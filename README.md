@@ -1,281 +1,210 @@
-# gid-rs
+# Graph Indexed Development (GID)
 
-Graph Indexed Development — Rust implementation.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![crates.io](https://img.shields.io/crates/v/gid-core.svg)](https://crates.io/crates/gid-core)
+[![npm](https://img.shields.io/npm/v/graph-indexed-development-mcp)](https://www.npmjs.com/package/graph-indexed-development-mcp)
 
-A graph-based project management and code intelligence library for AI agents and developers.
+**Graph-based project management and code intelligence for AI agents and developers.**
 
-## Crates
+GID gives your project a `.gid/graph.yml` — like `.git/` for version control, but for understanding your codebase architecture. AI agents can query dependencies, analyze impact, and track tasks. Humans get visualization and validation.
 
-| Crate | Purpose | Audience |
-|-------|---------|----------|
-| `gid-core` | Library — all graph logic, code analysis, knowledge management | Rust projects (RustClaw, swebench, your own tools) |
-| `gid-cli` | Binary — command-line interface using gid-core | Humans, non-Rust agents, shell scripts |
+---
 
 ## Quick Start
 
-### For Rust projects (use gid-core as a library)
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-gid-core = { path = "../gid-rs/crates/gid-core" }  # local
-# gid-core = "0.1"  # from crates.io (coming soon)
-```
-
-```rust
-use gid_core::{Graph, Node, Edge, NodeStatus};
-use gid_core::parser::{load_graph, save_graph};
-
-// Load a project's graph
-let graph = load_graph(Path::new("my-project/.gid/graph.yml"))?;
-
-// Query tasks
-let ready = graph.ready_tasks();
-let health = graph.health();
-println!("{}", graph.summary_text());
-```
-
-### For CLI users (agents, humans, scripts)
-
 ```bash
-# Install
-cargo install --path crates/gid-cli
+# Install the CLI
+cargo install gid-dev-cli
 
-# Use
-gid tasks                    # List tasks
-gid add-task "Fix bug"       # Add a task
-gid complete my-task          # Mark done
-gid visual                   # ASCII graph visualization
+# Initialize in your project
+cd your-project
+gid init
+
+# See your tasks
+gid tasks
+
+# Analyze what breaks if you change something
+gid query impact UserService
+
+# Visualize the architecture
+gid visual --format mermaid
 ```
 
 ---
 
-## Knowledge Management
+## Packages
 
-GID supports per-node knowledge storage — agents can record findings, cache files, and track tool usage as they explore code.
+| Package | Description | Install |
+|---------|-------------|---------|
+| [**gid-core**](./crates/gid-core) | Rust library — all graph logic, code analysis, knowledge management | `cargo add gid-core` |
+| [**gid-cli**](./crates/gid-cli) | Rust CLI — 39 commands for graph + code analysis | `cargo install gid-dev-cli` |
+| [**@gid/mcp**](./packages/mcp) | MCP server — 39 tools for AI assistants (Claude, Cursor, etc.) | `npx graph-indexed-development-mcp` |
+| [**@gid/cli**](./packages/cli) | TypeScript CLI — lighter alternative (10 commands) | `npm i -g graph-indexed-development-cli` |
 
-### Three types of knowledge
+### When to Use Which
 
-| Type | What it stores | Example |
-|------|---------------|---------|
-| **findings** | Discoveries about a node (key-value) | `"bug": "off-by-one on line 42"` |
-| **file_cache** | File contents read during exploration | `"src/main.py": "def foo(): ..."` |
-| **tool_history** | Operations performed on this node | `[{tool: "grep", summary: "searched callers"}]` |
+| You want to... | Use |
+|----------------|-----|
+| Embed GID in a Rust project | `gid-core` |
+| Run commands from terminal/scripts | `gid-cli` (Rust) |
+| Give Claude/Cursor/VS Code GID tools | `@gid/mcp` |
+| Quick TypeScript integration | `@gid/cli` |
 
-### How to use knowledge (3 approaches)
+---
 
-#### Approach 1: Use gid-core's Graph directly (recommended)
+## The Graph
 
-Best for: **RustClaw, your own Rust tools, most cases.**
-
-Node has built-in knowledge fields:
+Every GID project has a `.gid/graph.yml`:
 
 ```yaml
 # .gid/graph.yml
+project:
+  name: my-app
+
 nodes:
-  - id: fix-parser
-    title: Fix the parser bug
+  - id: auth-service
+    title: Authentication Service
     status: in_progress
-    findings:
-      root_cause: "race condition in tokenizer"
-      severity: "high"
-    file_cache:
-      src/parser.rs: |
-        pub fn parse(input: &str) -> Result<AST> {
-            // ...file contents cached here
-    tool_history:
-      - tool_name: grep
-        timestamp: "2026-03-25T20:00:00Z"
-        summary: "searched for all callers of parse()"
+    node_type: component
+    
+  - id: add-oauth
+    title: Add OAuth support
+    status: todo
+
+edges:
+  - from: add-oauth
+    to: auth-service
+    relation: depends_on
 ```
 
-```rust
-use gid_core::{Graph, Node};
+**Nodes** are tasks, components, features, or files. **Edges** define relationships: `depends_on`, `implements`, `calls`, `tested_by`.
 
-let mut graph = load_graph(path)?;
-// Read findings
-if let Some(node) = graph.get_node("fix-parser") {
-    if let Some(cause) = node.findings.get("root_cause") {
-        println!("Root cause: {}", cause);
+---
+
+## Core Concepts
+
+### Two Workflows
+
+**Top-down:** Design first, then build
+```bash
+gid design "E-commerce with auth, payments, orders"
+# → Generates graph with features, components, layers
+# → Build against the architecture
+```
+
+**Bottom-up:** Extract from existing code
+```bash
+gid extract .
+# → Scans codebase, builds dependency graph
+# → Use for impact analysis and refactoring
+```
+
+### Code Intelligence
+
+GID parses your code with tree-sitter and builds a semantic graph:
+
+```bash
+# What breaks if I change this?
+gid code-impact src/auth.py
+
+# Search for relevant code
+gid code-search "authentication,login"
+
+# Trace test failures to root cause
+gid code-trace test_auth::test_login
+```
+
+### Task Tracking
+
+```bash
+gid tasks                    # List all tasks
+gid tasks --ready            # Show unblocked tasks
+gid complete fix-bug-123     # Mark done, shows newly unblocked
+gid task-update X --status in_progress
+```
+
+---
+
+## MCP Server (AI Integration)
+
+Give Claude, Cursor, or VS Code instant access to your architecture:
+
+```json
+// Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json
+{
+  "mcpServers": {
+    "gid": {
+      "command": "npx",
+      "args": ["graph-indexed-development-mcp"]
     }
-}
-// Write findings
-if let Some(node) = graph.get_node_mut("fix-parser") {
-    node.findings.insert("root_cause".into(), "race condition".into());
+  }
 }
 ```
 
-#### Approach 2: Use the KnowledgeManagement trait (advanced)
+Then ask Claude:
+- *"What would break if I change UserService?"* → `gid_query_impact`
+- *"Show me the project health"* → `gid_advise`
+- *"Design a notification system"* → `gid_design`
 
-Best for: **Projects with custom graph types** (e.g., swebench has its own TaskNode).
+---
 
-If your project defines its own node/graph types, implement the trait to get knowledge functions:
+## Example Session
 
-```rust
-use gid_core::task_graph_knowledge::{KnowledgeGraph, KnowledgeManagement};
+```bash
+$ gid init --name my-api
+✓ Created .gid/graph.yml
+  Project: my-api
 
-// Your custom graph type
-struct MyTaskGraph { /* ... */ }
+$ gid add-node auth-service "Authentication Service" --type component
+✓ Added node: auth-service
 
-// Implement the required base trait
-impl KnowledgeGraph for MyTaskGraph {
-    fn get_knowledge_mut(&mut self, node_id: &str) -> Option<&mut KnowledgeNode> { /* ... */ }
-    fn get_knowledge(&self, node_id: &str) -> Option<&KnowledgeNode> { /* ... */ }
-    fn get_incoming_edges(&self, node_id: &str) -> Vec<String> { /* ... */ }
-}
+$ gid add-node add-oauth "Add OAuth support" --status todo
+✓ Added node: add-oauth
 
-// Get all knowledge functions for free
-impl KnowledgeManagement for MyTaskGraph {}
+$ gid add-edge add-oauth auth-service --relation depends_on
+✓ Added edge: add-oauth → auth-service (depends_on)
 
-// Now you can use:
-my_graph.store_finding("node-1", "bug", "off-by-one")?;
-my_graph.cache_file("node-1", "src/main.py", &contents)?;
-my_graph.record_tool_call("node-1", "grep", "searched callers")?;
-let context = my_graph.get_knowledge_context("node-1");
-```
+$ gid tasks --ready
+○ add-oauth — Add OAuth support [depends_on: auth-service]
 
-#### Approach 3: Use SimpleKnowledgeGraph standalone
+$ gid advise
+Health Score: 95/100
 
-Best for: **Quick prototyping, or when you don't have a graph at all.**
-
-```rust
-use gid_core::SimpleKnowledgeGraph;
-use gid_core::task_graph_knowledge::KnowledgeManagement;
-
-let mut kb = SimpleKnowledgeGraph::new();
-kb.add_node("my-task");
-kb.store_finding("my-task", "key", "value")?;
-```
-
-### Which approach should I use?
-
-```
-Do you use gid-core's Graph type?
-  ├─ Yes → Approach 1 (just use node.findings directly)
-  └─ No
-      ├─ Do you have your own graph type? → Approach 2 (impl the trait)
-      └─ No graph at all? → Approach 3 (SimpleKnowledgeGraph)
+Suggestions:
+  - [info] auth-service has no tests — consider adding test coverage
 ```
 
 ---
 
-## Extending Node with custom fields
-
-gid-core's Node covers common needs. When you need project-specific fields:
-
-### Option A: Use the metadata field (no code changes)
-
-```yaml
-nodes:
-  - id: parse-args
-    title: Fix parse_args
-    metadata:
-      path: "src/main.py"
-      line: 42
-      layer: "core"
-```
-
-```rust
-let line = node.metadata["line"].as_u64();
-```
-
-Good for: occasional extra fields, prototyping.
-Downside: no compile-time type checking.
-
-### Option B: Define your own Node type (type-safe)
-
-```rust
-pub struct MyNode {
-    pub id: String,
-    pub title: String,
-    pub path: Option<String>,    // custom
-    pub line: Option<usize>,     // custom
-    pub findings: HashMap<String, String>,
-}
-```
-
-Good for: when you have many custom fields used frequently (like swebench).
-Downside: more code to write.
-
----
-
-## Code Intelligence
-
-gid-core includes a full code graph engine with tree-sitter parsing:
-
-```rust
-use gid_core::CodeGraph;
-
-// Extract code structure from a repo
-let code_graph = CodeGraph::extract_from_dir(Path::new("my-repo/"));
-
-// Find relevant code for a bug report
-let keywords = CodeGraph::extract_keywords("parser crashes on empty input");
-let relevant = code_graph.find_relevant_nodes(&keywords);
-
-// Impact analysis — what breaks if I change this function?
-let impact = code_graph.impact_analysis(&["my-repo::src/parser.rs::parse"]);
-
-// Find related tests
-let tests = code_graph.find_related_tests(&["my-repo::src/parser.rs::parse"]);
-```
-
-### Key code graph features
-
-- **Tree-sitter parsing** (Python, with extensible Language enum)
-- **Impact analysis** — trace what's affected by a change
-- **Causal chain tracing** — from symptoms to root cause
-- **Test discovery** — find tests related to changed code
-- **Unified graph** — merge code graph + task graph into one view
-
----
-
-## Architecture
+## Monorepo Structure
 
 ```
-gid-rs/
+graph-indexed-development/
 ├── crates/
-│   ├── gid-core/           # Library crate
-│   │   └── src/
-│   │       ├── lib.rs              # Public API exports
-│   │       ├── graph.rs            # Task graph (Graph, Node, Edge)
-│   │       ├── parser.rs           # YAML load/save
-│   │       ├── code_graph.rs       # Code intelligence (tree-sitter)
-│   │       ├── working_mem.rs      # Agent working memory
-│   │       ├── task_graph_knowledge.rs  # Knowledge management trait
-│   │       ├── complexity.rs       # Change complexity assessment
-│   │       ├── unified.rs          # Code + task graph merging
-│   │       ├── query.rs            # Graph queries
-│   │       ├── validator.rs        # Graph validation
-│   │       ├── visual.rs           # ASCII visualization
-│   │       ├── history.rs          # Edit history tracking
-│   │       ├── advise.rs           # Next-step advice
-│   │       ├── design.rs           # Design doc → graph generation
-│   │       ├── semantify.rs        # Code → semantic graph
-│   │       ├── refactor.rs         # Graph refactoring
-│   │       └── ignore.rs           # .gitignore-style filtering
-│   └── gid-cli/            # CLI binary crate
-│       └── src/main.rs
-└── .gid/graph.yml           # This project's own graph
+│   ├── gid-core/     # Rust core library (165 pub functions, 50 tests)
+│   └── gid-cli/      # Rust CLI (39 commands)
+├── packages/
+│   ├── mcp/          # TypeScript MCP server (39 tools)
+│   └── cli/          # TypeScript CLI (10 commands)
+├── Cargo.toml        # Rust workspace
+└── package.json      # npm workspace
 ```
 
-## Per-project graphs
+---
 
-Each project has its own `.gid/graph.yml`. Graphs are completely isolated:
+## Related
 
-```
-~/projects/
-├── rustclaw/.gid/graph.yml      # RustClaw's tasks & knowledge
-├── gid-rs/.gid/graph.yml        # gid-rs's own tasks
-├── autoalpha/.gid/graph.yml     # AutoAlpha's tasks
-└── swebench/.gid/graph.yml      # SWE-bench tasks
-```
-
-When an agent (RustClaw, gid-cli, etc.) works on a project, it reads that project's graph. Switching projects = reading a different file. No cross-contamination.
+- [GID Methodology](https://github.com/tonioyeme/graph-indexed-development-principle) — Specification and examples
+- [GID Paper](https://zenodo.org/records/18425984) — Formal methodology (Zenodo)
 
 ---
 
 ## License
 
-MIT
+**MIT** — See [LICENSE](LICENSE) for details.
+
+---
+
+## Author
+
+**Toni Tang** — [@tonitangpotato](https://github.com/tonitangpotato)
