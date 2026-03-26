@@ -104,6 +104,17 @@ const TOOLS = [
     },
   },
   {
+    name: 'gid_query_topo',
+    description: 'Topological sort of the graph — shows valid execution order respecting dependencies',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'gid_design',
     description: 'Generate semantic graph from natural language requirements. Creates Features, Components, layers, and relationships.',
     inputSchema: {
@@ -172,25 +183,9 @@ const TOOLS = [
       },
     },
   },
+
   {
-    name: 'gid_history',
-    description: 'Manage graph version history (list, diff, restore)',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
-        action: {
-          type: 'string',
-          enum: ['list', 'diff', 'restore'],
-          description: 'Action to perform (default: list)',
-        },
-        version: { type: 'string', description: 'Version filename for diff/restore' },
-        force: { type: 'boolean', description: 'Force restore without confirmation' },
-      },
-    },
-  },
-  {
-    name: 'gid_get_schema',
+    name: 'gid_schema',
     description: 'Get the GID graph schema with dynamic relations. If a graph exists, includes custom/discovered relations from that graph.',
     inputSchema: {
       type: 'object' as const,
@@ -230,26 +225,7 @@ const TOOLS = [
       },
     },
   },
-  {
-    name: 'gid_refactor',
-    description: 'Preview or apply graph changes to codebase (rename, move, split, merge nodes)',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
-        operation: {
-          type: 'string',
-          enum: ['preview', 'rename', 'move', 'delete'],
-          description: 'Refactoring operation',
-        },
-        nodeId: { type: 'string', description: 'Node to refactor' },
-        newName: { type: 'string', description: 'New name for rename operation' },
-        newLayer: { type: 'string', description: 'New layer for move operation' },
-        dryRun: { type: 'boolean', description: 'Preview changes without applying (default: true)' },
-      },
-      required: ['operation', 'nodeId'],
-    },
-  },
+
   {
     name: 'gid_semantify',
     description: 'Propose semantic upgrades: map files to components, assign layers, detect features. Use returnContext: true for AI semantic analysis (reads docs + code names).',
@@ -271,7 +247,7 @@ const TOOLS = [
     },
   },
   {
-    name: 'gid_get_file_summary',
+    name: 'gid_file_summary',
     description: 'Get structured file analysis ready for AI to generate a summary description',
     inputSchema: {
       type: 'object' as const,
@@ -5488,6 +5464,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'gid_query_path':
         return await handleQueryPath(args as { from: string; to: string; graphPath?: string });
 
+      case 'gid_query_topo': {
+        const graphPath = (args as { graphPath?: string }).graphPath;
+        const resolvedPath = graphPath ? path.resolve(graphPath) : findGraphFile(process.cwd());
+        if (!resolvedPath) {
+          return { content: [{ type: 'text', text: 'No graph.yml found. Run gid_init first.' }] };
+        }
+        const topoGraph = loadGraph(resolvedPath);
+        const nodeIds = Object.keys(topoGraph.nodes);
+        const edges = topoGraph.edges || [];
+        // Kahn's algorithm for topological sort
+        const inDegree = new Map<string, number>();
+        for (const id of nodeIds) {
+          inDegree.set(id, 0);
+        }
+        for (const edge of edges) {
+          if (edge.type === 'depends_on' || edge.relation === 'depends_on') {
+            inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
+          }
+        }
+        const queue: string[] = [];
+        for (const [id, deg] of inDegree) {
+          if (deg === 0) queue.push(id);
+        }
+        const sorted: string[] = [];
+        while (queue.length > 0) {
+          const current = queue.shift()!;
+          sorted.push(current);
+          for (const edge of edges) {
+            if ((edge.type === 'depends_on' || edge.relation === 'depends_on') && edge.from === current) {
+              const newDeg = (inDegree.get(edge.to) || 1) - 1;
+              inDegree.set(edge.to, newDeg);
+              if (newDeg === 0) queue.push(edge.to);
+            }
+          }
+        }
+        const hasCycle = sorted.length < nodeIds.length;
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ order: sorted, count: sorted.length, hasCycle }, null, 2),
+          }],
+        };
+      }
+
       case 'gid_design':
         return await handleDesign(args as { requirements: string; outputPath?: string });
 
@@ -5510,15 +5530,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           groupingDepth?: number;
         });
 
-      case 'gid_history':
-        return await handleHistory(args as {
-          graphPath?: string;
-          action?: string;
-          version?: string;
-          force?: boolean;
-        });
-
-      case 'gid_get_schema':
+      case 'gid_schema':
         return await handleGetSchema(args as { includeExample?: boolean });
 
       case 'gid_analyze':
@@ -5536,16 +5548,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           threshold?: number;
         });
 
-      case 'gid_refactor':
-        return await handleRefactor(args as {
-          graphPath?: string;
-          operation: string;
-          nodeId: string;
-          newName?: string;
-          newLayer?: string;
-          dryRun?: boolean;
-        });
-
       case 'gid_semantify':
         return await handleSemantify(args as {
           graphPath?: string;
@@ -5554,7 +5556,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           returnContext?: boolean;
         });
 
-      case 'gid_get_file_summary':
+      case 'gid_file_summary':
         return await handleGetFileSummary(args as { filePath: string; includeContent?: boolean });
 
       case 'gid_edit_graph':
