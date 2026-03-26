@@ -34,21 +34,24 @@ gid visual --format mermaid
 
 ## Packages
 
-| Package | Description | Install |
-|---------|-------------|---------|
-| [**gid-core**](./crates/gid-core) | Rust library — all graph logic, code analysis, knowledge management | `cargo add gid-core` |
-| [**gid-cli**](./crates/gid-cli) | Rust CLI — 39 commands for graph + code analysis | `cargo install gid-dev-cli` |
-| [**@gid/mcp**](./packages/mcp) | MCP server — 39 tools for AI assistants (Claude, Cursor, etc.) | `npx graph-indexed-development-mcp` |
-| [**@gid/cli**](./packages/cli) | TypeScript CLI — lighter alternative (10 commands) | `npm i -g graph-indexed-development-cli` |
+| Package | Language | Status | Features | Install |
+|---------|----------|--------|----------|---------|
+| [**gid-core**](./crates/gid-core) | Rust | ✅ **Full** (165 pub fn, 50 tests) | Library — all graph logic, code analysis, knowledge mgmt | `cargo add gid-core` |
+| [**gid-cli**](./crates/gid-cli) | Rust | ✅ **Full** (39 commands) | CLI for terminal/scripts/agents | `cargo install gid-dev-cli` |
+| [**@gid/mcp**](./packages/mcp) | TypeScript | ✅ **Full** (39 tools) | MCP server for AI assistants (Claude, Cursor, etc.) | `npx graph-indexed-development-mcp` |
+| [**@gid/cli**](./packages/cli) | TypeScript | ⚠️ **Partial** (10/39 commands) | Lightweight CLI — **deprecated, use Rust CLI or MCP** | `npm i -g graph-indexed-development-cli` |
+
+> **Note:** `gid-core` is the source of truth. The Rust CLI and MCP server are fully synced.
+> The TypeScript CLI is outdated and not actively maintained — use the Rust CLI (`cargo install gid-dev-cli`) or MCP server instead.
 
 ### When to Use Which
 
-| You want to... | Use |
-|----------------|-----|
-| Embed GID in a Rust project | `gid-core` |
-| Run commands from terminal/scripts | `gid-cli` (Rust) |
-| Give Claude/Cursor/VS Code GID tools | `@gid/mcp` |
-| Quick TypeScript integration | `@gid/cli` |
+| You want to... | Use | Why |
+|----------------|-----|-----|
+| Embed GID in a Rust project | `gid-core` | Direct library, fastest, type-safe |
+| Run commands from terminal/scripts | `gid-cli` (Rust) | Full 39 commands, `--json` for agents |
+| Give Claude/Cursor/VS Code GID tools | `@gid/mcp` | Auto-injects tools via MCP protocol |
+| Use GID in a Rust agent harness | `gid-core` | RustClaw uses 13 built-in GID tools via gid-core |
 
 ---
 

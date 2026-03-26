@@ -3,9 +3,9 @@
 [![npm](https://img.shields.io/npm/v/graph-indexed-development-cli)](https://www.npmjs.com/package/graph-indexed-development-cli)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-**TypeScript CLI for Graph Indexed Development** — a lighter alternative to the Rust CLI.
+**TypeScript CLI for Graph Indexed Development.**
 
-> ⚠️ **Note:** Currently 10 commands, being synced to match the [Rust CLI](../../crates/gid-cli)'s 39 commands.
+> ⚠️ **Deprecated:** Only 10/39 commands implemented. Use the [Rust CLI](../../crates/gid-cli) (`cargo install gid-dev-cli`) or [MCP server](../../packages/mcp) instead. This package is no longer actively maintained.
 
 ---
 
