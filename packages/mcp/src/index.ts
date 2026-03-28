@@ -309,10 +309,10 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Keywords to search for',
         },
-        dir: { type: 'string', description: 'Directory to search in' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
         format_llm: { type: 'number', description: 'Max chars for LLM-friendly output (truncates long results)' },
       },
-      required: ['keywords'],
+      required: ['keywords', 'dir'],
     },
   },
   {
@@ -336,9 +336,9 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Fail-to-pass test files (optional)',
         },
-        dir: { type: 'string', description: 'Project directory' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
       },
-      required: ['changed'],
+      required: ['changed', 'dir'],
     },
   },
   {
@@ -349,9 +349,9 @@ const TOOLS = [
       properties: {
         problem: { type: 'string', description: 'Problem description (error message, bug description, etc.)' },
         tests: { type: 'string', description: 'Test output or failure messages (optional)' },
-        dir: { type: 'string', description: 'Project directory' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
       },
-      required: ['problem'],
+      required: ['problem', 'dir'],
     },
   },
   {
@@ -367,9 +367,9 @@ const TOOLS = [
         },
         depth: { type: 'number', description: 'Max trace depth (default: 5)' },
         max_chains: { type: 'number', description: 'Max number of chains to return (default: 10)' },
-        dir: { type: 'string', description: 'Project directory' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
       },
-      required: ['symptoms'],
+      required: ['symptoms', 'dir'],
     },
   },
   {
@@ -383,9 +383,9 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Node IDs to assess',
         },
-        dir: { type: 'string', description: 'Project directory' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
       },
-      required: ['nodes'],
+      required: ['nodes', 'dir'],
     },
   },
   {
@@ -399,9 +399,9 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Files to analyze impact for',
         },
-        dir: { type: 'string', description: 'Project directory' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
       },
-      required: ['files'],
+      required: ['files', 'dir'],
     },
   },
   {
@@ -416,9 +416,9 @@ const TOOLS = [
           description: 'Keywords to search for',
         },
         max_lines: { type: 'number', description: 'Max lines per snippet (default: 30)' },
-        dir: { type: 'string', description: 'Project directory' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
       },
-      required: ['keywords'],
+      required: ['keywords', 'dir'],
     },
   },
   {
@@ -428,9 +428,9 @@ const TOOLS = [
       type: 'object' as const,
       properties: {
         filePath: { type: 'string', description: 'Path to the file to summarize' },
-        dir: { type: 'string', description: 'Project directory' },
+        dir: { type: 'string', description: 'Project source directory (required to avoid slow filesystem scans)' },
       },
-      required: ['filePath'],
+      required: ['filePath', 'dir'],
     },
   },
   {
@@ -439,9 +439,10 @@ const TOOLS = [
     inputSchema: {
       type: 'object' as const,
       properties: {
-        dir: { type: 'string', description: 'Directory to extract from (default: current)' },
+        dir: { type: 'string', description: 'Project source directory to extract from (required)' },
         graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
       },
+      required: ['dir'],
     },
   },
 
