@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use crate::graph::{Graph, Node, NodeStatus};
+use crate::code_graph::{CodeGraph, NodeKind, EdgeRelation};
 use crate::query::QueryEngine;
 use crate::validator::Validator;
 
@@ -43,6 +44,7 @@ pub enum AdviceType {
     SuggestedTaskOrder,
     UnreachableTask,
     BlockedChain,
+    DeadCode,
 }
 
 impl std::fmt::Display for AdviceType {
@@ -60,6 +62,7 @@ impl std::fmt::Display for AdviceType {
             AdviceType::SuggestedTaskOrder => write!(f, "suggested-task-order"),
             AdviceType::UnreachableTask => write!(f, "unreachable-task"),
             AdviceType::BlockedChain => write!(f, "blocked-chain"),
+            AdviceType::DeadCode => write!(f, "dead-code"),
         }
     }
 }
@@ -355,13 +358,20 @@ pub fn analyze(graph: &Graph) -> AnalysisResult {
         }
     }
     
+    // Dead code detection for code nodes in the unified graph
+    let dead_code_items = detect_dead_code(graph);
+    items.extend(dead_code_items);
+    
     // Sort by severity (errors first)
     items.sort_by(|a, b| b.severity.cmp(&a.severity));
     
     // Calculate health score based on severity
+    // NOTE: Dead code (Info) does NOT count towards deductions — it's purely informational
     let error_count = items.iter().filter(|a| a.severity == Severity::Error).count();
     let warning_count = items.iter().filter(|a| a.severity == Severity::Warning).count();
-    let info_count = items.iter().filter(|a| a.severity == Severity::Info).count();
+    let info_count = items.iter()
+        .filter(|a| a.severity == Severity::Info && a.advice_type != AdviceType::DeadCode)
+        .count();
     
     // Scoring: errors are critical, warnings matter, info is advisory
     // Cap deductions so a few info items don't tank the score
@@ -526,6 +536,471 @@ fn detect_blocked_chains(graph: &Graph) -> Vec<(String, Vec<String>)> {
     }
     
     results
+}
+
+/// Detect dead code (functions with 0 incoming calls that are not entry points).
+/// Works on the unified Graph which contains code nodes from CodeGraph.
+fn detect_dead_code(graph: &Graph) -> Vec<Advice> {
+    let mut items = Vec::new();
+    
+    // Only proceed if graph has code nodes (function type)
+    let code_functions: Vec<&Node> = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("function"))
+        .collect();
+    
+    if code_functions.is_empty() {
+        return items;
+    }
+    
+    // Build incoming calls map
+    let mut incoming_calls: HashMap<&str, usize> = HashMap::new();
+    for edge in &graph.edges {
+        if edge.relation == "calls" {
+            *incoming_calls.entry(&edge.to).or_default() += 1;
+        }
+    }
+    
+    // Find functions with 0 incoming calls that are not entry points
+    let dead_functions: Vec<&Node> = code_functions
+        .into_iter()
+        .filter(|node| {
+            // Skip if has incoming calls
+            if incoming_calls.get(node.id.as_str()).copied().unwrap_or(0) > 0 {
+                return false;
+            }
+            
+            // Skip entry points
+            if is_code_entry_point(node) {
+                return false;
+            }
+            
+            // Skip test functions (check metadata or title pattern)
+            if is_test_function(node) {
+                return false;
+            }
+            
+            // Skip public API
+            if is_public_code(node) {
+                return false;
+            }
+            
+            // Skip Python dunder methods
+            if is_dunder(&node.title) {
+                return false;
+            }
+            
+            // Skip trait implementation methods (called via dynamic dispatch)
+            if is_trait_impl_method(node, graph) {
+                return false;
+            }
+            
+            // Skip serde default functions
+            if is_serde_default(node) {
+                return false;
+            }
+            
+            true
+        })
+        .collect();
+    
+    if dead_functions.is_empty() {
+        return items;
+    }
+    
+    // Group by file for better reporting
+    let mut by_file: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in &dead_functions {
+        let file_path = node.metadata.get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        by_file.entry(file_path).or_default().push(&node.title);
+    }
+    
+    for (file_path, names) in by_file {
+        // Report up to 10 dead functions per file
+        let names_to_report: Vec<&str> = names.iter().take(10).copied().collect();
+        let remaining = names.len().saturating_sub(10);
+        
+        let message = if remaining > 0 {
+            format!(
+                "{} has {} potentially dead functions: {} (and {} more)",
+                file_path,
+                names.len(),
+                names_to_report.join(", "),
+                remaining
+            )
+        } else {
+            format!(
+                "{} has {} potentially dead function(s): {}",
+                file_path,
+                names.len(),
+                names_to_report.join(", ")
+            )
+        };
+        
+        items.push(Advice {
+            advice_type: AdviceType::DeadCode,
+            severity: Severity::Info,
+            message,
+            nodes: dead_functions.iter()
+                .filter(|n| {
+                    n.metadata.get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("") == file_path
+                })
+                .map(|n| n.id.clone())
+                .collect(),
+            suggestion: Some("Consider removing unused code or exposing it if intentionally unused.".to_string()),
+        });
+    }
+    
+    items
+}
+
+/// Check if a code node is an entry point
+fn is_code_entry_point(node: &Node) -> bool {
+    let name = &node.title;
+    let file_path = node.metadata.get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    
+    // Common entry points
+    if matches!(name.as_str(), "main" | "lib" | "mod" | "index" | "app" | "run" | "start" | "init" | "setup") {
+        return true;
+    }
+    
+    // Rust: functions in main.rs or lib.rs
+    if file_path.ends_with("main.rs") || file_path.ends_with("lib.rs") {
+        return true;
+    }
+    
+    // TypeScript/JavaScript: common entry files
+    if file_path.ends_with("index.ts") 
+        || file_path.ends_with("index.js")
+        || file_path.ends_with("main.ts")
+        || file_path.ends_with("main.js")
+    {
+        return true;
+    }
+    
+    // Python: __main__ entry
+    if name == "__main__" || file_path.ends_with("__main__.py") {
+        return true;
+    }
+    
+    // CLI command handlers
+    if name.starts_with("cmd_") || name.starts_with("command_") || name.starts_with("handle_") {
+        return true;
+    }
+    
+    // Check signature for FFI markers
+    if let Some(sig) = node.metadata.get("signature").and_then(|v| v.as_str()) {
+        if sig.contains("#[no_mangle]") || sig.contains("extern") {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if a code node is a test function
+fn is_test_function(node: &Node) -> bool {
+    let name = &node.title;
+    let file_path = node.metadata.get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    
+    // Test file patterns
+    if file_path.contains("/test") || file_path.contains("_test.") || file_path.contains(".test.") || file_path.contains(".spec.") {
+        return true;
+    }
+    
+    // Test function name patterns
+    if name.starts_with("test_") || name.starts_with("Test") {
+        return true;
+    }
+    
+    // Node in a tests module (Rust pattern)
+    if node.id.contains("tests__") || node.id.contains("_tests_") {
+        return true;
+    }
+    
+    // Check signature for test attributes
+    if let Some(sig) = node.metadata.get("signature").and_then(|v| v.as_str()) {
+        if sig.contains("#[test]") || sig.contains("#[tokio::test]") {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if a code node is public API
+fn is_public_code(node: &Node) -> bool {
+    // Check signature for pub (Rust)
+    if let Some(sig) = node.metadata.get("signature").and_then(|v| v.as_str()) {
+        if sig.starts_with("pub ") || sig.starts_with("pub(") {
+            return true;
+        }
+        // TypeScript export
+        if sig.starts_with("export ") {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if a code node is a trait implementation method (called via dynamic dispatch)
+fn is_trait_impl_method(node: &Node, graph: &Graph) -> bool {
+    // Common trait method names that are called dynamically
+    let common_trait_methods = [
+        // Rust standard traits
+        "fmt", "clone", "default", "eq", "ne", "hash", "cmp", "partial_cmp",
+        "drop", "deref", "deref_mut", "index", "index_mut",
+        "add", "sub", "mul", "div", "rem", "neg", "not",
+        "from", "into", "try_from", "try_into", "as_ref", "as_mut",
+        "borrow", "borrow_mut", "to_owned", "to_string",
+        // Iterator
+        "next", "size_hint", "count", "last", "nth", "fold", "collect",
+        // Custom plugin/tool traits
+        "name", "description", "execute", "input_schema", "version",
+        "on_load", "on_unload", "tools", "hooks", "point", "priority",
+        // Serde
+        "serialize", "deserialize",
+        // Async traits
+        "poll", "wake",
+    ];
+    
+    let name = node.title.as_str();
+    if common_trait_methods.contains(&name) {
+        // Check if this method is in a struct/impl block (has DefinedIn edge to a class)
+        let has_parent = graph.edges.iter()
+            .any(|e| e.from == node.id && e.relation == "defined_in");
+        return has_parent;
+    }
+    
+    false
+}
+
+/// Check if a code node is a serde default function
+fn is_serde_default(node: &Node) -> bool {
+    let name = &node.title;
+    // Serde default functions follow the pattern default_* 
+    if name.starts_with("default_") {
+        return true;
+    }
+    false
+}
+
+/// Check if name is a Python dunder method
+fn is_dunder(name: &str) -> bool {
+    name.starts_with("__") && name.ends_with("__")
+}
+
+// ═══ Code Graph Analysis ═══
+
+/// Analyze a code graph for dead code and return advice.
+/// Dead code = functions/methods with 0 incoming Calls edges that are not entry points.
+pub fn analyze_code_graph(code_graph: &CodeGraph) -> Vec<Advice> {
+    let mut items = Vec::new();
+    
+    // Build incoming calls map
+    let mut incoming_calls: HashMap<&str, usize> = HashMap::new();
+    for edge in &code_graph.edges {
+        if edge.relation == EdgeRelation::Calls {
+            *incoming_calls.entry(&edge.to).or_default() += 1;
+        }
+    }
+    
+    // Find function/method nodes with 0 incoming calls
+    let dead_code: Vec<&crate::code_graph::CodeNode> = code_graph.nodes
+        .iter()
+        .filter(|node| {
+            // Only check functions/methods
+            if node.kind != NodeKind::Function {
+                return false;
+            }
+            
+            // Skip if has incoming calls
+            if incoming_calls.get(node.id.as_str()).copied().unwrap_or(0) > 0 {
+                return false;
+            }
+            
+            // Skip entry points
+            if is_entry_point(node) {
+                return false;
+            }
+            
+            // Skip test functions
+            if node.is_test {
+                return false;
+            }
+            
+            // Skip public API (Rust: pub, TypeScript: export)
+            if is_public_api(node) {
+                return false;
+            }
+            
+            // Skip Python dunder methods
+            if is_dunder_method(&node.name) {
+                return false;
+            }
+            
+            // Skip trait implementations (Rust)
+            if is_trait_impl(node, code_graph) {
+                return false;
+            }
+            
+            true
+        })
+        .collect();
+    
+    // Group by file for better reporting
+    let mut by_file: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in &dead_code {
+        by_file.entry(&node.file_path).or_default().push(&node.name);
+    }
+    
+    for (file_path, names) in by_file {
+        // Report up to 10 dead functions per file
+        let names_to_report: Vec<&str> = names.iter().take(10).copied().collect();
+        let remaining = names.len().saturating_sub(10);
+        
+        let message = if remaining > 0 {
+            format!(
+                "{} has {} potentially dead functions: {} (and {} more)",
+                file_path,
+                names.len(),
+                names_to_report.join(", "),
+                remaining
+            )
+        } else {
+            format!(
+                "{} has {} potentially dead function(s): {}",
+                file_path,
+                names.len(),
+                names_to_report.join(", ")
+            )
+        };
+        
+        items.push(Advice {
+            advice_type: AdviceType::DeadCode,
+            severity: Severity::Info,
+            message,
+            nodes: dead_code.iter()
+                .filter(|n| n.file_path == file_path)
+                .map(|n| n.id.clone())
+                .collect(),
+            suggestion: Some("Consider removing unused code or exposing it if intentionally unused.".to_string()),
+        });
+    }
+    
+    items
+}
+
+/// Check if a node is an entry point (main, lib, etc.)
+fn is_entry_point(node: &crate::code_graph::CodeNode) -> bool {
+    let name = &node.name;
+    
+    // Common entry points
+    if matches!(name.as_str(), "main" | "lib" | "mod" | "index" | "app" | "run" | "start" | "init" | "setup") {
+        return true;
+    }
+    
+    // Rust: functions in main.rs or lib.rs at root
+    if node.file_path.ends_with("main.rs") || node.file_path.ends_with("lib.rs") {
+        if name == "main" || name.starts_with("pub ") {
+            return true;
+        }
+    }
+    
+    // TypeScript/JavaScript: common entry files
+    if node.file_path.ends_with("index.ts") 
+        || node.file_path.ends_with("index.js")
+        || node.file_path.ends_with("main.ts")
+        || node.file_path.ends_with("main.js")
+        || node.file_path.ends_with("app.ts")
+        || node.file_path.ends_with("app.js")
+    {
+        return true;
+    }
+    
+    // Python: __main__ entry
+    if name == "__main__" || node.file_path.ends_with("__main__.py") {
+        return true;
+    }
+    
+    // CLI command handlers
+    if name.starts_with("cmd_") || name.starts_with("command_") || name.starts_with("handle_") {
+        return true;
+    }
+    
+    // FFI/no_mangle functions (Rust)
+    if node.decorators.iter().any(|d| d.contains("no_mangle") || d.contains("export_name")) {
+        return true;
+    }
+    
+    false
+}
+
+/// Check if a node is public API
+fn is_public_api(node: &crate::code_graph::CodeNode) -> bool {
+    // Check signature for pub (Rust)
+    if let Some(ref sig) = node.signature {
+        if sig.starts_with("pub ") || sig.starts_with("pub(") {
+            return true;
+        }
+    }
+    
+    // Check decorators for export (TypeScript)
+    if node.decorators.iter().any(|d| d == "export" || d.contains("Export")) {
+        return true;
+    }
+    
+    // Check if method ID suggests it's in a public trait/interface
+    if node.id.starts_with("method:") {
+        // Methods in impl blocks for traits are considered public
+        // (handled separately in is_trait_impl)
+    }
+    
+    // Python: functions starting with single underscore are private convention
+    // Functions without underscore are considered public
+    if node.file_path.ends_with(".py") && !node.name.starts_with('_') {
+        // But only if it's a top-level function (not method)
+        if node.id.starts_with("func:") {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if name is a Python dunder method
+fn is_dunder_method(name: &str) -> bool {
+    name.starts_with("__") && name.ends_with("__")
+}
+
+/// Check if node is a trait implementation method (Rust)
+fn is_trait_impl(node: &crate::code_graph::CodeNode, code_graph: &CodeGraph) -> bool {
+    // A method is a trait impl if its parent class/struct has an Inherits edge to a trait
+    
+    // Find the parent class/struct from DefinedIn edge
+    let parent_id = code_graph.edges.iter()
+        .find(|e| e.from == node.id && e.relation == EdgeRelation::DefinedIn)
+        .map(|e| &e.to);
+    
+    if let Some(parent) = parent_id {
+        // Check if parent has Inherits edges (trait implementation)
+        let has_trait_impl = code_graph.edges.iter()
+            .any(|e| &e.from == parent && e.relation == EdgeRelation::Inherits);
+        
+        if has_trait_impl {
+            return true;
+        }
+    }
+    
+    false
 }
 
 #[cfg(test)]

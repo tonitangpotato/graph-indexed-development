@@ -508,12 +508,8 @@ impl CodeGraph {
             })
             .collect();
 
-        // Third pass: extract call edges (only for Python with tree-sitter)
+        // Third pass: extract call edges for all languages with tree-sitter
         for (rel_path, content, lang) in &file_entries {
-            if *lang != Language::Python {
-                continue;
-            }
-
             let file_func_ids: HashSet<String> = nodes
                 .iter()
                 .filter(|n| n.file_path == *rel_path && n.kind == NodeKind::Function)
@@ -522,47 +518,112 @@ impl CodeGraph {
 
             let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
 
-            if let Some(tree) = parser.parse(content, None) {
-                let source = content.as_bytes();
-                let root = tree.root_node();
+            match lang {
+                Language::Python => {
+                    // Set Python language for parser
+                    if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
+                        continue;
+                    }
+                    
+                    if let Some(tree) = parser.parse(content, None) {
+                        let source = content.as_bytes();
+                        let root = tree.root_node();
 
-                extract_calls_from_tree(
-                    root,
-                    source,
-                    rel_path,
-                    &func_map,
-                    &method_to_class,
-                    &class_parents,
-                    &file_func_ids,
-                    &file_imported_names,
-                    package_dir,
-                    &class_init_map,
-                    &node_pkg_map,
-                    &mut edges,
-                );
-            }
+                        extract_calls_from_tree(
+                            root,
+                            source,
+                            rel_path,
+                            &func_map,
+                            &method_to_class,
+                            &class_parents,
+                            &file_func_ids,
+                            &file_imported_names,
+                            package_dir,
+                            &class_init_map,
+                            &node_pkg_map,
+                            &mut edges,
+                        );
+                    }
 
-            // Test-to-source mapping
-            let is_test_file = rel_path.contains("/tests/") || rel_path.contains("/test_");
-            if is_test_file {
-                let file_id = format!("file:{}", rel_path);
-                let re_from_import = Regex::new(r"^from\s+([\w.]+)\s+import").unwrap();
+                    // Test-to-source mapping for Python
+                    let is_test_file = rel_path.contains("/tests/") || rel_path.contains("/test_");
+                    if is_test_file {
+                        let file_id = format!("file:{}", rel_path);
+                        let re_from_import = Regex::new(r"^from\s+([\w.]+)\s+import").unwrap();
 
-                for line in content.lines() {
-                    if let Some(cap) = re_from_import.captures(line) {
-                        let module = cap[1].to_string();
-                        if let Some(source_file_id) = module_map.get(&module) {
-                            edges.push(CodeEdge {
-                                from: file_id.clone(),
-                                to: source_file_id.clone(),
-                                relation: EdgeRelation::TestsFor,
-                                weight: 0.5,
-                                call_count: 1,
-                                in_error_path: false,
-                                confidence: 1.0,
-                            });
+                        for line in content.lines() {
+                            if let Some(cap) = re_from_import.captures(line) {
+                                let module = cap[1].to_string();
+                                if let Some(source_file_id) = module_map.get(&module) {
+                                    edges.push(CodeEdge {
+                                        from: file_id.clone(),
+                                        to: source_file_id.clone(),
+                                        relation: EdgeRelation::TestsFor,
+                                        weight: 0.5,
+                                        call_count: 1,
+                                        in_error_path: false,
+                                        confidence: 1.0,
+                                    });
+                                }
+                            }
                         }
                     }
+                }
+                Language::Rust => {
+                    // Set Rust language for parser
+                    if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+                        continue;
+                    }
+
+                    if let Some(tree) = parser.parse(content, None) {
+                        let source = content.as_bytes();
+                        let root = tree.root_node();
+
+                        extract_calls_rust(
+                            root,
+                            source,
+                            rel_path,
+                            &func_map,
+                            &method_to_class,
+                            &file_func_ids,
+                            &node_pkg_map,
+                            &mut edges,
+                        );
+                    }
+                }
+                Language::TypeScript => {
+                    // Set TypeScript language for parser based on extension
+                    let extension = rel_path.rsplit('.').next().unwrap_or("");
+                    let lang_result = match extension {
+                        "tsx" => parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()),
+                        "ts" => parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+                        "jsx" => parser.set_language(&tree_sitter_javascript::LANGUAGE.into()),
+                        _ => parser.set_language(&tree_sitter_javascript::LANGUAGE.into()),
+                    };
+                    
+                    if lang_result.is_err() {
+                        continue;
+                    }
+
+                    if let Some(tree) = parser.parse(content, None) {
+                        let source = content.as_bytes();
+                        let root = tree.root_node();
+
+                        extract_calls_typescript(
+                            root,
+                            source,
+                            rel_path,
+                            &func_map,
+                            &method_to_class,
+                            &file_func_ids,
+                            &file_imported_names,
+                            &node_pkg_map,
+                            &mut edges,
+                        );
+                    }
+                }
+                Language::Unknown => {
+                    // No call extraction for unknown languages
                 }
             }
         }
@@ -4846,6 +4907,967 @@ fn is_stdlib(module: &str) -> bool {
     stdlib_prefixes.contains(&first_part)
 }
 
+/// Check if a Rust call is a builtin/macro to skip
+fn is_rust_builtin(name: &str) -> bool {
+    // Strip trailing ! for macro calls
+    let name = name.trim_end_matches('!');
+    matches!(
+        name,
+        // Core macros
+        "println" | "eprintln" | "print" | "eprint"
+            | "format" | "format_args"
+            | "vec" | "vec!"
+            | "todo" | "unimplemented" | "unreachable"
+            | "assert" | "assert_eq" | "assert_ne"
+            | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
+            | "dbg" | "cfg" | "env" | "option_env"
+            | "include" | "include_str" | "include_bytes"
+            | "concat" | "stringify"
+            | "write" | "writeln"
+            | "panic"
+            // Tracing/logging macros
+            | "info" | "debug" | "warn" | "error" | "trace"
+            | "log" | "span" | "event"
+            // Common traits/primitives
+            | "Some" | "None" | "Ok" | "Err"
+            | "Box" | "Rc" | "Arc" | "Cell" | "RefCell"
+            | "Vec" | "String" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet"
+            | "Option" | "Result"
+            | "Default" | "Clone" | "Copy" | "Debug" | "Display"
+            | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash"
+            | "Iterator" | "IntoIterator" | "FromIterator"
+            | "From" | "Into" | "TryFrom" | "TryInto"
+            | "AsRef" | "AsMut" | "Borrow" | "BorrowMut"
+            | "Deref" | "DerefMut"
+            | "Drop" | "Sized" | "Send" | "Sync"
+            // Standard functions
+            | "drop" | "mem" | "take" | "replace" | "swap"
+    )
+}
+
+/// Check if a Rust macro invocation should be skipped
+fn is_rust_macro_builtin(name: &str) -> bool {
+    matches!(
+        name.trim_end_matches('!'),
+        "println" | "eprintln" | "print" | "eprint"
+            | "format" | "format_args"
+            | "vec"
+            | "todo" | "unimplemented" | "unreachable"
+            | "assert" | "assert_eq" | "assert_ne"
+            | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
+            | "dbg" | "cfg" | "env" | "option_env"
+            | "include" | "include_str" | "include_bytes"
+            | "concat" | "stringify"
+            | "write" | "writeln"
+            | "panic"
+            | "info" | "debug" | "warn" | "error" | "trace"
+            | "log" | "span" | "event"
+            | "matches"
+    )
+}
+
+/// Check if a TypeScript/JavaScript call is a builtin to skip
+fn is_typescript_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        // Console
+        "log" | "error" | "warn" | "debug" | "info" | "trace" | "dir" | "table"
+            // Timers
+            | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
+            | "setImmediate" | "clearImmediate"
+            // Parsing
+            | "parseInt" | "parseFloat" | "isNaN" | "isFinite"
+            // Require/import
+            | "require" | "import"
+            // Promise statics
+            | "resolve" | "reject" | "all" | "race" | "allSettled" | "any"
+            // Object statics
+            | "keys" | "values" | "entries" | "assign" | "freeze" | "seal"
+            | "defineProperty" | "getOwnPropertyNames" | "getPrototypeOf"
+            // Array statics
+            | "isArray" | "from" | "of"
+            // JSON
+            | "parse" | "stringify"
+            // Math
+            | "floor" | "ceil" | "round" | "abs" | "min" | "max" | "random"
+            | "sqrt" | "pow" | "sin" | "cos" | "tan"
+            // String methods (common)
+            | "toString" | "valueOf" | "charAt" | "charCodeAt" | "codePointAt"
+            | "concat" | "includes" | "indexOf" | "lastIndexOf"
+            | "match" | "replace" | "search" | "slice" | "split"
+            | "substring" | "substr" | "toLowerCase" | "toUpperCase" | "trim"
+            // Array methods (common)
+            | "push" | "pop" | "shift" | "unshift" | "splice"
+            | "map" | "filter" | "reduce" | "reduceRight" | "find" | "findIndex"
+            | "every" | "some" | "forEach" | "join" | "sort" | "reverse"
+            | "fill" | "copyWithin" | "flat" | "flatMap"
+            // Reflect/Proxy
+            | "Reflect" | "Proxy"
+            // Node.js globals
+            | "process" | "Buffer" | "__dirname" | "__filename"
+    )
+}
+
+/// Check if a TypeScript object.method call should be skipped
+fn is_typescript_builtin_method(obj: &str, method: &str) -> bool {
+    match obj {
+        "console" => matches!(method, "log" | "error" | "warn" | "debug" | "info" | "trace" | "dir" | "table" | "time" | "timeEnd" | "assert"),
+        "Promise" => matches!(method, "resolve" | "reject" | "all" | "race" | "allSettled" | "any"),
+        "Object" => matches!(method, "keys" | "values" | "entries" | "assign" | "freeze" | "seal" | "defineProperty" | "getOwnPropertyNames" | "getPrototypeOf" | "create" | "hasOwn"),
+        "Array" => matches!(method, "isArray" | "from" | "of"),
+        "JSON" => matches!(method, "parse" | "stringify"),
+        "Math" => true, // All Math methods are builtins
+        "Number" => matches!(method, "isNaN" | "isFinite" | "isInteger" | "isSafeInteger" | "parseInt" | "parseFloat"),
+        "String" => matches!(method, "fromCharCode" | "fromCodePoint" | "raw"),
+        "Date" => matches!(method, "now" | "parse" | "UTC"),
+        "Reflect" => true, // All Reflect methods are builtins
+        "process" => true, // Node.js process is builtin
+        "Buffer" => true, // Node.js Buffer is builtin
+        _ => false,
+    }
+}
+
+// ═══ Call Extraction - Rust ═══
+
+/// Build scope map for Rust — maps line ranges to function IDs
+fn build_scope_map_rust(
+    node: tree_sitter::Node,
+    source: &[u8],
+    rel_path: &str,
+    scope_map: &mut Vec<(usize, usize, String, Option<String>)>,
+) {
+    let mut stack: Vec<(tree_sitter::Node, Option<String>)> = vec![(node, None)];
+
+    while let Some((current, impl_ctx)) = stack.pop() {
+        match current.kind() {
+            "impl_item" => {
+                // Extract impl target type
+                let impl_type = extract_impl_type(current, source);
+                let impl_id = impl_type.as_ref().map(|t| format!("class:{}:{}", rel_path, t));
+                
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, impl_id.clone()));
+                    }
+                }
+            }
+            "function_item" => {
+                let func_name = current
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+
+                if !func_name.is_empty() {
+                    let start_line = current.start_position().row + 1;
+                    let end_line = current.end_position().row + 1;
+
+                    let func_id = if let Some(ref impl_type) = impl_ctx {
+                        let type_name = impl_type.rsplit(':').next().unwrap_or("");
+                        if type_name.is_empty() {
+                            format!("method:{}:{}", rel_path, func_name)
+                        } else {
+                            format!("method:{}:{}.{}", rel_path, type_name, func_name)
+                        }
+                    } else {
+                        format!("func:{}:{}", rel_path, func_name)
+                    };
+
+                    scope_map.push((start_line, end_line, func_id, impl_ctx.clone()));
+                }
+
+                // Recurse into nested functions/closures
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, impl_ctx.clone()));
+                    }
+                }
+            }
+            "closure_expression" => {
+                // Track closures as anonymous scopes but don't create IDs for them
+                // The containing function will handle the call
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, impl_ctx.clone()));
+                    }
+                }
+            }
+            "mod_item" => {
+                // Recurse into inline modules
+                if let Some(body) = current.child_by_field_name("body") {
+                    stack.push((body, impl_ctx.clone()));
+                }
+            }
+            _ => {
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, impl_ctx.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract calls from Rust AST
+fn extract_calls_rust(
+    root: tree_sitter::Node,
+    source: &[u8],
+    rel_path: &str,
+    func_name_map: &HashMap<String, Vec<String>>,
+    method_to_class: &HashMap<String, String>,
+    file_func_ids: &HashSet<String>,
+    node_pkg_map: &HashMap<String, String>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    // Build scope map
+    let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
+    build_scope_map_rust(root, source, rel_path, &mut scope_map);
+
+    let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
+
+    // Walk tree looking for calls
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        // Skip string literals and comments
+        if node.kind() == "string_literal"
+            || node.kind() == "raw_string_literal"
+            || node.kind() == "line_comment"
+            || node.kind() == "block_comment"
+        {
+            continue;
+        }
+
+        match node.kind() {
+            "call_expression" => {
+                // Function call: foo() or path::to::foo()
+                let call_line = node.start_position().row + 1;
+
+                let scope = scope_map
+                    .iter()
+                    .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
+                    .max_by_key(|(start, _, _, _)| *start);
+
+                if let Some((_start, _end, caller_id, _impl_ctx)) = scope {
+                    if let Some(func_node) = node.child_by_field_name("function") {
+                        let callee_name = extract_rust_call_target(func_node, source);
+                        
+                        if !callee_name.is_empty() && !is_rust_builtin(&callee_name) {
+                            resolve_rust_call_edge(
+                                caller_id,
+                                &callee_name,
+                                func_name_map,
+                                file_func_ids,
+                                package_dir,
+                                node_pkg_map,
+                                false,
+                                edges,
+                            );
+                        }
+                    }
+                }
+            }
+            "method_call_expression" => {
+                // Method call: obj.method() or self.method()
+                let call_line = node.start_position().row + 1;
+
+                let scope = scope_map
+                    .iter()
+                    .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
+                    .max_by_key(|(start, _, _, _)| *start);
+
+                if let Some((_start, _end, caller_id, impl_ctx)) = scope {
+                    // Get method name
+                    let method_name = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("");
+
+                    if !method_name.is_empty() && !is_rust_builtin(method_name) {
+                        // Check if receiver is self
+                        let receiver = node.child_by_field_name("value")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+
+                        if receiver == "self" || receiver == "Self" {
+                            // Self method call — resolve within impl type
+                            resolve_rust_self_method_call(
+                                caller_id,
+                                method_name,
+                                impl_ctx.as_deref(),
+                                func_name_map,
+                                method_to_class,
+                                file_func_ids,
+                                edges,
+                            );
+                        } else {
+                            // Regular method call — resolve by method name only
+                            resolve_rust_call_edge(
+                                caller_id,
+                                method_name,
+                                func_name_map,
+                                file_func_ids,
+                                package_dir,
+                                node_pkg_map,
+                                true,
+                                edges,
+                            );
+                        }
+                    }
+                }
+            }
+            "macro_invocation" => {
+                // Macro call: foo!()
+                let call_line = node.start_position().row + 1;
+
+                // Get macro name
+                let macro_name = node
+                    .child_by_field_name("macro")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+
+                if !macro_name.is_empty() && !is_rust_macro_builtin(macro_name) {
+                    let scope = scope_map
+                        .iter()
+                        .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
+                        .max_by_key(|(start, _, _, _)| *start);
+
+                    if let Some((_start, _end, caller_id, _)) = scope {
+                        // Look for macro definition
+                        let macro_id_name = format!("{}!", macro_name);
+                        if let Some(callee_ids) = func_name_map.get(&macro_id_name) {
+                            for callee_id in callee_ids.iter().take(3) {
+                                if callee_id != caller_id {
+                                    edges.push(CodeEdge {
+                                        from: caller_id.to_string(),
+                                        to: callee_id.clone(),
+                                        relation: EdgeRelation::Calls,
+                                        weight: 0.5,
+                                        call_count: 1,
+                                        in_error_path: false,
+                                        confidence: 0.7,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let child_count = node.child_count();
+        for i in (0..child_count).rev() {
+            if let Some(child) = node.child(i) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+/// Extract the target of a Rust call expression
+fn extract_rust_call_target(node: tree_sitter::Node, source: &[u8]) -> String {
+    match node.kind() {
+        "identifier" => {
+            node.utf8_text(source).unwrap_or("").to_string()
+        }
+        "scoped_identifier" | "field_expression" => {
+            // For path::to::fn or Type::method, get the last segment
+            node.utf8_text(source).ok()
+                .map(|s| s.rsplit("::").next().unwrap_or(s).to_string())
+                .unwrap_or_default()
+        }
+        "generic_function" => {
+            // foo::<T>() — extract foo
+            node.child_by_field_name("function")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.rsplit("::").next().unwrap_or(s).to_string())
+                .unwrap_or_default()
+        }
+        _ => {
+            // Fallback: get the text and extract last identifier
+            node.utf8_text(source).ok()
+                .map(|s| s.rsplit("::").next().unwrap_or(s).trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_').to_string())
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// Extract impl type from impl_item node
+fn extract_impl_type(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "type_identifier" | "generic_type" | "scoped_type_identifier" => {
+                if child.kind() == "generic_type" {
+                    return child.child_by_field_name("type")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .map(|s| s.to_string());
+                } else if child.kind() == "scoped_type_identifier" {
+                    return child.utf8_text(source).ok()
+                        .map(|s| s.rsplit("::").next().unwrap_or(s).to_string());
+                } else {
+                    return child.utf8_text(source).ok().map(|s| s.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Resolve and add Rust call edge
+fn resolve_rust_call_edge(
+    caller_id: &str,
+    callee_name: &str,
+    func_name_map: &HashMap<String, Vec<String>>,
+    file_func_ids: &HashSet<String>,
+    package_dir: &str,
+    node_pkg_map: &HashMap<String, String>,
+    is_method_call: bool,
+    edges: &mut Vec<CodeEdge>,
+) {
+    if let Some(callee_ids) = func_name_map.get(callee_name) {
+        // Prioritize: same file > same package > global (limited)
+        let same_file: Vec<&String> = callee_ids
+            .iter()
+            .filter(|id| file_func_ids.contains(*id))
+            .collect();
+        let same_pkg: Vec<&String> = callee_ids
+            .iter()
+            .filter(|id| {
+                node_pkg_map
+                    .get(id.as_str())
+                    .map(|pkg| pkg == package_dir)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let global_limit = if is_method_call { 10 } else { 3 };
+
+        let (targets, confidence): (Vec<&String>, f32) = if !same_file.is_empty() {
+            (same_file, 0.9)
+        } else if !same_pkg.is_empty() {
+            (same_pkg, 0.7)
+        } else if callee_ids.len() <= global_limit {
+            (callee_ids.iter().collect(), 0.5)
+        } else {
+            (vec![], 0.0)
+        };
+
+        for callee_id in targets {
+            if callee_id != caller_id {
+                edges.push(CodeEdge {
+                    from: caller_id.to_string(),
+                    to: callee_id.clone(),
+                    relation: EdgeRelation::Calls,
+                    weight: 0.5,
+                    call_count: 1,
+                    in_error_path: false,
+                    confidence,
+                });
+            }
+        }
+    }
+}
+
+/// Resolve self.method() calls in Rust
+fn resolve_rust_self_method_call(
+    caller_id: &str,
+    method_name: &str,
+    impl_type: Option<&str>,
+    func_name_map: &HashMap<String, Vec<String>>,
+    method_to_class: &HashMap<String, String>,
+    file_func_ids: &HashSet<String>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    if let Some(callee_ids) = func_name_map.get(method_name) {
+        if let Some(type_id) = impl_type {
+            // Filter methods that belong to the same type or its traits
+            let scoped: Vec<&String> = callee_ids
+                .iter()
+                .filter(|id| {
+                    method_to_class
+                        .get(*id)
+                        .map(|cls| cls == type_id)
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            let targets = if !scoped.is_empty() {
+                scoped
+            } else if callee_ids.len() <= 5 {
+                callee_ids.iter().collect()
+            } else {
+                callee_ids
+                    .iter()
+                    .filter(|id| file_func_ids.contains(*id))
+                    .collect()
+            };
+
+            for callee_id in targets {
+                if callee_id != caller_id {
+                    edges.push(CodeEdge {
+                        from: caller_id.to_string(),
+                        to: callee_id.clone(),
+                        relation: EdgeRelation::Calls,
+                        weight: 0.5,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 0.9,
+                    });
+                }
+            }
+        } else {
+            // No impl context, use same-file heuristic
+            for callee_id in callee_ids {
+                if callee_id != caller_id && file_func_ids.contains(callee_id) {
+                    edges.push(CodeEdge {
+                        from: caller_id.to_string(),
+                        to: callee_id.clone(),
+                        relation: EdgeRelation::Calls,
+                        weight: 0.5,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 0.6,
+                    });
+                }
+            }
+        }
+    }
+}
+
+// ═══ Call Extraction - TypeScript ═══
+
+/// Build scope map for TypeScript — maps line ranges to function IDs
+fn build_scope_map_typescript(
+    node: tree_sitter::Node,
+    source: &[u8],
+    rel_path: &str,
+    scope_map: &mut Vec<(usize, usize, String, Option<String>)>,
+) {
+    let mut stack: Vec<(tree_sitter::Node, Option<String>)> = vec![(node, None)];
+
+    while let Some((current, class_ctx)) = stack.pop() {
+        match current.kind() {
+            "class_declaration" | "class" | "abstract_class_declaration" => {
+                let class_name = current
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let class_id = if !class_name.is_empty() {
+                    Some(format!("class:{}:{}", rel_path, class_name))
+                } else {
+                    class_ctx.clone()
+                };
+
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, class_id.clone()));
+                    }
+                }
+            }
+            "function_declaration" | "function" => {
+                let func_name = current
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+
+                if !func_name.is_empty() {
+                    let start_line = current.start_position().row + 1;
+                    let end_line = current.end_position().row + 1;
+                    let func_id = format!("func:{}:{}", rel_path, func_name);
+                    scope_map.push((start_line, end_line, func_id, class_ctx.clone()));
+                }
+
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, class_ctx.clone()));
+                    }
+                }
+            }
+            "method_definition" | "method_signature" => {
+                let method_name = current
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+
+                if !method_name.is_empty() {
+                    let start_line = current.start_position().row + 1;
+                    let end_line = current.end_position().row + 1;
+
+                    let method_id = if let Some(ref cls) = class_ctx {
+                        let cls_name = cls.rsplit(':').next().unwrap_or("");
+                        if cls_name.is_empty() {
+                            format!("method:{}:{}", rel_path, method_name)
+                        } else {
+                            format!("method:{}:{}.{}", rel_path, cls_name, method_name)
+                        }
+                    } else {
+                        format!("method:{}:{}", rel_path, method_name)
+                    };
+
+                    scope_map.push((start_line, end_line, method_id, class_ctx.clone()));
+                }
+
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, class_ctx.clone()));
+                    }
+                }
+            }
+            "arrow_function" => {
+                // Arrow functions inside variable declarators
+                // The scope is tracked but ID comes from the variable name
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, class_ctx.clone()));
+                    }
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                // Check for const foo = () => {}
+                let mut cursor = current.walk();
+                for child in current.children(&mut cursor) {
+                    if child.kind() == "variable_declarator" {
+                        let var_name = child.child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        
+                        if let Some(value) = child.child_by_field_name("value") {
+                            if value.kind() == "arrow_function" || value.kind() == "function" {
+                                if !var_name.is_empty() {
+                                    let start_line = current.start_position().row + 1;
+                                    let end_line = current.end_position().row + 1;
+                                    let func_id = format!("func:{}:{}", rel_path, var_name);
+                                    scope_map.push((start_line, end_line, func_id, class_ctx.clone()));
+                                }
+                            }
+                        }
+                        stack.push((child, class_ctx.clone()));
+                    }
+                }
+            }
+            "export_statement" => {
+                // Unwrap export and process inner
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, class_ctx.clone()));
+                    }
+                }
+            }
+            _ => {
+                let child_count = current.child_count();
+                for i in (0..child_count).rev() {
+                    if let Some(child) = current.child(i) {
+                        stack.push((child, class_ctx.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract calls from TypeScript AST
+fn extract_calls_typescript(
+    root: tree_sitter::Node,
+    source: &[u8],
+    rel_path: &str,
+    func_name_map: &HashMap<String, Vec<String>>,
+    method_to_class: &HashMap<String, String>,
+    file_func_ids: &HashSet<String>,
+    file_imported_names: &HashMap<String, HashSet<String>>,
+    node_pkg_map: &HashMap<String, String>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    // Build scope map
+    let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
+    build_scope_map_typescript(root, source, rel_path, &mut scope_map);
+
+    let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
+
+    // Walk tree looking for calls
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        // Skip string literals and comments
+        if node.kind() == "string" 
+            || node.kind() == "template_string"
+            || node.kind() == "comment"
+        {
+            continue;
+        }
+
+        match node.kind() {
+            "call_expression" => {
+                let call_line = node.start_position().row + 1;
+
+                let scope = scope_map
+                    .iter()
+                    .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
+                    .max_by_key(|(start, _, _, _)| *start);
+
+                if let Some((_start, _end, caller_id, caller_class)) = scope {
+                    if let Some(func_node) = node.child_by_field_name("function") {
+                        match func_node.kind() {
+                            "identifier" => {
+                                let callee_name = func_node.utf8_text(source).unwrap_or("");
+                                if !callee_name.is_empty() && !is_typescript_builtin(callee_name) {
+                                    resolve_typescript_call_edge(
+                                        caller_id,
+                                        callee_name,
+                                        func_name_map,
+                                        file_func_ids,
+                                        file_imported_names,
+                                        rel_path,
+                                        package_dir,
+                                        node_pkg_map,
+                                        false,
+                                        edges,
+                                    );
+                                }
+                            }
+                            "member_expression" => {
+                                // obj.method()
+                                let obj_node = func_node.child_by_field_name("object");
+                                let prop_node = func_node.child_by_field_name("property");
+
+                                if let (Some(obj), Some(prop)) = (obj_node, prop_node) {
+                                    let obj_text = obj.utf8_text(source).unwrap_or("");
+                                    let method_name = prop.utf8_text(source).unwrap_or("");
+
+                                    if !method_name.is_empty() {
+                                        // Check for builtin object.method patterns
+                                        if is_typescript_builtin_method(obj_text, method_name) {
+                                            // Skip builtin
+                                        } else if obj_text == "this" {
+                                            // this.method() — resolve within class
+                                            resolve_typescript_self_method_call(
+                                                caller_id,
+                                                method_name,
+                                                caller_class.as_deref(),
+                                                func_name_map,
+                                                method_to_class,
+                                                file_func_ids,
+                                                edges,
+                                            );
+                                        } else if !is_typescript_builtin(method_name) {
+                                            // Regular method call
+                                            resolve_typescript_call_edge(
+                                                caller_id,
+                                                method_name,
+                                                func_name_map,
+                                                file_func_ids,
+                                                file_imported_names,
+                                                rel_path,
+                                                package_dir,
+                                                node_pkg_map,
+                                                true,
+                                                edges,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "new_expression" => {
+                // new ClassName()
+                let call_line = node.start_position().row + 1;
+
+                let scope = scope_map
+                    .iter()
+                    .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
+                    .max_by_key(|(start, _, _, _)| *start);
+
+                if let Some((_start, _end, caller_id, _)) = scope {
+                    if let Some(constructor) = node.child_by_field_name("constructor") {
+                        let class_name = constructor.utf8_text(source).unwrap_or("");
+                        
+                        // Skip builtins like new Promise, new Error, etc.
+                        if !class_name.is_empty() 
+                            && !matches!(class_name, "Promise" | "Error" | "Array" | "Object" | "Map" | "Set" | "WeakMap" | "WeakSet" | "Date" | "RegExp" | "URL" | "URLSearchParams" | "Headers" | "Request" | "Response" | "FormData" | "Blob" | "File" | "FileReader" | "Image" | "Event" | "CustomEvent" | "AbortController")
+                        {
+                            // Look for class constructor by name
+                            if let Some(callee_ids) = func_name_map.get(class_name) {
+                                let targets: Vec<&String> = if callee_ids.len() <= 5 {
+                                    callee_ids.iter().collect()
+                                } else {
+                                    callee_ids.iter().filter(|id| file_func_ids.contains(*id)).collect()
+                                };
+
+                                for callee_id in targets {
+                                    if callee_id != caller_id {
+                                        edges.push(CodeEdge {
+                                            from: caller_id.to_string(),
+                                            to: callee_id.clone(),
+                                            relation: EdgeRelation::Calls,
+                                            weight: 0.5,
+                                            call_count: 1,
+                                            in_error_path: false,
+                                            confidence: 0.7,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let child_count = node.child_count();
+        for i in (0..child_count).rev() {
+            if let Some(child) = node.child(i) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+/// Resolve and add TypeScript call edge
+fn resolve_typescript_call_edge(
+    caller_id: &str,
+    callee_name: &str,
+    func_name_map: &HashMap<String, Vec<String>>,
+    file_func_ids: &HashSet<String>,
+    file_imported_names: &HashMap<String, HashSet<String>>,
+    rel_path: &str,
+    package_dir: &str,
+    node_pkg_map: &HashMap<String, String>,
+    is_method_call: bool,
+    edges: &mut Vec<CodeEdge>,
+) {
+    if let Some(callee_ids) = func_name_map.get(callee_name) {
+        let same_file: Vec<&String> = callee_ids
+            .iter()
+            .filter(|id| file_func_ids.contains(*id))
+            .collect();
+        let imported: Vec<&String> = callee_ids
+            .iter()
+            .filter(|_id| {
+                file_imported_names
+                    .get(rel_path)
+                    .map(|names| names.contains(callee_name))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let same_pkg: Vec<&String> = callee_ids
+            .iter()
+            .filter(|id| {
+                node_pkg_map
+                    .get(id.as_str())
+                    .map(|pkg| pkg == package_dir)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let global_limit = if is_method_call { 15 } else { 3 };
+
+        let (targets, confidence): (Vec<&String>, f32) = if !same_file.is_empty() {
+            (same_file, 0.9)
+        } else if !imported.is_empty() {
+            (imported, 0.8)
+        } else if !same_pkg.is_empty() {
+            (same_pkg, 0.7)
+        } else if callee_ids.len() <= global_limit {
+            (callee_ids.iter().collect(), 0.5)
+        } else {
+            (vec![], 0.0)
+        };
+
+        for callee_id in targets {
+            if callee_id != caller_id {
+                edges.push(CodeEdge {
+                    from: caller_id.to_string(),
+                    to: callee_id.clone(),
+                    relation: EdgeRelation::Calls,
+                    weight: 0.5,
+                    call_count: 1,
+                    in_error_path: false,
+                    confidence,
+                });
+            }
+        }
+    }
+}
+
+/// Resolve this.method() calls in TypeScript
+fn resolve_typescript_self_method_call(
+    caller_id: &str,
+    method_name: &str,
+    caller_class: Option<&str>,
+    func_name_map: &HashMap<String, Vec<String>>,
+    method_to_class: &HashMap<String, String>,
+    file_func_ids: &HashSet<String>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    if let Some(callee_ids) = func_name_map.get(method_name) {
+        if let Some(class_id) = caller_class {
+            let scoped: Vec<&String> = callee_ids
+                .iter()
+                .filter(|id| {
+                    method_to_class
+                        .get(*id)
+                        .map(|cls| cls == class_id)
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            let targets = if !scoped.is_empty() {
+                scoped
+            } else if callee_ids.len() <= 5 {
+                callee_ids.iter().collect()
+            } else {
+                callee_ids
+                    .iter()
+                    .filter(|id| file_func_ids.contains(*id))
+                    .collect()
+            };
+
+            for callee_id in targets {
+                if callee_id != caller_id {
+                    edges.push(CodeEdge {
+                        from: caller_id.to_string(),
+                        to: callee_id.clone(),
+                        relation: EdgeRelation::Calls,
+                        weight: 0.5,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 0.9,
+                    });
+                }
+            }
+        } else {
+            // No class context
+            for callee_id in callee_ids {
+                if callee_id != caller_id && file_func_ids.contains(callee_id) {
+                    edges.push(CodeEdge {
+                        from: caller_id.to_string(),
+                        to: callee_id.clone(),
+                        relation: EdgeRelation::Calls,
+                        weight: 0.5,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 0.6,
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5105,5 +6127,209 @@ namespace MyNamespace {
         
         // Imports
         assert!(edges.iter().any(|e| e.relation == EdgeRelation::Imports), "Should have import edges");
+    }
+
+    #[test]
+    fn test_rust_call_extraction() {
+        let content = r#"
+pub struct Calculator {
+    value: i32,
+}
+
+impl Calculator {
+    pub fn new() -> Self {
+        Self { value: 0 }
+    }
+    
+    pub fn add(&mut self, x: i32) {
+        self.value += x;
+        self.log_operation("add");
+    }
+    
+    fn log_operation(&self, op: &str) {
+        helper_fn(op);
+    }
+}
+
+fn helper_fn(msg: &str) {
+    println!("{}", msg);
+}
+
+pub fn create_and_use() {
+    let mut calc = Calculator::new();
+    calc.add(5);
+    helper_fn("done");
+}
+"#;
+        // Use full extract_from_dir simulation
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+        
+        let mut class_map = HashMap::new();
+        let (nodes, mut edges, _) = extract_rust_tree_sitter("calc.rs", content, &mut parser, &mut class_map);
+
+        // Build func_map for call extraction
+        let func_map: HashMap<String, Vec<String>> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .fold(HashMap::new(), |mut acc, n| {
+                acc.entry(n.name.clone()).or_default().push(n.id.clone());
+                acc
+            });
+
+        // Build method_to_class
+        let method_to_class: HashMap<String, String> = edges
+            .iter()
+            .filter(|e| e.relation == EdgeRelation::DefinedIn && e.to.starts_with("class:"))
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+
+        let file_func_ids: HashSet<String> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.id.clone())
+            .collect();
+
+        let node_pkg_map: HashMap<String, String> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), "".to_string()))
+            .collect();
+
+        // Parse and extract calls
+        let tree = parser.parse(content, None).unwrap();
+        let root = tree.root_node();
+        
+        extract_calls_rust(
+            root,
+            content.as_bytes(),
+            "calc.rs",
+            &func_map,
+            &method_to_class,
+            &file_func_ids,
+            &node_pkg_map,
+            &mut edges,
+        );
+
+        // Verify call edges exist
+        let call_edges: Vec<_> = edges.iter()
+            .filter(|e| e.relation == EdgeRelation::Calls)
+            .collect();
+        
+        assert!(!call_edges.is_empty(), "Should have call edges");
+        
+        // Check specific calls
+        assert!(
+            call_edges.iter().any(|e| e.from.contains("create_and_use") && e.to.contains("helper_fn")),
+            "create_and_use should call helper_fn"
+        );
+        
+        assert!(
+            call_edges.iter().any(|e| e.from.contains("log_operation") && e.to.contains("helper_fn")),
+            "log_operation should call helper_fn"
+        );
+    }
+
+    #[test]
+    fn test_typescript_call_extraction() {
+        let content = r#"
+export class UserService {
+    private helper: Helper;
+    
+    constructor() {
+        this.helper = new Helper();
+    }
+    
+    getUser(id: string) {
+        return this.fetchFromDb(id);
+    }
+    
+    private fetchFromDb(id: string) {
+        return formatUser(this.helper.query(id));
+    }
+}
+
+function formatUser(data: any) {
+    return processData(data);
+}
+
+function processData(data: any) {
+    return data;
+}
+
+class Helper {
+    query(id: string) {
+        return null;
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()).unwrap();
+        
+        let mut class_map = HashMap::new();
+        let (nodes, mut edges, imports) = extract_typescript_tree_sitter("user.ts", content, &mut parser, &mut class_map, "ts");
+
+        // Build func_map
+        let func_map: HashMap<String, Vec<String>> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .fold(HashMap::new(), |mut acc, n| {
+                acc.entry(n.name.clone()).or_default().push(n.id.clone());
+                acc
+            });
+
+        // Build method_to_class
+        let method_to_class: HashMap<String, String> = edges
+            .iter()
+            .filter(|e| e.relation == EdgeRelation::DefinedIn && e.to.starts_with("class:"))
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+
+        let file_func_ids: HashSet<String> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.id.clone())
+            .collect();
+
+        let mut file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
+        file_imported_names.insert("user.ts".to_string(), imports);
+
+        let node_pkg_map: HashMap<String, String> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), "".to_string()))
+            .collect();
+
+        // Parse and extract calls
+        let tree = parser.parse(content, None).unwrap();
+        let root = tree.root_node();
+        
+        extract_calls_typescript(
+            root,
+            content.as_bytes(),
+            "user.ts",
+            &func_map,
+            &method_to_class,
+            &file_func_ids,
+            &file_imported_names,
+            &node_pkg_map,
+            &mut edges,
+        );
+
+        // Verify call edges exist
+        let call_edges: Vec<_> = edges.iter()
+            .filter(|e| e.relation == EdgeRelation::Calls)
+            .collect();
+        
+        assert!(!call_edges.is_empty(), "Should have call edges");
+        
+        // Check specific calls
+        assert!(
+            call_edges.iter().any(|e| e.from.contains("fetchFromDb") && e.to.contains("formatUser")),
+            "fetchFromDb should call formatUser"
+        );
+        
+        assert!(
+            call_edges.iter().any(|e| e.from.contains("formatUser") && e.to.contains("processData")),
+            "formatUser should call processData"
+        );
     }
 }
