@@ -2786,7 +2786,13 @@ fn extract_method_node(
     }
 
     let line_num = node.start_position().row + 1;
-    let method_id = format!("method:{}:{}", path, func_name);
+    // Include parent class name in method ID to avoid collisions
+    let parent_name = class_id.rsplit(':').next().unwrap_or("");
+    let method_id = if parent_name.is_empty() {
+        format!("method:{}:{}", path, func_name)
+    } else {
+        format!("method:{}:{}.{}", path, parent_name, func_name)
+    };
 
     let signature = {
         let sig_text = &source_str[node.start_byte()..];
@@ -3044,8 +3050,13 @@ fn build_scope_map(
                     let start_line = current.start_position().row + 1;
                     let end_line = current.end_position().row + 1;
 
-                    let func_id = if class_ctx.is_some() {
-                        format!("method:{}:{}", rel_path, func_name)
+                    let func_id = if let Some(ref cls) = class_ctx {
+                        let cls_name = cls.rsplit(':').next().unwrap_or("");
+                        if cls_name.is_empty() {
+                            format!("method:{}:{}", rel_path, func_name)
+                        } else {
+                            format!("method:{}:{}.{}", rel_path, cls_name, func_name)
+                        }
                     } else {
                         format!("func:{}:{}", rel_path, func_name)
                     };
@@ -3843,7 +3854,14 @@ fn extract_rust_method(
     if name.is_empty() { return; }
 
     let line = node.start_position().row + 1;
-    let method_id = format!("method:{}:{}", path, name);
+    // Include parent type name in method ID to avoid collisions
+    // parent_id is like "class:path:TypeName" — extract the type name
+    let parent_name = parent_id.rsplit(':').next().unwrap_or("");
+    let method_id = if parent_name.is_empty() {
+        format!("method:{}:{}", path, name)
+    } else {
+        format!("method:{}:{}.{}", path, parent_name, name)
+    };
 
     let signature = extract_rust_signature(node, source_str);
     let docstring = extract_rust_docstring(node, source_str);
@@ -4435,7 +4453,13 @@ fn extract_typescript_method(
     if name.is_empty() { return; }
 
     let line = node.start_position().row + 1;
-    let method_id = format!("method:{}:{}", path, name);
+    // Include parent class name in method ID to avoid collisions
+    let parent_name = class_id.rsplit(':').next().unwrap_or("");
+    let method_id = if parent_name.is_empty() {
+        format!("method:{}:{}", path, name)
+    } else {
+        format!("method:{}:{}.{}", path, parent_name, name)
+    };
 
     let signature = extract_typescript_signature(node, source_str);
     let docstring = extract_typescript_docstring(node, source_str);
