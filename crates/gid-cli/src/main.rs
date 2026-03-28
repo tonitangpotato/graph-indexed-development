@@ -12,9 +12,10 @@ use gid_core::{
     parser::find_graph_file,
     query::QueryEngine,
     validator::Validator,
-    CodeGraph, CodeNode, NodeKind, EdgeRelation,
+    CodeGraph, CodeNode, NodeKind,
     analyze_impact, format_impact_for_llm,
     assess_complexity_from_graph, assess_risk_level,
+    build_unified_graph,
     // New modules
     HistoryManager,
     render, VisualFormat,
@@ -1074,20 +1075,52 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
     if !json_flag {
         eprintln!("Extracting code graph from {}...", dir.display());
     }
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let code_graph = CodeGraph::extract_from_dir(&dir);
+    
+    // Load existing graph if output file exists (for merge behavior)
+    let existing_graph = if let Some(out_path) = output {
+        if out_path.exists() {
+            load_graph(out_path).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    // Convert to unified Graph format
+    let task_graph = existing_graph.unwrap_or_else(Graph::default);
+    let unified = build_unified_graph(&code_graph, &task_graph);
     
     let output_str = match format {
-        "yaml" | "yml" => serde_yaml::to_string(&graph)?,
-        "json" => serde_json::to_string_pretty(&graph)?,
+        "yaml" | "yml" => serde_yaml::to_string(&unified)?,
+        "json" => serde_json::to_string_pretty(&unified)?,
         "summary" | _ => {
             if json_flag {
-                serde_json::to_string_pretty(&graph)?
+                serde_json::to_string_pretty(&unified)?
             } else {
-                let file_count = graph.nodes.iter().filter(|n| n.kind == NodeKind::File).count();
-                let class_count = graph.nodes.iter().filter(|n| n.kind == NodeKind::Class).count();
-                let func_count = graph.nodes.iter().filter(|n| n.kind == NodeKind::Function).count();
-                let import_count = graph.edges.iter().filter(|e| e.relation == EdgeRelation::Imports).count();
-                let call_count = graph.edges.iter().filter(|e| e.relation == EdgeRelation::Calls).count();
+                // Count nodes by node_type from unified graph
+                let file_count = unified.nodes.iter()
+                    .filter(|n| n.node_type.as_deref() == Some("file"))
+                    .count();
+                let class_count = unified.nodes.iter()
+                    .filter(|n| n.node_type.as_deref() == Some("class"))
+                    .count();
+                let func_count = unified.nodes.iter()
+                    .filter(|n| n.node_type.as_deref() == Some("function"))
+                    .count();
+                let task_count = unified.nodes.iter()
+                    .filter(|n| n.node_type.is_none() || 
+                            !["file", "class", "function", "module"].contains(&n.node_type.as_deref().unwrap_or("")))
+                    .count();
+                
+                // Count edges by relation
+                let import_count = unified.edges.iter()
+                    .filter(|e| e.relation == "imports")
+                    .count();
+                let call_count = unified.edges.iter()
+                    .filter(|e| e.relation == "calls")
+                    .count();
                 
                 let mut s = format!(
                     "Code Graph Summary\n{}\n\n",
@@ -1095,13 +1128,19 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
                 );
                 s.push_str(&format!("📊 {} files, {} classes/structs, {} functions\n", 
                     file_count, class_count, func_count));
+                if task_count > 0 {
+                    s.push_str(&format!("📋 {} task nodes (preserved from existing graph)\n", task_count));
+                }
                 s.push_str(&format!("🔗 {} edges ({} imports, {} calls)\n\n", 
-                    graph.edges.len(), import_count, call_count));
+                    unified.edges.len(), import_count, call_count));
                 
+                // Count entities per file from metadata
                 let mut file_entities: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                for node in &graph.nodes {
-                    if node.kind != NodeKind::File {
-                        *file_entities.entry(node.file_path.clone()).or_default() += 1;
+                for node in &unified.nodes {
+                    if let Some(file_path) = node.metadata.get("file_path").and_then(|v| v.as_str()) {
+                        if node.node_type.as_deref() != Some("file") {
+                            *file_entities.entry(file_path.to_string()).or_default() += 1;
+                        }
                     }
                 }
                 let mut files: Vec<_> = file_entities.into_iter().collect();
@@ -1124,7 +1163,7 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
     if let Some(out_path) = output {
         std::fs::write(out_path, &output_str)?;
         if !json_flag {
-            println!("✓ Wrote code graph to {}", out_path.display());
+            println!("✓ Wrote unified graph to {}", out_path.display());
         }
     } else {
         print!("{}", output_str);

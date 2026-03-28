@@ -1,241 +1,158 @@
-# @gid/mcp
+# GID MCP Server
 
-[![npm](https://img.shields.io/npm/v/graph-indexed-development-mcp)](https://www.npmjs.com/package/graph-indexed-development-mcp)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+Model Context Protocol server for Graph-Indexed Development.
 
-**MCP server for Graph Indexed Development** — 39 tools for AI assistants (Claude, Cursor, VS Code).
+This is a **thin wrapper** around the `gid` Rust CLI binary. All graph operations go through `gid-core` (Rust) for consistency and schema correctness.
 
-Give your AI assistant structural awareness of your codebase. GID answers questions like:
-- *"What breaks if I change UserService?"*
-- *"What's the dependency path from Controller to Database?"*
-- *"Design an auth system with the right layers"*
+## Prerequisites
 
----
+Install the gid CLI:
+
+```bash
+cargo install gid-dev-cli
+```
+
+Verify it's installed:
+
+```bash
+gid --version
+```
 
 ## Installation
 
-### Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "gid": {
-      "command": "npx",
-      "args": ["graph-indexed-development-mcp"]
-    }
-  }
-}
+```bash
+npm install @gid/mcp
 ```
 
-### Claude Code
+## Usage
+
+### With mcporter
 
 ```bash
-claude mcp add gid -- npx graph-indexed-development-mcp
+# Add to your MCP config
+mcporter add gid /path/to/packages/mcp/dist/index.js
+
+# List tools
+mcporter list gid
+
+# Call a tool
+mcporter call gid.gid_read
+mcporter call gid.gid_tasks
 ```
 
-### Cursor / VS Code
+### Standalone
 
-Add to your MCP settings:
+```bash
+# Build
+npm run build
 
-```json
-{
-  "gid": {
-    "command": "npx",
-    "args": ["graph-indexed-development-mcp"]
-  }
-}
+# Run (stdio transport)
+node dist/index.js
 ```
 
----
+## Tools
 
-## Quick Start
+All 39 tools from the original GID MCP, now backed by the Rust CLI:
 
-After installation, ask your AI assistant:
+### Query Operations (5)
+- `gid_query_impact` - Impact analysis: what nodes are affected by a change?
+- `gid_query_deps` - Get dependencies/dependents of a node
+- `gid_query_common_cause` - Find shared dependencies between two nodes
+- `gid_query_path` - Find path between two nodes
+- `gid_query_topo` - Topological sort of the graph
 
-```
-"Initialize a GID graph for this project"
-→ Uses gid_init
+### Graph Operations (11)
+- `gid_read` - Read the graph (yaml/json/summary)
+- `gid_init` - Initialize a new graph
+- `gid_validate` - Validate graph structure
+- `gid_tasks` - List tasks with status filter
+- `gid_task_update` - Update task status
+- `gid_add_node` - Add a node
+- `gid_remove_node` - Remove a node
+- `gid_add_edge` - Add an edge
+- `gid_remove_edge` - Remove an edge
+- `gid_edit_graph` - Batch operations (JSON array)
+- `gid_complete` - Mark task done, show unblocked tasks
 
-"Extract the dependency graph from the codebase"
-→ Uses gid_extract
+### Code Analysis (11)
+- `gid_extract` - Extract graph from code
+- `gid_analyze` - Analyze file dependencies
+- `gid_code_search` - Search code by keywords
+- `gid_code_failures` - Analyze test failures
+- `gid_code_symptoms` - Find symptoms from problem description
+- `gid_code_trace` - Trace causal chains to root causes
+- `gid_code_complexity` - Assess code complexity
+- `gid_code_impact` - Impact of changing files
+- `gid_code_snippets` - Extract relevant code snippets
+- `gid_file_summary` - File summary for AI
+- `gid_schema` - Show code graph schema
 
-"What would break if I change UserService?"
-→ Uses gid_query_impact
+### Design/AI Operations (3)
+- `gid_design` - Generate LLM prompt for graph design
+- `gid_semantify` - Generate prompt to semantify graph
+- `gid_advise` - Validate and get improvement suggestions
 
-"Design an e-commerce backend with auth, payments, orders"
-→ Uses gid_design
+### History (4)
+- `gid_history_list` - List snapshots
+- `gid_history_save` - Save snapshot
+- `gid_history_diff` - Diff against historical version
+- `gid_history_restore` - Restore historical version
 
-"Show me the project health score"
-→ Uses gid_advise
-```
+### Refactor (4)
+- `gid_refactor_rename` - Rename node, update edges
+- `gid_refactor_merge` - Merge two nodes
+- `gid_refactor_split` - Split a node
+- `gid_refactor_extract` - Extract nodes to new parent
 
----
+### Visual (1)
+- `gid_visual` - Visualize graph (ASCII/DOT/Mermaid)
 
-## Tools (39 total)
-
-### Query & Analysis
-
-| Tool | Description |
-|------|-------------|
-| `gid_query_impact` | What's affected by changing a node |
-| `gid_query_deps` | Dependencies or dependents of a node |
-| `gid_query_common_cause` | Shared dependencies between two nodes |
-| `gid_query_path` | Dependency path between nodes |
-| `gid_query_topo` | Topological sort (valid execution order) |
-| `gid_analyze` | Deep analysis of file/function/class |
-| `gid_get_file_summary` | Structured file analysis |
-| `gid_advise` | Health score and improvement suggestions |
-| `gid_get_schema` | Graph schema with available relations |
-
-### Graph Management
-
-| Tool | Description |
-|------|-------------|
-| `gid_read` | Read graph (YAML, JSON, or summary) |
-| `gid_init` | Initialize a new graph |
-| `gid_edit_graph` | Add/update/delete nodes and edges |
-| `gid_refactor` | Rename, move, or delete nodes |
-| `gid_history` | Version history: list, diff, restore |
-| `gid_validate` | Check for cycles, orphans, errors |
-
-### Task Tracking
-
-| Tool | Description |
-|------|-------------|
-| `gid_tasks` | Query tasks (all, ready, by status) |
-| `gid_task_update` | Toggle task completion |
-| `gid_complete` | Mark task done, show unblocked |
-
-### AI-Assisted Design
-
-| Tool | Description |
-|------|-------------|
-| `gid_design` | Generate graph from natural language |
-| `gid_extract` | Extract graph from existing code |
-| `gid_semantify` | Upgrade to semantic graph (layers, components) |
-| `gid_complete_analysis` | Analyze docs for gaps and suggestions |
-
-### Code Analysis
-
-| Tool | Description |
-|------|-------------|
-| `gid_code_search` | Search code by keywords |
-| `gid_code_impact` | Impact of changing files |
-| `gid_code_failures` | Trace test failures |
-| `gid_code_symptoms` | Find symptom nodes from problem |
-| `gid_code_trace` | Trace causal chains |
-| `gid_code_complexity` | Assess change complexity |
-| `gid_code_snippets` | Extract relevant snippets |
-
-### Visualization
-
-| Tool | Description |
-|------|-------------|
-| `gid_visual` | Generate visualization (ASCII, DOT, Mermaid) |
-
-### Resources
-
-| Resource | Description |
-|----------|-------------|
-| `gid://graph` | Current dependency graph (YAML) |
-| `gid://health` | Health score and validation |
-| `gid://features` | List of features in graph |
-
----
-
-## Example Conversations
-
-### Design First, Then Build
+## Architecture
 
 ```
-You: "Design an e-commerce backend with auth, payments, order tracking"
-
-Claude uses gid_design →
-  Created 4 features: UserAuth, Payment, OrderTracking, ProductCatalog
-  Created 8 components across 4 layers
-  Created 15 dependency edges
-  Health score: 95/100
-
-You: "Now implement the AuthService based on the graph"
-
-Claude uses gid_query_deps →
-  AuthService depends on: UserRepository, TokenManager
-  Implements: UserAuth feature
-  Layer: application
-
-Claude generates code that fits the architecture.
+MCP Client (AI assistant)
+    │
+    ▼
+┌─────────────────────────┐
+│   GID MCP Server        │  ← This package (thin wrapper)
+│   (TypeScript)          │
+└────────────┬────────────┘
+             │ execSync("gid --json ...")
+             ▼
+┌─────────────────────────┐
+│   gid CLI               │  ← Rust binary
+│   (gid-cli crate)       │
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│   gid-core              │  ← Rust library
+│   (graph engine)        │
+└─────────────────────────┘
 ```
 
-### Impact Analysis
+All graph operations go through `gid-core` in Rust, ensuring:
+- Single source of truth for graph schema
+- Consistent validation across CLI and MCP
+- Optimal performance for large graphs
+- No duplicate implementations to maintain
 
+## Development
+
+```bash
+# Install dependencies
+npm install
+
+# Build
+npm run build
+
+# Run in dev mode
+npm run dev
+
+# Lint
+npm run lint
 ```
-You: "I need to refactor UserService. What would break?"
-
-Claude uses gid_query_impact →
-  Direct dependents: AuthController, ProfileController, OrderService
-  Affected features: UserRegistration, OrderPayment
-  5 components impacted, 2 features at risk
-```
-
-### Debug Correlated Failures
-
-```
-You: "Why do OrderService and PaymentService keep failing together?"
-
-Claude uses gid_query_common_cause →
-  Shared dependency: DatabaseService
-  Both services depend on it — that's likely the root cause.
-```
-
----
-
-## Graph Format
-
-GID uses `.gid/graph.yml`:
-
-```yaml
-nodes:
-  UserAuth:
-    type: Feature
-    description: User authentication
-    status: active
-    
-  AuthService:
-    type: Component
-    layer: application
-    path: src/services/auth.ts
-
-edges:
-  - from: AuthService
-    to: UserAuth
-    relation: implements
-```
-
-**Node types:** Feature, Component, Interface, Data, File, Test
-
-**Relations:** `implements`, `depends_on`, `calls`, `reads`, `writes`, `tested_by`, plus custom
-
----
-
-## Requirements
-
-- Node.js >= 20.0.0
-
----
-
-## Related
-
-- [gid-core](../../crates/gid-core) — Rust library (full API)
-- [gid-cli](../../crates/gid-cli) — Rust CLI (39 commands)
-- [GID Methodology](https://github.com/tonioyeme/graph-indexed-development-principle) — Specification
-- [GID Paper](https://zenodo.org/records/18425984) — Formal methodology (Zenodo)
-
----
 
 ## License
 
-**AGPL-3.0** — See [LICENSE](LICENSE) for details.
-
-For commercial licensing, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+AGPL-3.0-or-later

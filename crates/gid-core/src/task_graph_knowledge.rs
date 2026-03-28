@@ -20,11 +20,21 @@ pub struct ToolCallRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KnowledgeNode {
     /// Findings attached to this node (key-value pairs)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub findings: HashMap<String, String>,
     /// Cached file contents
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub file_cache: HashMap<String, String>,
     /// History of tool calls made for this node
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_history: Vec<ToolCallRecord>,
+}
+
+impl KnowledgeNode {
+    /// Returns true if this knowledge node has no data stored.
+    pub fn is_empty(&self) -> bool {
+        self.findings.is_empty() && self.file_cache.is_empty() && self.tool_history.is_empty()
+    }
 }
 
 /// A graph that supports knowledge management on nodes

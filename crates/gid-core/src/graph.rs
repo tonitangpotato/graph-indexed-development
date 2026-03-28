@@ -40,7 +40,7 @@ pub struct Node {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub node_type: Option<String>,
     /// Knowledge storage: findings, file cache, and tool history.
-    #[serde(default, flatten)]
+    #[serde(default, skip_serializing_if = "KnowledgeNode::is_empty")]
     pub knowledge: KnowledgeNode,
     /// Additional metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
