@@ -5143,7 +5143,9 @@ fn extract_calls_rust(
 
         match node.kind() {
             "call_expression" => {
-                // Function call: foo() or path::to::foo()
+                // Function call: foo(), path::to::foo(), or self.method()
+                // Note: Rust tree-sitter parses self.method() as call_expression > field_expression,
+                // NOT as method_call_expression. We need to detect self. here.
                 let call_line = node.start_position().row + 1;
 
                 let scope = scope_map
@@ -5151,21 +5153,57 @@ fn extract_calls_rust(
                     .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
                     .max_by_key(|(start, _, _, _)| *start);
 
-                if let Some((_start, _end, caller_id, _impl_ctx)) = scope {
+                if let Some((_start, _end, caller_id, impl_ctx)) = scope {
                     if let Some(func_node) = node.child_by_field_name("function") {
-                        let callee_name = extract_rust_call_target(func_node, source);
-                        
-                        if !callee_name.is_empty() && !is_rust_builtin(&callee_name) {
-                            resolve_rust_call_edge(
-                                caller_id,
-                                &callee_name,
-                                func_name_map,
-                                file_func_ids,
-                                package_dir,
-                                node_pkg_map,
-                                false,
-                                edges,
-                            );
+                        // Check if this is self.method() or Self::method()
+                        let is_self_call = if func_node.kind() == "field_expression" {
+                            // self.method() — field_expression with self receiver
+                            func_node.child(0)
+                                .map(|c| c.kind() == "self" || c.utf8_text(source).ok() == Some("self"))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+
+                        if is_self_call {
+                            // Extract method name from field_expression
+                            let method_name = func_node.child_by_field_name("field")
+                                .or_else(|| {
+                                    // fallback: last child that is field_identifier
+                                    let mut cursor = func_node.walk();
+                                    func_node.children(&mut cursor)
+                                        .filter(|c| c.kind() == "field_identifier")
+                                        .last()
+                                })
+                                .and_then(|n| n.utf8_text(source).ok())
+                                .unwrap_or("");
+
+                            if !method_name.is_empty() && !is_rust_builtin(method_name) {
+                                resolve_rust_self_method_call(
+                                    caller_id,
+                                    method_name,
+                                    impl_ctx.as_deref(),
+                                    func_name_map,
+                                    method_to_class,
+                                    file_func_ids,
+                                    edges,
+                                );
+                            }
+                        } else {
+                            let callee_name = extract_rust_call_target(func_node, source);
+                            
+                            if !callee_name.is_empty() && !is_rust_builtin(&callee_name) {
+                                resolve_rust_call_edge(
+                                    caller_id,
+                                    &callee_name,
+                                    func_name_map,
+                                    file_func_ids,
+                                    package_dir,
+                                    node_pkg_map,
+                                    false,
+                                    edges,
+                                );
+                            }
                         }
                     }
                 }

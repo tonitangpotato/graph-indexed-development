@@ -599,6 +599,17 @@ fn detect_dead_code(graph: &Graph) -> Vec<Advice> {
                 return false;
             }
             
+            // Skip trait definition methods (they define the interface, not called directly)
+            if is_trait_definition_method(node, graph) {
+                return false;
+            }
+            
+            // Skip methods in structs that have ANY trait impl
+            // (dynamic dispatch means any method could be called via trait object)
+            if is_method_in_trait_implementing_struct(node, graph) {
+                return false;
+            }
+            
             true
         })
         .collect();
@@ -688,8 +699,25 @@ fn is_code_entry_point(node: &Node) -> bool {
         return true;
     }
     
-    // CLI command handlers
+    // CLI command handlers and framework patterns
     if name.starts_with("cmd_") || name.starts_with("command_") || name.starts_with("handle_") {
+        return true;
+    }
+    
+    // Web framework route handlers (axum, actix, rocket, express)
+    if name.starts_with("get_") || name.starts_with("post_") || name.starts_with("put_") 
+        || name.starts_with("delete_") || name.starts_with("patch_") {
+        return true;
+    }
+    
+    // Common callback/hook/middleware patterns
+    if name.ends_with("_handler") || name.ends_with("_callback") || name.ends_with("_hook")
+        || name.ends_with("_middleware") || name.ends_with("_listener") {
+        return true;
+    }
+    
+    // Serenity/Discord event handlers
+    if matches!(name.as_str(), "ready" | "message" | "interaction_create" | "guild_member_addition") {
         return true;
     }
     
@@ -753,31 +781,94 @@ fn is_public_code(node: &Node) -> bool {
 
 /// Check if a code node is a trait implementation method (called via dynamic dispatch)
 fn is_trait_impl_method(node: &Node, graph: &Graph) -> bool {
-    // Common trait method names that are called dynamically
+    // Check 1: Is this node the target of an "overrides" edge?
+    // (trait_method --overrides--> impl_method means impl_method is a trait impl)
+    let is_override_target = graph.edges.iter()
+        .any(|e| e.relation == "overrides" && e.to == node.id);
+    if is_override_target {
+        return true;
+    }
+    
+    // Check 2: Is this method defined in a class/struct that implements a trait?
+    // (struct --inherits--> trait means all methods in struct could be trait impls)
+    let parent_id = graph.edges.iter()
+        .find(|e| e.from == node.id && e.relation == "defined_in")
+        .map(|e| &e.to);
+    
+    if let Some(parent) = parent_id {
+        let parent_has_trait = graph.edges.iter()
+            .any(|e| e.from == *parent && e.relation == "inherits");
+        if parent_has_trait {
+            return true;
+        }
+    }
+    
+    // Check 3: Common trait method names as fallback
     let common_trait_methods = [
         // Rust standard traits
         "fmt", "clone", "default", "eq", "ne", "hash", "cmp", "partial_cmp",
-        "drop", "deref", "deref_mut", "index", "index_mut",
-        "add", "sub", "mul", "div", "rem", "neg", "not",
-        "from", "into", "try_from", "try_into", "as_ref", "as_mut",
-        "borrow", "borrow_mut", "to_owned", "to_string",
+        "drop", "deref", "deref_mut", "from", "into", "try_from", "try_into",
+        "as_ref", "as_mut", "to_owned", "to_string",
         // Iterator
-        "next", "size_hint", "count", "last", "nth", "fold", "collect",
-        // Custom plugin/tool traits
-        "name", "description", "execute", "input_schema", "version",
-        "on_load", "on_unload", "tools", "hooks", "point", "priority",
+        "next", "size_hint",
         // Serde
         "serialize", "deserialize",
-        // Async traits
+        // Async
         "poll", "wake",
     ];
     
-    let name = node.title.as_str();
-    if common_trait_methods.contains(&name) {
-        // Check if this method is in a struct/impl block (has DefinedIn edge to a class)
+    if common_trait_methods.contains(&node.title.as_str()) {
         let has_parent = graph.edges.iter()
             .any(|e| e.from == node.id && e.relation == "defined_in");
-        return has_parent;
+        if has_parent {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if a code node is a method defined inside a trait (trait definition, not impl)
+fn is_trait_definition_method(node: &Node, graph: &Graph) -> bool {
+    // Find the parent via defined_in edge
+    let parent_id = graph.edges.iter()
+        .find(|e| e.from == node.id && e.relation == "defined_in")
+        .map(|e| &e.to);
+    
+    if let Some(parent) = parent_id {
+        // Check if parent is a trait (has nodes that inherit FROM it, meaning it's a trait)
+        let is_trait = graph.edges.iter()
+            .any(|e| e.to == *parent && e.relation == "inherits");
+        if is_trait {
+            return true;
+        }
+        
+        // Also check overrides: if any overrides edge targets methods of this parent
+        let is_overrides_source = graph.edges.iter()
+            .any(|e| e.relation == "overrides" && e.from.starts_with(&format!("{}.", parent.rsplit('_').next().unwrap_or(""))));
+        if is_overrides_source {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if a method belongs to a struct that implements any trait
+/// (methods could be called via dynamic dispatch even if we can't see the call)
+fn is_method_in_trait_implementing_struct(node: &Node, graph: &Graph) -> bool {
+    // Only applies to methods (defined_in a class)
+    let parent_id = graph.edges.iter()
+        .find(|e| e.from == node.id && e.relation == "defined_in")
+        .map(|e| e.to.clone());
+    
+    if let Some(parent) = parent_id {
+        // Check if this parent has any inherits edge (implements a trait)
+        let has_trait = graph.edges.iter()
+            .any(|e| e.from == parent && e.relation == "inherits");
+        if has_trait {
+            return true;
+        }
     }
     
     false
@@ -931,8 +1022,25 @@ fn is_entry_point(node: &crate::code_graph::CodeNode) -> bool {
         return true;
     }
     
-    // CLI command handlers
+    // CLI command handlers and framework patterns
     if name.starts_with("cmd_") || name.starts_with("command_") || name.starts_with("handle_") {
+        return true;
+    }
+    
+    // Web framework route handlers
+    if name.starts_with("get_") || name.starts_with("post_") || name.starts_with("put_") 
+        || name.starts_with("delete_") || name.starts_with("patch_") {
+        return true;
+    }
+    
+    // Common callback/hook/middleware patterns
+    if name.ends_with("_handler") || name.ends_with("_callback") || name.ends_with("_hook")
+        || name.ends_with("_middleware") || name.ends_with("_listener") {
+        return true;
+    }
+    
+    // Serenity/Discord event handlers
+    if matches!(name.as_str(), "ready" | "message" | "interaction_create" | "guild_member_addition") {
         return true;
     }
     
