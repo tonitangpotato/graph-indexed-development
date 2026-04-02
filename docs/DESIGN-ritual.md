@@ -459,6 +459,42 @@ pub struct TemplateSummary {
 
 **Satisfies:** GOAL-7.1, GOAL-7.2, GOAL-7.3
 
+### 3.7 ToolScope (Per-Phase Capability Boundaries)
+
+**Responsibility:** Enforce what an agent CAN do in a given ritual phase by filtering the tools array at the environment level (not prompt level). Two layers of enforcement.
+
+**Interface:**
+```rust
+pub struct ToolScope {
+    pub allowed_tools: Vec<String>,      // Tool names visible to LLM
+    pub writable_paths: Vec<String>,     // Glob patterns for write access
+    pub readable_paths: Vec<String>,     // Glob patterns for read access (empty = all)
+    pub bash_policy: BashPolicy,         // Deny | AllowAll | AllowList(Vec<String>)
+}
+
+impl ToolScope {
+    pub fn full() -> Self;               // All tools, all paths
+    pub fn research() -> Self;           // Read + Edit + Write (docs only) + WebSearch
+    pub fn documentation() -> Self;      // Read + Write + Edit (.gid/ + docs/)
+    pub fn verify() -> Self;             // Read + Bash (test commands only)
+    pub fn graph_ops() -> Self;          // Read + Write + Bash (gid commands only)
+    pub fn with_tool_mapping(&self, map: &HashMap<String, String>) -> Self;
+    pub fn filter_tools<T>(&self, tools: Vec<T>, name_fn: impl Fn(&T) -> &str) -> Vec<T>;
+}
+
+pub fn default_scope_for_phase(phase_id: &str) -> ToolScope;
+pub fn rustclaw_tool_mapping() -> HashMap<String, String>;
+```
+
+**Key Details:**
+- **Layer 1 (Visibility):** Tools not in `allowed_tools` are removed from the LLM's tools array before the API call. The LLM doesn't know they exist.
+- **Layer 2 (Execution):** Even if a tool is visible, write/edit operations check `writable_paths` and exec checks `bash_policy`. Violations return an error to the LLM.
+- **Fail-open:** If no ritual is active or state can't be read, all tools are available.
+- **Tool mapping:** Generic names (Read, Write, Bash) are mapped to runtime-specific names (read_file, write_file, exec) via `with_tool_mapping()`.
+- **Always-allowed tools:** GID, engram, TTS, STT tools bypass filtering (they're infrastructure, not capability).
+
+**Satisfies:** GOAL-5.7, GOAL-5.8, GOAL-6.5
+
 ## 4. Data Models
 
 ### 4.1 ritual.yml (Pipeline Definition)
@@ -700,7 +736,8 @@ crates/gid-harness/src/
 │   ├── executor.rs      # PhaseExecutor trait + impls (3.3)
 │   ├── artifact.rs      # ArtifactManager (3.4)
 │   ├── approval.rs      # ApprovalGate (3.5)
-│   └── template.rs      # TemplateRegistry (3.6)
+│   ├── template.rs      # TemplateRegistry (3.6)
+│   └── scope.rs         # ToolScope (3.7)
 ├── scheduler.rs         # Existing task harness scheduler
 ├── executor.rs          # Existing task executor (sub-agent spawner)
 ├── ...
