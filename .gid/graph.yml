@@ -520,6 +520,36 @@ edges:
 - from: harness-scheduler
   to: harness-types
   relation: depends_on
-- from: mcp-package
-  to: mcp-server
+- from: mcp-server
+  to: mcp-package
+  relation: depends_on
+- from: history
+  to: graph-types
+  relation: depends_on
+- from: refactor
+  to: graph-crud
+  relation: depends_on
+- from: semantify
+  to: code-graph
+  relation: depends_on
+- from: semantify
+  to: parser
+  relation: depends_on
+- from: ignore-list
+  to: workspace-setup
+  relation: depends_on
+- from: json-output
+  to: cli-basic
+  relation: depends_on
+- from: ritual-shell-executor
+  to: ritual-engine
+  relation: depends_on
+- from: ritual-cli-run
+  to: ritual-shell-executor
+  relation: depends_on
+- from: harness-notifier
+  to: harness-executor
+  relation: depends_on
+- from: harness-worktree
+  to: harness-executor
   relation: depends_on
