@@ -189,7 +189,7 @@ impl TemplateRegistry {
     fn full_dev_cycle_template() -> RitualDefinition {
         RitualDefinition {
             name: "full-dev-cycle".to_string(),
-            description: Some("Complete development cycle: idea → requirements → design → implement → verify".to_string()),
+            description: Some("Complete development cycle: idea → research → requirements → design → implement → verify".to_string()),
             extends: None,
             phases: vec![
                 // Phase 0: Capture idea
@@ -208,7 +208,25 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Escalate,
                     harness_config: None,
                 },
-                // Phase 1: Draft requirements
+                // Phase 1: Research (competitive analysis, technical research, market validation)
+                PhaseDefinition {
+                    id: "research".to_string(),
+                    kind: PhaseKind::Skill { name: "research".to_string() },
+                    model: Some("opus".to_string()),  // Deep technical analysis needs Opus
+                    approval: ApprovalRequirement::Required,  // Human reviews research before proceeding
+                    skip_if: None,  // Can be skipped via `gid ritual skip` if not needed
+                    timeout_minutes: Some(30),
+                    input: vec![
+                        ArtifactRef { from_phase: Some("capture-idea".to_string()), path: ".gid/features/{feature}/idea.md".to_string() },
+                    ],
+                    output: vec![
+                        ArtifactSpec { path: "docs/RESEARCH-*.md".to_string(), required: true },
+                    ],
+                    hooks: PhaseHooks::default(),
+                    on_failure: FailureStrategy::Escalate,
+                    harness_config: None,
+                },
+                // Phase 2: Draft requirements
                 PhaseDefinition {
                     id: "draft-requirements".to_string(),
                     kind: PhaseKind::Skill { name: "requirements".to_string() },
@@ -226,7 +244,7 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Escalate,
                     harness_config: None,
                 },
-                // Phase 2: Draft design
+                // Phase 3: Draft design
                 PhaseDefinition {
                     id: "draft-design".to_string(),
                     kind: PhaseKind::Skill { name: "design-doc".to_string() },
@@ -244,7 +262,7 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Escalate,
                     harness_config: None,
                 },
-                // Phase 3: Generate graph
+                // Phase 4: Generate graph
                 PhaseDefinition {
                     id: "generate-graph".to_string(),
                     kind: PhaseKind::GidCommand {
@@ -266,7 +284,7 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Escalate,
                     harness_config: None,
                 },
-                // Phase 4: Plan tasks
+                // Phase 5: Plan tasks
                 PhaseDefinition {
                     id: "plan-tasks".to_string(),
                     kind: PhaseKind::GidCommand {
@@ -283,7 +301,7 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Escalate,
                     harness_config: None,
                 },
-                // Phase 5: Execute tasks
+                // Phase 6: Execute tasks
                 PhaseDefinition {
                     id: "execute-tasks".to_string(),
                     kind: PhaseKind::Harness { config_overrides: None },
@@ -300,7 +318,7 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Escalate,
                     harness_config: None,
                 },
-                // Phase 6: Extract code
+                // Phase 7: Extract code
                 PhaseDefinition {
                     id: "extract-code".to_string(),
                     kind: PhaseKind::GidCommand {
@@ -317,7 +335,7 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Skip,
                     harness_config: None,
                 },
-                // Phase 7: Verify quality
+                // Phase 8: Verify quality
                 PhaseDefinition {
                     id: "verify-quality".to_string(),
                     kind: PhaseKind::GidCommand {
@@ -495,7 +513,7 @@ mod tests {
         
         // Check full-dev-cycle
         let full = templates.iter().find(|t| t.name == "full-dev-cycle").unwrap();
-        assert_eq!(full.phases.len(), 8);
+        assert_eq!(full.phases.len(), 9);
         
         // Check quick-impl
         let quick = templates.iter().find(|t| t.name == "quick-impl").unwrap();
@@ -523,7 +541,7 @@ mod tests {
         
         let full = registry.load("full-dev-cycle").unwrap();
         assert_eq!(full.name, "full-dev-cycle");
-        assert_eq!(full.phases.len(), 8);
+        assert_eq!(full.phases.len(), 9);
         
         let quick = registry.load("quick-impl").unwrap();
         assert_eq!(quick.name, "quick-impl");
@@ -585,30 +603,32 @@ phases:
         let registry = TemplateRegistry::for_project(temp_dir.path());
         let custom = registry.load("full-dev-cycle").unwrap();
         
-        // Should get the custom version (1 phase) not builtin (8 phases)
+        // Should get the custom version (1 phase) not builtin (9 phases)
         // Note: builtins are checked first, so this actually returns the builtin
         // To shadow builtins, we'd need to change the search order
         // For now, builtins always win which might be the desired behavior
-        assert_eq!(custom.phases.len(), 8); // Gets builtin
+        assert_eq!(custom.phases.len(), 9); // Gets builtin
     }
     
     #[test]
     fn test_full_dev_cycle_structure() {
         let template = TemplateRegistry::full_dev_cycle_template();
         
-        // Verify phase order
+        // Verify phase order (9 phases total)
         assert_eq!(template.phases[0].id, "capture-idea");
-        assert_eq!(template.phases[1].id, "draft-requirements");
-        assert_eq!(template.phases[2].id, "draft-design");
-        assert_eq!(template.phases[3].id, "generate-graph");
-        assert_eq!(template.phases[4].id, "plan-tasks");
-        assert_eq!(template.phases[5].id, "execute-tasks");
-        assert_eq!(template.phases[6].id, "extract-code");
-        assert_eq!(template.phases[7].id, "verify-quality");
+        assert_eq!(template.phases[1].id, "research");
+        assert_eq!(template.phases[2].id, "draft-requirements");
+        assert_eq!(template.phases[3].id, "draft-design");
+        assert_eq!(template.phases[4].id, "generate-graph");
+        assert_eq!(template.phases[5].id, "plan-tasks");
+        assert_eq!(template.phases[6].id, "execute-tasks");
+        assert_eq!(template.phases[7].id, "extract-code");
+        assert_eq!(template.phases[8].id, "verify-quality");
         
         // Verify approval requirements
-        assert!(matches!(template.phases[1].approval, ApprovalRequirement::Required));
-        assert!(matches!(template.phases[2].approval, ApprovalRequirement::Required));
-        assert!(matches!(template.phases[5].approval, ApprovalRequirement::Auto));
+        assert!(matches!(template.phases[1].approval, ApprovalRequirement::Required)); // research
+        assert!(matches!(template.phases[2].approval, ApprovalRequirement::Required)); // draft-requirements
+        assert!(matches!(template.phases[3].approval, ApprovalRequirement::Required)); // draft-design
+        assert!(matches!(template.phases[6].approval, ApprovalRequirement::Auto));     // execute-tasks
     }
 }
