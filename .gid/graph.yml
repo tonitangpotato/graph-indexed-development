@@ -385,75 +385,75 @@ edges:
 - from: mcp-server
   to: cli-basic
   relation: depends_on
-- from: ritual-skill-executor
-  to: ritual-cli-run
+- from: ritual-cli-run
+  to: ritual-skill-executor
   relation: depends_on
-- from: ritual-harness-executor
-  to: ritual-cli-run
-  relation: depends_on
-- from: ritual-gid-executor
-  to: ritual-cli-run
-  relation: depends_on
-- from: ritual-toolscope
-  to: ritual-rustclaw-integration
-  relation: depends_on
-- from: ritual-skill-executor
+- from: ritual-cli-run
   to: ritual-harness-executor
   relation: depends_on
 - from: ritual-cli-run
-  to: ritual-notifier
+  to: ritual-gid-executor
   relation: depends_on
-- from: ritual-definition
-  to: ritual-engine
-  relation: depends_on
-- from: ritual-approval
-  to: ritual-engine
-  relation: depends_on
-- from: ritual-artifact
-  to: ritual-engine
-  relation: depends_on
-- from: ritual-engine
-  to: ritual-cli-basic
-  relation: depends_on
-- from: ritual-engine
+- from: ritual-harness-executor
   to: ritual-skill-executor
   relation: depends_on
+- from: ritual-notifier
+  to: ritual-cli-run
+  relation: depends_on
 - from: ritual-engine
+  to: ritual-definition
+  relation: depends_on
+- from: ritual-engine
+  to: ritual-approval
+  relation: depends_on
+- from: ritual-engine
+  to: ritual-artifact
+  relation: depends_on
+- from: ritual-cli-basic
+  to: ritual-engine
+  relation: depends_on
+- from: ritual-skill-executor
+  to: ritual-engine
+  relation: depends_on
+- from: ritual-toolscope
+  to: ritual-engine
+  relation: depends_on
+- from: ritual-cli-basic
+  to: ritual-template
+  relation: depends_on
+- from: ritual-rustclaw-integration
   to: ritual-toolscope
   relation: depends_on
-- from: ritual-template
-  to: ritual-cli-basic
-  relation: depends_on
-- from: harness-topology
-  to: harness-scheduler
+- from: harness-scheduler
+  to: harness-topology
   relation: depends_on
 - from: harness-scheduler
-  to: harness-executor
+  to: harness-config
   relation: depends_on
-- from: harness-context
-  to: harness-executor
-  relation: depends_on
-- from: harness-executor
-  to: harness-verifier
+- from: harness-scheduler
+  to: harness-planner
   relation: depends_on
 - from: harness-executor
-  to: harness-replanner
-  relation: depends_on
-- from: harness-executor
-  to: harness-telemetry
-  relation: depends_on
-- from: harness-log-reader
-  to: harness-telemetry
-  relation: depends_on
-- from: harness-config
-  to: harness-scheduler
-  relation: depends_on
-- from: harness-planner
   to: harness-scheduler
   relation: depends_on
 - from: harness-executor
-  to: ritual-harness-executor
+  to: harness-context
   relation: depends_on
-- from: harness-execution-state
+- from: harness-executor
+  to: harness-execution-state
+  relation: depends_on
+- from: harness-verifier
+  to: harness-executor
+  relation: depends_on
+- from: harness-replanner
+  to: harness-executor
+  relation: depends_on
+- from: harness-telemetry
+  to: harness-executor
+  relation: depends_on
+- from: harness-telemetry
+  to: harness-log-reader
+  relation: depends_on
+- from: ritual-harness-executor
   to: harness-executor
   relation: depends_on
