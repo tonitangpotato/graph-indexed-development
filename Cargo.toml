@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gid-core", "crates/gid-cli"]
+members = ["crates/gid-core", "crates/gid-cli", "crates/gid-harness"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

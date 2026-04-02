@@ -14,7 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 gid-core = { path = "../gid-core", version = "0.2.1" }
+gid-harness = { path = "../gid-harness" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 anyhow = { workspace = true }
+tokio = { version = "1", features = ["full"] }

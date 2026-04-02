@@ -148,7 +148,7 @@ pub fn compute_layers(graph: &Graph) -> Result<Vec<Vec<String>>> {
                 && task_ids.contains(edge.from.as_str())
                 && !processed.contains(edge.from.as_str())
             {
-                if let Some(deg) = in_degree.get_mut(edge.from.as_str()) {
+                if let Some(_deg) = in_degree.get_mut(edge.from.as_str()) {
                     if processed.contains(edge.to.as_str()) || 
                        graph.get_node(&edge.to).map(|n| n.status == NodeStatus::Done).unwrap_or(true) {
                         // This dependency was just satisfied

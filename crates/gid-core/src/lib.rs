@@ -14,6 +14,7 @@ pub mod refactor;
 pub mod ignore;
 pub mod task_graph_knowledge;
 pub mod complexity;
+pub mod harness;
 
 // Re-export commonly used types
 pub use graph::*;

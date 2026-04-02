@@ -26,6 +26,12 @@ use gid_core::{
     preview_merge, apply_merge,
     preview_split, apply_split, SplitDefinition,
     preview_extract, apply_extract,
+    // Harness
+    harness::{
+        create_plan,
+        types::{ExecutionEvent, ExecutionStats},
+        load_config,
+    },
 };
 
 #[derive(Parser)]
@@ -322,6 +328,36 @@ enum Commands {
     /// Refactor operations on the graph
     #[command(subcommand)]
     Refactor(RefactorCommands),
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Task Harness Commands
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Show execution plan from graph topology
+    Plan {
+        /// Output format: json or text
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+
+    /// Execute the task plan (spawns sub-agents)
+    Execute {
+        /// Maximum concurrent sub-agents per layer
+        #[arg(long)]
+        max_concurrent: Option<usize>,
+        /// Model for sub-agents
+        #[arg(long)]
+        model: Option<String>,
+        /// Approval mode: auto, mixed, manual
+        #[arg(long)]
+        approval_mode: Option<String>,
+        /// Show plan and exit without executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show execution statistics from telemetry log
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -515,6 +551,13 @@ fn main() -> Result<()> {
                 cmd_refactor_extract(resolve_graph_path(cli.graph)?, &nodes, &parent, &title, apply, cli.json)
             }
         },
+
+        // Task Harness commands
+        Commands::Plan { format } => cmd_plan(resolve_graph_path(cli.graph)?, &format, cli.json),
+        Commands::Execute { max_concurrent, model, approval_mode, dry_run } => {
+            cmd_execute(resolve_graph_path(cli.graph)?, max_concurrent, model, approval_mode, dry_run, cli.json)
+        }
+        Commands::Stats => cmd_stats(resolve_graph_path(cli.graph)?, cli.json),
     }
 }
 
@@ -1641,6 +1684,283 @@ fn cmd_refactor_extract(path: PathBuf, nodes: &[String], parent: &str, title: &s
         }
     } else {
         bail!("One or more nodes not found");
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Task Harness Commands
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_plan(path: PathBuf, format: &str, json: bool) -> Result<()> {
+    let graph = load_graph(&path)?;
+    let plan = create_plan(&graph)?;
+
+    // If --json flag or format is json, output as JSON
+    if json || format == "json" {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+
+    // Human-readable text format
+    println!();
+    println!("Execution Plan");
+    println!("══════════════════════════════════════════════════════════");
+    println!();
+    println!("Total tasks: {}", plan.total_tasks);
+    println!("Estimated total turns: {}", plan.estimated_total_turns);
+
+    if !plan.critical_path.is_empty() {
+        println!(
+            "Critical path: {} ({} tasks)",
+            plan.critical_path.join(" → "),
+            plan.critical_path.len()
+        );
+    }
+
+    for layer in &plan.layers {
+        println!();
+        let parallel = if layer.tasks.len() > 1 { ", parallel" } else { "" };
+        let task_word = if layer.tasks.len() == 1 { "task" } else { "tasks" };
+        println!(
+            "Layer {} ({} {}{}):",
+            layer.index,
+            layer.tasks.len(),
+            task_word,
+            parallel
+        );
+        for task in &layer.tasks {
+            let turns = format!(" [{} turns]", task.estimated_turns);
+            let desc = if task.description.is_empty() {
+                task.title.clone()
+            } else {
+                // Take first line of description or title
+                task.description.lines().next().unwrap_or(&task.title).to_string()
+            };
+            println!("  ○ {}{} — {}", task.id, turns, desc);
+        }
+        if let Some(ref checkpoint) = layer.checkpoint {
+            println!("  ✓ Checkpoint: {}", checkpoint);
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+fn cmd_execute(
+    path: PathBuf,
+    max_concurrent: Option<usize>,
+    model: Option<String>,
+    approval_mode: Option<String>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let graph = load_graph(&path)?;
+    let plan = create_plan(&graph)?;
+
+    // Load config from .gid/execution.yml (or defaults)
+    let gid_dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let execution_yml = gid_dir.join("execution.yml");
+    let mut config = load_config(
+        None,
+        Some(&execution_yml),
+        None,
+    ).unwrap_or_default();
+
+    // Override config from CLI args
+    if let Some(mc) = max_concurrent {
+        config.max_concurrent = mc;
+    }
+    if let Some(m) = model {
+        config.model = m;
+    }
+    if let Some(am) = approval_mode {
+        config.approval_mode = match am.to_lowercase().as_str() {
+            "auto" => gid_core::harness::types::ApprovalMode::Auto,
+            "manual" => gid_core::harness::types::ApprovalMode::Manual,
+            _ => gid_core::harness::types::ApprovalMode::Mixed,
+        };
+    }
+
+    if dry_run {
+        if json {
+            println!("{}", serde_json::json!({
+                "dry_run": true,
+                "plan": serde_json::to_value(&plan)?,
+                "config": {
+                    "max_concurrent": config.max_concurrent,
+                    "model": config.model,
+                    "approval_mode": format!("{:?}", config.approval_mode),
+                }
+            }));
+        } else {
+            println!("Dry run — showing plan without executing\n");
+            println!("Configuration:");
+            println!("  Max concurrent: {}", config.max_concurrent);
+            println!("  Model: {}", config.model);
+            println!("  Approval mode: {:?}", config.approval_mode);
+            println!();
+
+            // Reuse plan display
+            cmd_plan(path, "text", false)?;
+        }
+        return Ok(());
+    }
+
+    // Run full execution via gid-harness
+    if !json {
+        println!("Starting execution...");
+        println!("✓ Loaded graph: {} tasks in {} layers\n", plan.total_tasks, plan.layers.len());
+    }
+
+    // Set up executor and worktree manager
+    let project_dir = gid_dir.parent().unwrap_or(std::path::Path::new("."));
+    let worktree_mgr = gid_harness::worktree::GitWorktreeManager::new(project_dir.to_path_buf());
+    let executor = gid_harness::executor::CliExecutor::new();
+
+    // Run async execution
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut graph_mut = graph;
+    let result = rt.block_on(gid_harness::scheduler::execute_plan(
+        &plan,
+        &mut graph_mut,
+        &config,
+        &executor,
+        &worktree_mgr,
+    ));
+
+    // Save updated graph state
+    save_graph(&graph_mut, &path)?;
+
+    match result {
+        Ok(exec_result) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&exec_result)?);
+            } else {
+                println!("\nExecution complete!");
+                println!("✓ {} tasks completed, {} failed",
+                    exec_result.tasks_completed, exec_result.tasks_failed);
+                println!("  Total turns: {}", exec_result.total_turns);
+                println!("  Total tokens: {}K", exec_result.total_tokens / 1000);
+                println!("  Duration: {}s", exec_result.duration_secs);
+            }
+        }
+        Err(e) => {
+            // Save graph even on error
+            let _ = save_graph(&graph_mut, &path);
+            if json {
+                println!("{}", serde_json::json!({"error": e.to_string()}));
+            } else {
+                eprintln!("✗ Execution failed: {}", e);
+            }
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_stats(path: PathBuf, json: bool) -> Result<()> {
+    let gid_dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let log_path = gid_dir.join("execution-log.jsonl");
+
+    if !log_path.exists() {
+        if json {
+            println!("{}", serde_json::json!({"error": "No execution log found", "path": log_path.display().to_string()}));
+        } else {
+            println!("No execution log found at {}", log_path.display());
+            println!("Run `gid execute` to generate execution telemetry.");
+        }
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&log_path)?;
+    let events: Vec<ExecutionEvent> = content.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    if events.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({"error": "Execution log is empty"}));
+        } else {
+            println!("Execution log is empty.");
+        }
+        return Ok(());
+    }
+
+    // Compute stats from events
+    let mut tasks_completed: usize = 0;
+    let mut tasks_failed: usize = 0;
+    let mut total_turns: u32 = 0;
+    let mut total_tokens: u64 = 0;
+    let mut duration_secs: u64 = 0;
+
+    for event in &events {
+        match event {
+            ExecutionEvent::TaskDone { turns, tokens, .. } => {
+                tasks_completed += 1;
+                total_turns += turns;
+                total_tokens += tokens;
+            }
+            ExecutionEvent::TaskFailed { turns, .. } => {
+                tasks_failed += 1;
+                total_turns += turns;
+            }
+            ExecutionEvent::Complete { duration_s, .. } => {
+                duration_secs = *duration_s;
+            }
+            _ => {}
+        }
+    }
+
+    let avg_turns = if tasks_completed > 0 {
+        total_turns as f32 / tasks_completed as f32
+    } else {
+        0.0
+    };
+
+    let stats = ExecutionStats {
+        tasks_completed,
+        tasks_failed,
+        total_turns,
+        avg_turns_per_task: avg_turns,
+        total_tokens,
+        duration_secs,
+        estimation_accuracy: 0.0, // Would need plan data to compute
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        println!();
+        println!("Execution Statistics");
+        println!("══════════════════════════════════════════════════════════");
+        println!();
+        println!("Tasks completed: {}", stats.tasks_completed);
+        println!("Tasks failed:    {}", stats.tasks_failed);
+        println!("Total turns:     {}", stats.total_turns);
+        println!("Avg turns/task:  {:.1}", stats.avg_turns_per_task);
+
+        let tokens_display = if stats.total_tokens > 1_000_000 {
+            format!("{:.1}M", stats.total_tokens as f64 / 1_000_000.0)
+        } else if stats.total_tokens > 1_000 {
+            format!("{:.1}K", stats.total_tokens as f64 / 1_000.0)
+        } else {
+            format!("{}", stats.total_tokens)
+        };
+        println!("Total tokens:    {}", tokens_display);
+
+        if stats.duration_secs > 0 {
+            let mins = stats.duration_secs / 60;
+            let secs = stats.duration_secs % 60;
+            if mins > 0 {
+                println!("Duration:        {}m {}s", mins, secs);
+            } else {
+                println!("Duration:        {}s", secs);
+            }
+        }
+        println!();
     }
     Ok(())
 }
