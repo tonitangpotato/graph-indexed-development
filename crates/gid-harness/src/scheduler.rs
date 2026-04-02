@@ -163,12 +163,19 @@ pub async fn execute_plan(
                     }
                 };
 
-                let context = gid_core::harness::types::TaskContext {
-                    task_info: task.clone(),
-                    goals_text: task.goals.clone(),
-                    design_excerpt: None,
-                    dependency_interfaces: vec![],
-                    guards: vec![],
+                // Build full context via assemble_task_context (resolves design docs, goals, guards)
+                let context = match gid_core::harness::assemble_task_context(graph, &task.id, gid_root) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        warn!(task_id = %task.id, error = %e, "Context assembly failed, using basic context");
+                        gid_core::harness::types::TaskContext {
+                            task_info: task.clone(),
+                            goals_text: task.goals.clone(),
+                            design_excerpt: None,
+                            dependency_interfaces: vec![],
+                            guards: vec![],
+                        }
+                    }
                 };
 
                 prepared.push((task.clone(), wt_path, context));
