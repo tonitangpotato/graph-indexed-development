@@ -71,12 +71,12 @@ impl ToolScope {
         }
     }
 
-    /// Read-only access with web search.
+    /// Research access — read, write, edit docs, plus web search.
     /// Used for research phases.
     pub fn research() -> Self {
         Self {
             allowed_tools: vec![
-                "Read".into(), "Write".into(),
+                "Read".into(), "Write".into(), "Edit".into(),
                 "WebSearch".into(), "WebFetch".into(),
             ],
             writable_paths: vec![
@@ -378,9 +378,9 @@ mod tests {
         let scope = ToolScope::research();
         assert!(scope.is_tool_allowed("Read"));
         assert!(scope.is_tool_allowed("Write"));
+        assert!(scope.is_tool_allowed("Edit"));
         assert!(scope.is_tool_allowed("WebSearch"));
         assert!(!scope.is_tool_allowed("Bash"));
-        assert!(!scope.is_tool_allowed("Edit"));
 
         assert!(scope.is_path_writable(".gid/features/auth/research.md"));
         assert!(scope.is_path_writable("docs/RESEARCH-auth.md"));
@@ -456,10 +456,10 @@ mod tests {
         let mapped = scope.with_tool_mapping(&rustclaw_tool_mapping());
         assert!(mapped.is_tool_allowed("read_file"));
         assert!(mapped.is_tool_allowed("write_file"));
+        assert!(mapped.is_tool_allowed("edit_file"));
         assert!(mapped.is_tool_allowed("web_search"));
         assert!(mapped.is_tool_allowed("web_fetch"));
         assert!(!mapped.is_tool_allowed("exec"));
-        assert!(!mapped.is_tool_allowed("edit_file"));
     }
 
     #[test]
@@ -476,11 +476,11 @@ mod tests {
         let filtered = scope.filter_tools(tools, |t| t);
         assert!(filtered.contains(&"read_file"));
         assert!(filtered.contains(&"write_file"));
+        assert!(filtered.contains(&"edit_file")); // Research allows Edit
         assert!(filtered.contains(&"web_search"));
         assert!(filtered.contains(&"gid_tasks"));
         assert!(filtered.contains(&"engram_recall"));
         assert!(filtered.contains(&"tts"));
-        assert!(!filtered.contains(&"edit_file"));
         assert!(!filtered.contains(&"exec"));
     }
 
