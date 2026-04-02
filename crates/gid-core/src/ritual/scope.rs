@@ -173,6 +173,10 @@ impl ToolScope {
 ///
 /// This maps well-known phase IDs to predefined scopes.
 /// Custom phases get full access by default (can be overridden in ritual.yml).
+///
+/// Tool names are generic (Read, Write, Edit, Bash, WebSearch, WebFetch).
+/// Agent runtimes should use `ToolScope::with_tool_mapping()` to translate
+/// to their actual tool names (e.g., "Read" → "read_file").
 pub fn default_scope_for_phase(phase_id: &str) -> ToolScope {
     match phase_id {
         "capture-idea" => ToolScope {
@@ -190,6 +194,67 @@ pub fn default_scope_for_phase(phase_id: &str) -> ToolScope {
         "extract-code" => ToolScope::graph_ops(),
         "verify-quality" => ToolScope::verify(),
         _ => ToolScope::full(), // Unknown phases get full access
+    }
+}
+
+/// Standard tool name mapping from generic names to runtime-specific names.
+/// Each tuple is (generic_name, runtime_name).
+pub type ToolNameMapping = Vec<(String, String)>;
+
+/// Create a standard mapping for RustClaw tool names.
+pub fn rustclaw_tool_mapping() -> ToolNameMapping {
+    vec![
+        ("Read".into(), "read_file".into()),
+        ("Write".into(), "write_file".into()),
+        ("Edit".into(), "edit_file".into()),
+        ("Bash".into(), "exec".into()),
+        ("WebSearch".into(), "web_search".into()),
+        ("WebFetch".into(), "web_fetch".into()),
+    ]
+}
+
+impl ToolScope {
+    /// Translate generic tool names to runtime-specific names using a mapping.
+    ///
+    /// Any generic name not in the mapping is kept as-is (passthrough).
+    /// This allows GID tools (gid_tasks, gid_read, etc.) to pass through
+    /// without explicit mapping.
+    pub fn with_tool_mapping(mut self, mapping: &ToolNameMapping) -> Self {
+        self.allowed_tools = self.allowed_tools.iter().map(|generic| {
+            mapping.iter()
+                .find(|(g, _)| g == generic)
+                .map(|(_, runtime)| runtime.clone())
+                .unwrap_or_else(|| generic.clone())
+        }).collect();
+        self
+    }
+
+    /// Filter a list of tool definitions, keeping only those allowed by this scope.
+    ///
+    /// Tool names are matched case-insensitively.
+    /// GID tools (names starting with "gid_") are always allowed — they're
+    /// needed for ritual management regardless of phase.
+    pub fn filter_tools<T, F>(&self, tools: Vec<T>, name_fn: F) -> Vec<T>
+    where
+        F: Fn(&T) -> &str,
+    {
+        tools.into_iter().filter(|tool| {
+            let name = name_fn(tool);
+            // Always allow GID tools — needed for ritual management
+            if name.starts_with("gid_") {
+                return true;
+            }
+            // Always allow engram tools — memory is always needed
+            if name.starts_with("engram_") {
+                return true;
+            }
+            // Always allow set_voice_mode, tts, stt — communication tools
+            if matches!(name, "set_voice_mode" | "tts" | "stt") {
+                return true;
+            }
+            // Check against allowed list
+            self.is_tool_allowed(name)
+        }).collect()
     }
 }
 
@@ -383,5 +448,56 @@ mod tests {
         assert!(!BashPolicy::Deny.eq(&BashPolicy::AllowAll));
         let scope = ToolScope::documentation();
         assert!(!scope.is_bash_allowed("any command"));
+    }
+
+    #[test]
+    fn test_tool_mapping_rustclaw() {
+        let scope = ToolScope::research();
+        let mapped = scope.with_tool_mapping(&rustclaw_tool_mapping());
+        assert!(mapped.is_tool_allowed("read_file"));
+        assert!(mapped.is_tool_allowed("write_file"));
+        assert!(mapped.is_tool_allowed("web_search"));
+        assert!(mapped.is_tool_allowed("web_fetch"));
+        assert!(!mapped.is_tool_allowed("exec"));
+        assert!(!mapped.is_tool_allowed("edit_file"));
+    }
+
+    #[test]
+    fn test_filter_tools() {
+        let scope = ToolScope::research().with_tool_mapping(&rustclaw_tool_mapping());
+        let tools = vec![
+            "read_file", "write_file", "edit_file", "exec",
+            "web_search", "web_fetch",
+            "gid_tasks", "gid_read",  // GID tools always pass
+            "engram_recall",           // Engram always passes
+            "tts",                     // Communication always passes
+        ];
+
+        let filtered = scope.filter_tools(tools, |t| t);
+        assert!(filtered.contains(&"read_file"));
+        assert!(filtered.contains(&"write_file"));
+        assert!(filtered.contains(&"web_search"));
+        assert!(filtered.contains(&"gid_tasks"));
+        assert!(filtered.contains(&"engram_recall"));
+        assert!(filtered.contains(&"tts"));
+        assert!(!filtered.contains(&"edit_file"));
+        assert!(!filtered.contains(&"exec"));
+    }
+
+    #[test]
+    fn test_filter_tools_verify_phase() {
+        let scope = ToolScope::verify().with_tool_mapping(&rustclaw_tool_mapping());
+        let tools = vec![
+            "read_file", "write_file", "edit_file", "exec",
+            "web_search", "gid_tasks",
+        ];
+
+        let filtered = scope.filter_tools(tools, |t| t);
+        assert!(filtered.contains(&"read_file"));
+        assert!(filtered.contains(&"exec"));       // Bash is allowed in verify
+        assert!(filtered.contains(&"gid_tasks"));  // GID always passes
+        assert!(!filtered.contains(&"write_file")); // No writes in verify!
+        assert!(!filtered.contains(&"edit_file"));
+        assert!(!filtered.contains(&"web_search"));
     }
 }

@@ -27,4 +27,4 @@ pub use executor::{PhaseExecutor, PhaseResult, PhaseContext};
 pub use artifact::ArtifactManager;
 pub use approval::{ApprovalGate, ApprovalRequest};
 pub use template::{TemplateRegistry, TemplateSummary};
-pub use scope::{ToolScope, BashPolicy, default_scope_for_phase};
+pub use scope::{ToolScope, BashPolicy, ToolNameMapping, default_scope_for_phase, rustclaw_tool_mapping};
