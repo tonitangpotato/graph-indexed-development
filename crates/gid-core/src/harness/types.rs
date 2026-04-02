@@ -217,6 +217,14 @@ pub enum ExecutionEvent {
         #[serde(rename = "ts")]
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "advise")]
+    Advise {
+        passed: bool,
+        score: u8,
+        issues: usize,
+        #[serde(rename = "ts")]
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "complete")]
     Complete {
         total_turns: u32,

@@ -21,6 +21,9 @@ use gid_core::harness::types::{
     ExecutionPlan, ExecutionResult, HarnessConfig,
     ExecutionEvent, VerifyResult,
 };
+use gid_core::code_graph::CodeGraph;
+use gid_core::unified::build_unified_graph;
+use gid_core::advise::analyze as advise_analyze;
 
 use crate::executor::TaskExecutor;
 use crate::verifier::Verifier;
@@ -289,9 +292,22 @@ pub async fn execute_plan(
                 }
             }
         }
+
+        // Post-layer code graph extraction (GOAL-2.18, GOAL-2.19, GOAL-2.20)
+        // Extract code nodes from source directory and merge into graph
+        info!(layer = layer.index, "Running post-layer extract");
+        if let Err(e) = post_layer_extract(graph).await {
+            warn!(layer = layer.index, error = %e, "Post-layer extract failed (non-fatal)");
+        }
     }
 
     let duration = start.elapsed();
+
+    // Post-execution quality check (GOAL-2.21, GOAL-2.22)
+    info!("Running post-execution advise");
+    if let Err(e) = post_execution_advise(graph, &telemetry).await {
+        warn!(error = %e, "Post-execution advise failed (non-fatal)");
+    }
 
     // Log completion
     telemetry.log_event(&ExecutionEvent::Complete {
@@ -326,6 +342,72 @@ fn truncate(s: &str, max_len: usize) -> String {
     } else {
         format!("{}...", &s[..max_len])
     }
+}
+
+/// Post-layer code graph extraction.
+///
+/// Extracts code nodes from the project source directory and merges them into
+/// the graph, preserving semantic nodes (feature, task) and updating only
+/// structural nodes (file, class, function).
+///
+/// Satisfies: GOAL-2.18, GOAL-2.19, GOAL-2.20
+async fn post_layer_extract(graph: &mut Graph) -> Result<()> {
+    // Determine project root — look for Cargo.toml, package.json, etc.
+    // For now, assume current directory (caller should set cwd appropriately)
+    let project_root = std::env::current_dir()?;
+    let src_dir = project_root.join("src");
+    
+    if !src_dir.exists() {
+        // No src/ directory — skip extract (might be a non-code project)
+        info!("No src/ directory found, skipping extract");
+        return Ok(());
+    }
+
+    info!(project_root = %project_root.display(), "Extracting code graph");
+    let code_graph = CodeGraph::extract_from_dir(&src_dir);
+    
+    // Merge code nodes into existing graph, preserving semantic nodes
+    let unified = build_unified_graph(&code_graph, graph);
+    *graph = unified;
+    
+    info!(
+        code_nodes = code_graph.nodes.len(),
+        "Code graph extraction complete"
+    );
+    
+    Ok(())
+}
+
+/// Post-execution quality check via advise.
+///
+/// Runs graph quality analysis and logs the result to telemetry.
+/// Failures are logged as warnings but do not block or revert work.
+///
+/// Satisfies: GOAL-2.21, GOAL-2.22
+async fn post_execution_advise(
+    graph: &Graph,
+    telemetry: &TelemetryLogger,
+) -> Result<()> {
+    let result = advise_analyze(graph);
+    
+    telemetry.log_event(&ExecutionEvent::Advise {
+        passed: result.passed,
+        score: result.health_score,
+        issues: result.items.len(),
+        timestamp: Utc::now(),
+    }).ok();
+    
+    if result.passed {
+        info!(score = result.health_score, "Graph quality check passed");
+    } else {
+        warn!(
+            score = result.health_score,
+            issues = result.items.len(),
+            "Graph quality check failed (non-fatal)"
+        );
+    }
+    
+    Ok(())
 }
 
 #[cfg(test)]
