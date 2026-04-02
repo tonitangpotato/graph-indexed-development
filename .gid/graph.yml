@@ -158,6 +158,54 @@ nodes:
   tags:
   - p2
   - cli
+- id: ritual-skill-executor
+  title: 'SkillExecutor: LLM-backed skill phase execution'
+  status: todo
+  tags:
+  - p0
+  - ritual
+- id: ritual-harness-executor
+  title: 'HarnessExecutor: task harness phase execution'
+  status: todo
+  tags:
+  - p0
+  - ritual
+- id: ritual-gid-executor
+  title: 'GidCommandExecutor: wire to gid CLI commands'
+  status: todo
+  tags:
+  - p1
+  - ritual
+- id: ritual-shell-executor
+  title: 'ShellExecutor: validated shell command execution'
+  status: todo
+  tags:
+  - p1
+  - ritual
+- id: ritual-cli-run
+  title: 'gid ritual run: CLI command to execute ritual end-to-end'
+  status: todo
+  tags:
+  - p0
+  - ritual
+- id: ritual-toolscope
+  title: 'ToolScope: per-phase capability boundaries'
+  status: done
+  tags:
+  - p0
+  - ritual
+- id: ritual-rustclaw-integration
+  title: 'RustClaw ritual integration: scope filtering in agent loop'
+  status: done
+  tags:
+  - p0
+  - ritual
+- id: ritual-notifier
+  title: 'Ritual notifier: Telegram/channel updates on phase transitions'
+  status: todo
+  tags:
+  - p1
+  - ritual
 edges:
 - from: graph-types
   to: workspace-setup
@@ -221,4 +269,22 @@ edges:
   relation: depends_on
 - from: mcp-server
   to: cli-basic
+  relation: depends_on
+- from: ritual-skill-executor
+  to: ritual-cli-run
+  relation: depends_on
+- from: ritual-harness-executor
+  to: ritual-cli-run
+  relation: depends_on
+- from: ritual-gid-executor
+  to: ritual-cli-run
+  relation: depends_on
+- from: ritual-toolscope
+  to: ritual-rustclaw-integration
+  relation: depends_on
+- from: ritual-skill-executor
+  to: ritual-harness-executor
+  relation: depends_on
+- from: ritual-cli-run
+  to: ritual-notifier
   relation: depends_on
