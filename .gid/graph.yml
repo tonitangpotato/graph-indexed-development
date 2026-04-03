@@ -184,7 +184,7 @@ nodes:
   - ritual
 - id: ritual-cli-run
   title: 'gid ritual run: CLI command to execute ritual end-to-end'
-  status: todo
+  status: done
   tags:
   - p0
   - ritual
