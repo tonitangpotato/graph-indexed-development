@@ -21,6 +21,7 @@ pub mod notifier;
 pub mod api_llm_client;
 pub mod composer;
 pub mod state_machine;
+pub mod v2_executor;
 
 // Re-export key types
 pub use definition::{
@@ -43,6 +44,7 @@ pub use llm::{LlmClient, ToolDefinition, SkillResult};
 pub use api_llm_client::ApiLlmClient;
 pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
 pub use composer::{compose_ritual, ProjectState as ComposerProjectState, ProjectLanguage};
+pub use v2_executor::{V2Executor, V2ExecutorConfig, NotifyFn, run_ritual};
 pub use state_machine::{
     RitualPhase as V2Phase,
     RitualState as V2State,

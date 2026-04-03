@@ -13,6 +13,22 @@
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use super::state_machine::RitualPhase;
+
+impl RitualPhase {
+    /// Map ritual phase to scope category for ToolScope enforcement.
+    pub fn scope_category(&self) -> Option<ScopeCategory> {
+        match self {
+            Self::Designing => Some(ScopeCategory::Design),
+            Self::Planning => Some(ScopeCategory::Plan),
+            Self::Graphing => Some(ScopeCategory::Design), // graph is doc writing
+            Self::Implementing => Some(ScopeCategory::Implement),
+            Self::Verifying => Some(ScopeCategory::Verify),
+            _ => None, // Idle, Initializing, Done, Escalated, Cancelled — no scope
+        }
+    }
+}
+
 /// Policy for bash/shell command execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -519,6 +535,20 @@ mod tests {
         assert!(filtered.contains(&"engram_recall"));
         assert!(filtered.contains(&"tts"));
         assert!(!filtered.contains(&"exec"));
+    }
+
+    #[test]
+    fn test_ritual_phase_scope_category() {
+        use super::super::state_machine::RitualPhase;
+
+        assert_eq!(RitualPhase::Designing.scope_category(), Some(ScopeCategory::Design));
+        assert_eq!(RitualPhase::Planning.scope_category(), Some(ScopeCategory::Plan));
+        assert_eq!(RitualPhase::Graphing.scope_category(), Some(ScopeCategory::Design));
+        assert_eq!(RitualPhase::Implementing.scope_category(), Some(ScopeCategory::Implement));
+        assert_eq!(RitualPhase::Verifying.scope_category(), Some(ScopeCategory::Verify));
+        assert_eq!(RitualPhase::Idle.scope_category(), None);
+        assert_eq!(RitualPhase::Done.scope_category(), None);
+        assert_eq!(RitualPhase::Escalated.scope_category(), None);
     }
 
     #[test]
