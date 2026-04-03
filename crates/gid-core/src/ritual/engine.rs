@@ -4,6 +4,7 @@
 //! checking approval gates, and delegating work to phase executors.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use anyhow::{Context, Result, bail};
@@ -18,6 +19,7 @@ use super::executor::{
     PhaseContext, PhaseResult,
     SkillExecutor, GidCommandExecutor, HarnessExecutor, ShellExecutor,
 };
+use super::llm::LlmClient;
 
 /// Current state of a ritual execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,11 +115,23 @@ pub struct RitualEngine {
     gid_root: PathBuf,
     /// Artifact manager.
     artifact_manager: ArtifactManager,
+    /// LLM client for skill and harness execution.
+    /// If None, skill and harness phases will use stub implementations.
+    llm_client: Option<Arc<dyn LlmClient>>,
 }
 
 impl RitualEngine {
     /// Create a new engine, initializing state if not present.
     pub fn new(definition: RitualDefinition, project_root: &Path) -> Result<Self> {
+        Self::with_llm_client(definition, project_root, None)
+    }
+
+    /// Create a new engine with an LLM client for skill/harness execution.
+    pub fn with_llm_client(
+        definition: RitualDefinition,
+        project_root: &Path,
+        llm_client: Option<Arc<dyn LlmClient>>,
+    ) -> Result<Self> {
         let gid_root = project_root.join(".gid");
         let state_path = gid_root.join("ritual-state.json");
         
@@ -138,11 +152,21 @@ impl RitualEngine {
             project_root: project_root.to_path_buf(),
             gid_root,
             artifact_manager: ArtifactManager::new(project_root),
+            llm_client,
         })
     }
     
     /// Resume from persisted state (crash recovery).
     pub fn resume(definition: RitualDefinition, project_root: &Path) -> Result<Self> {
+        Self::resume_with_llm_client(definition, project_root, None)
+    }
+
+    /// Resume from persisted state with an LLM client.
+    pub fn resume_with_llm_client(
+        definition: RitualDefinition,
+        project_root: &Path,
+        llm_client: Option<Arc<dyn LlmClient>>,
+    ) -> Result<Self> {
         let gid_root = project_root.join(".gid");
         let state_path = gid_root.join("ritual-state.json");
         
@@ -161,6 +185,7 @@ impl RitualEngine {
             project_root: project_root.to_path_buf(),
             gid_root,
             artifact_manager: ArtifactManager::new(project_root),
+            llm_client,
         })
     }
     
@@ -443,20 +468,40 @@ impl RitualEngine {
         
         match &phase.kind {
             PhaseKind::Skill { name } => {
-                let executor = SkillExecutor::new(&self.project_root);
-                executor.execute(phase, &context, name).await
+                if let Some(ref llm_client) = self.llm_client {
+                    let executor = SkillExecutor::new(&self.project_root, llm_client.clone());
+                    executor.execute_skill(phase, &context, name).await
+                } else {
+                    // Stub implementation when no LLM client provided
+                    tracing::warn!(
+                        "No LLM client provided, skill phase '{}' will be stubbed",
+                        phase.id
+                    );
+                    Ok(PhaseResult::success())
+                }
             }
             PhaseKind::GidCommand { command, args } => {
                 let executor = GidCommandExecutor::new();
-                executor.execute(phase, &context, command, args).await
+                executor.execute_command(phase, &context, command, args).await
             }
             PhaseKind::Harness { config_overrides } => {
-                let executor = HarnessExecutor::new(&self.project_root);
-                executor.execute(phase, &context, config_overrides.as_ref()).await
+                if let Some(ref llm_client) = self.llm_client {
+                    let executor = HarnessExecutor::new(&self.project_root, llm_client.clone());
+                    // Also check the phase-level harness_config
+                    let overrides = config_overrides.as_ref().or(phase.harness_config.as_ref());
+                    executor.execute_harness(phase, &context, overrides).await
+                } else {
+                    // Stub implementation when no LLM client provided
+                    tracing::warn!(
+                        "No LLM client provided, harness phase '{}' will be stubbed",
+                        phase.id
+                    );
+                    Ok(PhaseResult::success())
+                }
             }
             PhaseKind::Shell { command } => {
                 let executor = ShellExecutor::new(&self.project_root);
-                executor.execute(phase, &context, command).await
+                executor.execute_shell(phase, &context, command).await
             }
         }
     }

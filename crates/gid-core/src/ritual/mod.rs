@@ -15,6 +15,7 @@ pub mod artifact;
 pub mod approval;
 pub mod template;
 pub mod scope;
+pub mod llm;
 
 // Re-export key types
 pub use definition::{
@@ -23,8 +24,13 @@ pub use definition::{
     RitualConfig,
 };
 pub use engine::{RitualEngine, RitualState, RitualStatus, PhaseState, PhaseStatus};
-pub use executor::{PhaseExecutor, PhaseResult, PhaseContext};
+pub use executor::{
+    PhaseExecutor, PhaseResult, PhaseContext,
+    SkillExecutor, GidCommandExecutor, HarnessExecutor, ShellExecutor,
+    LlmTaskExecutor,
+};
 pub use artifact::ArtifactManager;
 pub use approval::{ApprovalGate, ApprovalRequest};
 pub use template::{TemplateRegistry, TemplateSummary};
 pub use scope::{ToolScope, BashPolicy, ToolNameMapping, default_scope_for_phase, rustclaw_tool_mapping};
+pub use llm::{LlmClient, ToolDefinition, SkillResult};
