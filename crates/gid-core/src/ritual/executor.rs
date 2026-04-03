@@ -363,7 +363,92 @@ impl GidCommandExecutor {
         Self { gid_binary }
     }
 
-    /// Execute a gid command phase (legacy method for backward compatibility).
+    /// Execute a gid command in-process using gid-core APIs.
+    async fn execute_in_process(
+        &self,
+        command: &str,
+        args: &[String],
+        context: &PhaseContext,
+    ) -> Result<String> {
+        let graph_path = context.gid_root.join("graph.yml");
+
+        match command {
+            "advise" => {
+                let graph = crate::load_graph(&graph_path)?;
+                let results = crate::advise::analyze(&graph);
+                let mut output = String::new();
+                for advice in &results.items {
+                    output.push_str(&format!("[{:?}] {:?}: {}\n", advice.severity, advice.advice_type, advice.message));
+                }
+                if results.items.is_empty() {
+                    output.push_str("No issues found. Graph looks healthy.\n");
+                }
+                output.push_str(&format!("\nHealth score: {}%\n", results.health_score));
+                Ok(output)
+            }
+            "extract" => {
+                let src_dir = if args.is_empty() {
+                    context.project_root.join("src")
+                } else {
+                    context.project_root.join(&args[0])
+                };
+                let code_graph = crate::code_graph::CodeGraph::extract_from_dir(&src_dir);
+                let graph = crate::load_graph(&graph_path).unwrap_or_default();
+                let unified = crate::unified::build_unified_graph(&code_graph, &graph);
+                let stats = unified.summary();
+                crate::save_graph(&unified, &graph_path)?;
+                Ok(format!("Extracted code graph: {} total nodes, {} edges", stats.total_nodes, stats.total_edges))
+            }
+            "plan" => {
+                let graph = crate::load_graph(&graph_path)?;
+                let plan = crate::harness::create_plan(&graph)?;
+                Ok(format!(
+                    "Plan: {} tasks, {} layers, ~{} estimated turns\nCritical path: {}",
+                    plan.total_tasks,
+                    plan.layers.len(),
+                    plan.estimated_total_turns,
+                    plan.critical_path.join(" → ")
+                ))
+            }
+            "validate" => {
+                let graph = crate::load_graph(&graph_path)?;
+                let summary = graph.summary();
+                let health = graph.health();
+                Ok(format!(
+                    "Graph: {} nodes, {} edges\nHealth: {:.0}%\nDone: {}/{} tasks",
+                    summary.total_nodes, summary.total_edges,
+                    health * 100.0, summary.done, summary.total_nodes
+                ))
+            }
+            "design" if args.iter().any(|a| a == "--parse") => {
+                // design --parse needs LLM — fall back to CLI if available
+                let mut cmd = tokio::process::Command::new(&self.gid_binary);
+                cmd.arg(command).args(args).current_dir(&context.project_root);
+                let output = cmd.output().await
+                    .with_context(|| "gid design --parse requires LLM; falling back to CLI failed")?;
+                if output.status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                } else {
+                    Err(anyhow::anyhow!("gid design --parse failed: {}", String::from_utf8_lossy(&output.stderr)))
+                }
+            }
+            _ => {
+                // Unknown command — fall back to CLI
+                info!("Falling back to CLI for unknown command: {} {}", command, args.join(" "));
+                let mut cmd = tokio::process::Command::new(&self.gid_binary);
+                cmd.arg(command).args(args).current_dir(&context.project_root);
+                let output = cmd.output().await
+                    .with_context(|| format!("gid {} failed", command))?;
+                if output.status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                } else {
+                    Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&output.stderr)))
+                }
+            }
+        }
+    }
+
+    /// Execute a gid command phase.
     pub async fn execute_command(
         &self,
         phase: &PhaseDefinition,
@@ -378,17 +463,13 @@ impl GidCommandExecutor {
             phase.id, command, args.join(" ")
         );
 
-        let mut cmd = tokio::process::Command::new(&self.gid_binary);
-        cmd.arg(command);
-        cmd.args(args);
-        cmd.current_dir(&context.project_root);
+        // Execute in-process using gid-core APIs (no shell out)
+        let result = self.execute_in_process(command, args, context).await;
 
-        let output = cmd.output().await
-            .with_context(|| format!("Failed to execute: gid {} {}", command, args.join(" ")))?;
-
-        let success = output.status.success();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let (success, stdout, stderr) = match result {
+            Ok(output) => (true, output, String::new()),
+            Err(e) => (false, String::new(), e.to_string()),
+        };
 
         if !success {
             return Ok(PhaseResult::failure(format!(
