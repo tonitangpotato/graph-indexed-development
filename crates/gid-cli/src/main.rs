@@ -3,6 +3,7 @@
 //! A unified graph-based project and task management CLI.
 
 mod llm_client;
+mod api_llm_client;
 
 use std::path::PathBuf;
 use std::io::{self, Read};
@@ -2491,8 +2492,14 @@ async fn cmd_ritual_run(
 
     let definition = RitualDefinition::load(&ritual_path, &template_dirs)?;
 
-    // Create LLM client for skill/harness phases
-    let llm_client = llm_client::CliLlmClient::new().into_arc();
+    // Create LLM client — prefer API (agentctl-auth) over CLI fallback
+    let llm_client = if let Some(api_client) = api_llm_client::ApiLlmClient::try_from_pool() {
+        eprintln!("Using agentctl-auth API client");
+        api_client.into_arc()
+    } else {
+        eprintln!("No auth pool found, falling back to claude CLI");
+        llm_client::CliLlmClient::new().into_arc()
+    };
 
     // Check if we're resuming
     let resuming = state_path.exists();

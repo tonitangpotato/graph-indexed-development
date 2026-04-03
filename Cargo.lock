@@ -516,6 +516,7 @@ dependencies = [
 name = "gid-dev-cli"
 version = "0.3.0"
 dependencies = [
+ "agentctl-auth",
  "anyhow",
  "async-trait",
  "clap",
