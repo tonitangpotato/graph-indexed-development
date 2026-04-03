@@ -80,6 +80,9 @@ pub struct RitualState {
     pub phase_retries: HashMap<String, u32>,
     pub failed_phase: Option<RitualPhase>,
     pub error_context: Option<String>,
+    /// Tokens used per phase (e.g. "design" -> 5432, "implement" -> 28000).
+    #[serde(default)]
+    pub phase_tokens: HashMap<String, u64>,
     pub transitions: Vec<TransitionRecord>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -122,6 +125,7 @@ impl RitualState {
             phase_retries: HashMap::new(),
             failed_phase: None,
             error_context: None,
+            phase_tokens: HashMap::new(),
             transitions: Vec::new(),
             started_at: now,
             updated_at: now,
@@ -153,6 +157,17 @@ impl RitualState {
     pub fn with_strategy(mut self, strategy: ImplementStrategy) -> Self {
         self.strategy = Some(strategy);
         self
+    }
+
+    /// Record tokens used by a phase (additive — multiple calls accumulate).
+    pub fn add_phase_tokens(mut self, phase: &str, tokens: u64) -> Self {
+        *self.phase_tokens.entry(phase.to_string()).or_insert(0) += tokens;
+        self
+    }
+
+    /// Total tokens used across all phases.
+    pub fn total_tokens(&self) -> u64 {
+        self.phase_tokens.values().sum()
     }
 
     pub fn inc_verify_retries(mut self) -> Self {
@@ -482,6 +497,16 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
+        // Planning failed → retry once
+        (Planning, SkillFailed { error, .. }) if state.retries_for("planning") < 1 => (
+            state.clone().with_phase(Planning).inc_phase_retry("planning"),
+            vec![
+                Notify { message: format!("🔄 Planning failed, retrying... ({})", truncate(&error, 100)) },
+                SaveState,
+                RunPlanning,
+            ],
+        ),
+
         // Implementing failed → retry once
         (Implementing, SkillFailed { error, .. }) if state.retries_for("implementing") < 1 => (
             state.clone().with_phase(Implementing).inc_phase_retry("implementing"),
@@ -525,6 +550,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
         ),
 
         // Retry from Escalated
+        // Root fix: reset retry counters + re-detect project state for Design/Graph phases
         (Escalated, UserRetry) => {
             let retry_phase = state.failed_phase.clone().unwrap_or(Implementing);
             let context = format!(
@@ -532,24 +558,33 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 state.error_context.as_deref().unwrap_or("unknown"),
                 state.task
             );
+
+            // Reset retry counters for the phase being retried
+            let mut new_state = state.clone()
+                .with_error_context(String::new());
+            match &retry_phase {
+                Verifying => { new_state.verify_retries = 0; }
+                Designing => { new_state.phase_retries.remove("designing"); }
+                Graphing => { new_state.phase_retries.remove("graphing"); }
+                Implementing => { new_state.phase_retries.remove("implementing"); }
+                Planning => { new_state.phase_retries.remove("planning"); }
+                _ => {}
+            }
+
+            // Design/Graph retry: re-detect project state (DESIGN.md may have been created)
+            if matches!(retry_phase, Designing | Graphing) {
+                return (
+                    new_state.with_phase(Initializing),
+                    vec![
+                        Notify { message: "🔄 Retrying — re-detecting project state...".into() },
+                        SaveState,
+                        DetectProject,
+                    ],
+                );
+            }
+
             let action = match &retry_phase {
-                Designing => RunSkill {
-                    name: if state.project.as_ref().map_or(false, |p| p.has_design) {
-                        "update-design"
-                    } else {
-                        "draft-design"
-                    }.into(),
-                    context,
-                },
                 Planning => RunPlanning,
-                Graphing => RunSkill {
-                    name: if state.project.as_ref().map_or(false, |p| p.has_graph) {
-                        "update-graph"
-                    } else {
-                        "generate-graph"
-                    }.into(),
-                    context,
-                },
                 Implementing => RunSkill {
                     name: "implement".into(),
                     context,
@@ -563,7 +598,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 },
             };
             (
-                state.clone().with_phase(retry_phase),
+                new_state.with_phase(retry_phase),
                 vec![
                     Notify { message: "🔄 Retrying...".into() },
                     SaveState,
@@ -870,6 +905,70 @@ mod tests {
             .with_project(project_with_design());
         let (s, a) = transition(&state, RitualEvent::UserRetry);
         assert_eq!(s.phase, RitualPhase::Implementing);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_retry_resets_verify_retries() {
+        let mut state = idle_state()
+            .with_phase(RitualPhase::Escalated)
+            .with_failed_phase(RitualPhase::Verifying)
+            .with_task("test".into())
+            .with_project(project_with_design());
+        state.verify_retries = 3;
+        let (s, a) = transition(&state, RitualEvent::UserRetry);
+        assert_eq!(s.phase, RitualPhase::Verifying);
+        assert_eq!(s.verify_retries, 0, "UserRetry must reset verify_retries");
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_retry_resets_phase_retries() {
+        let mut state = idle_state()
+            .with_phase(RitualPhase::Escalated)
+            .with_failed_phase(RitualPhase::Implementing)
+            .with_task("test".into());
+        state.phase_retries.insert("implementing".into(), 1);
+        let (s, a) = transition(&state, RitualEvent::UserRetry);
+        assert_eq!(s.phase, RitualPhase::Implementing);
+        assert_eq!(s.retries_for("implementing"), 0, "UserRetry must reset phase_retries");
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_retry_design_re_detects_project() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Escalated)
+            .with_failed_phase(RitualPhase::Designing)
+            .with_task("test".into())
+            .with_project(project_greenfield());
+        let (s, a) = transition(&state, RitualEvent::UserRetry);
+        // Should go to Initializing to re-detect (DESIGN.md may now exist)
+        assert_eq!(s.phase, RitualPhase::Initializing);
+        let has_detect = a.iter().any(|a| matches!(a, RitualAction::DetectProject));
+        assert!(has_detect, "Design retry must re-detect project state");
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_planning_retry_once() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Planning)
+            .with_task("test".into());
+        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "planning".into(), error: "oops".into() });
+        assert_eq!(s.phase, RitualPhase::Planning);
+        assert_eq!(s.retries_for("planning"), 1);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_planning_escalate_after_retry() {
+        let mut state = idle_state()
+            .with_phase(RitualPhase::Planning)
+            .with_task("test".into());
+        state.phase_retries.insert("planning".into(), 1);
+        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "planning".into(), error: "oops".into() });
+        assert_eq!(s.phase, RitualPhase::Escalated);
         assert_invariant(&s, &a);
     }
 
