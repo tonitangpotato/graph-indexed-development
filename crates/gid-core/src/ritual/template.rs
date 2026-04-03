@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use super::definition::{
     RitualDefinition, PhaseDefinition, PhaseKind, ApprovalRequirement,
     FailureStrategy, ArtifactRef, ArtifactSpec, PhaseHooks, RitualConfig,
+    SkipCondition,
 };
 
 /// Summary of a template for listing.
@@ -393,7 +394,23 @@ impl TemplateRegistry {
             description: Some("Quick implementation: design → graph → implement → verify".to_string()),
             extends: None,
             phases: vec![
-                // Phase 0: Generate graph from existing design
+                // Phase 0: Draft design (LLM generates DESIGN.md)
+                PhaseDefinition {
+                    id: "draft-design".to_string(),
+                    kind: PhaseKind::Skill { name: "quick-design".to_string() },
+                    model: Some("sonnet".to_string()),
+                    approval: ApprovalRequirement::Auto,
+                    skip_if: Some(SkipCondition::FileExists { file_exists: "DESIGN.md".to_string() }),
+                    timeout_minutes: Some(30),
+                    input: vec![],
+                    output: vec![
+                        ArtifactSpec { path: "DESIGN.md".to_string(), required: false },
+                    ],
+                    hooks: PhaseHooks::default(),
+                    on_failure: FailureStrategy::Skip,
+                    harness_config: None,
+                },
+                // Phase 1: Generate graph from design
                 PhaseDefinition {
                     id: "generate-graph".to_string(),
                     kind: PhaseKind::GidCommand {
@@ -412,7 +429,7 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Escalate,
                     harness_config: None,
                 },
-                // Phase 1: Execute tasks
+                // Phase 2: Execute tasks
                 PhaseDefinition {
                     id: "execute-tasks".to_string(),
                     kind: PhaseKind::Harness { config_overrides: None },
