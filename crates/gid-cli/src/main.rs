@@ -3,6 +3,7 @@
 //! A unified graph-based project and task management CLI.
 
 mod llm_client;
+mod mcp;
 
 use std::path::PathBuf;
 use std::io::{self, Read};
@@ -375,6 +376,9 @@ enum Commands {
     /// Ritual pipeline orchestration
     #[command(subcommand)]
     Ritual(RitualCommands),
+
+    /// Start MCP server (stdio mode) for AI agent integration
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -634,6 +638,12 @@ fn main() -> Result<()> {
                 RitualCommands::Cancel => cmd_ritual_cancel(&cwd, cli.json),
                 RitualCommands::Templates => cmd_ritual_templates(&cwd, cli.json),
             }
+        }
+
+        // MCP server
+        Commands::Mcp => {
+            let cwd = std::env::current_dir()?;
+            mcp::cmd_mcp(&cwd)
         }
     }
 }
