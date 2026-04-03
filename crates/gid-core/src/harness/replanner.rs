@@ -88,9 +88,8 @@ impl Replanner {
             ));
         }
 
-        // If sub-agent reported a blocker, escalate
+        // If sub-agent reported a blocker, escalate (don't count against replan budget)
         if let Some(ref blocker) = result.blocker {
-            self.replan_count += 1;
             warn!(task_id = %task.id, blocker = %blocker, "Task has blocker, escalating");
             return ReplanDecision::Escalate(format!(
                 "Task '{}' blocked: {}",

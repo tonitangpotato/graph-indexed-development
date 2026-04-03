@@ -134,15 +134,23 @@ fn parse_usage_stats(stderr: &str) -> (usize, u64) {
 
 /// Extract the last number from a string (handles commas).
 fn extract_number(s: &str) -> Option<u64> {
-    let cleaned: String = s
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit() || *c == ',')
-        .collect::<String>()
-        .chars()
-        .rev()
-        .filter(|c| *c != ',')
-        .collect();
+    // Find first contiguous digit sequence (with optional commas like 1,234)
+    let mut start = None;
+    let mut end = 0;
+    for (i, c) in s.chars().enumerate() {
+        if c.is_ascii_digit() {
+            if start.is_none() {
+                start = Some(i);
+            }
+            end = i + 1;
+        } else if c == ',' && start.is_some() {
+            // Allow commas within numbers (e.g. "1,234")
+        } else if start.is_some() {
+            break;
+        }
+    }
+    let start = start?;
+    let cleaned: String = s[start..end].chars().filter(|c| *c != ',').collect();
     cleaned.parse().ok()
 }
 

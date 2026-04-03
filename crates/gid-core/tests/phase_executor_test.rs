@@ -130,12 +130,22 @@ async fn test_gid_command_executor() {
     let phase = make_phase("gen-graph", PhaseKind::GidCommand { command: "version".into(), args: vec![] });
 
     let executor = GidCommandExecutor::new();
-    // Using the new execute_command method
+    // Using the new execute_command method — "version" may not be a valid subcommand
     let result = executor.execute_command(&phase, &ctx, "version", &[]).await;
     
-    // gid might not be installed in test env, but the command should at least try
-    // This test verifies the API works
-    assert!(result.is_ok() || result.is_err());
+    // Verify the executor attempted to run the command (doesn't panic/crash)
+    // Result depends on whether gid is installed and if "version" is valid
+    match &result {
+        Ok(r) => {
+            // Command ran — success or failure is fine, just verify we got a result
+            assert!(r.duration_secs < 30, "Command should not take more than 30s");
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("spawn") || msg.contains("not found") || msg.contains("No such file") || msg.contains("Failed"),
+                "Expected spawn/not-found error, got: {}", msg);
+        }
+    }
 }
 
 #[tokio::test]
@@ -148,7 +158,15 @@ async fn test_gid_command_executor_via_trait() {
     let executor = GidCommandExecutor::new();
     // Use the PhaseExecutor trait
     let result = executor.execute(&phase, &ctx).await;
-    assert!(result.is_ok() || result.is_err()); // gid may not be installed
+    // Verify the executor doesn't panic — result depends on gid installation
+    match &result {
+        Ok(r) => assert!(r.duration_secs < 30, "Command should not take more than 30s"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("spawn") || msg.contains("not found") || msg.contains("No such file") || msg.contains("Failed"),
+                "Expected spawn/not-found error, got: {}", msg);
+        }
+    }
 }
 
 #[tokio::test]

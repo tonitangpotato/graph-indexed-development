@@ -23,6 +23,8 @@ pub struct PhaseResult {
     pub artifacts: Vec<String>,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Captured stdout/stderr output (for debugging).
+    pub output: Option<String>,
     /// Duration in seconds.
     pub duration_secs: u64,
 }
@@ -34,6 +36,7 @@ impl PhaseResult {
             success: true,
             artifacts: vec![],
             error: None,
+            output: None,
             duration_secs: 0,
         }
     }
@@ -44,6 +47,7 @@ impl PhaseResult {
             success: false,
             artifacts: vec![],
             error: Some(error.into()),
+            output: None,
             duration_secs: 0,
         }
     }
@@ -51,6 +55,12 @@ impl PhaseResult {
     /// Set the duration.
     pub fn with_duration(mut self, secs: u64) -> Self {
         self.duration_secs = secs;
+        self
+    }
+
+    /// Set captured output.
+    pub fn with_output(mut self, output: impl Into<String>) -> Self {
+        self.output = Some(output.into());
         self
     }
 
@@ -823,7 +833,12 @@ impl ShellExecutor {
             )).with_duration(start.elapsed().as_secs()));
         }
 
-        debug!("Shell command completed: {}", stdout.trim());
+        if !stdout.is_empty() {
+            debug!("Shell stdout: {}", stdout.trim());
+        }
+        if !stderr.is_empty() {
+            debug!("Shell stderr: {}", stderr.trim());
+        }
 
         // Collect output artifacts
         let mut artifacts = Vec::new();
@@ -838,9 +853,15 @@ impl ShellExecutor {
             }
         }
 
-        Ok(PhaseResult::success()
+        // Capture output for debugging
+        let combined = format!("{}{}", stdout, stderr);
+        let mut result = PhaseResult::success()
             .with_artifacts(artifacts)
-            .with_duration(start.elapsed().as_secs()))
+            .with_duration(start.elapsed().as_secs());
+        if !combined.trim().is_empty() {
+            result = result.with_output(combined);
+        }
+        Ok(result)
     }
 }
 

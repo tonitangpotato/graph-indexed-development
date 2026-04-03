@@ -11,6 +11,7 @@
 //! 2. Path constraints — even visible tools are restricted to specific paths
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Policy for bash/shell command execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -193,7 +194,10 @@ pub fn default_scope_for_phase(phase_id: &str) -> ToolScope {
         "execute-tasks" => ToolScope::full(),
         "extract-code" => ToolScope::graph_ops(),
         "verify-quality" => ToolScope::verify(),
-        _ => ToolScope::full(), // Unknown phases get full access
+        _ => {
+            warn!("No ToolScope defined for phase '{}', using full access", phase_id);
+            ToolScope::full()
+        }
     }
 }
 
