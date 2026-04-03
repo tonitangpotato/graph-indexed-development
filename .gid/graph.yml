@@ -117,14 +117,14 @@ nodes:
 - id: gidterm-integration
   title: gidterm as UI layer — reads execution-log.jsonl, writes execution-state.json
   status: done
-  description: 'gid-core dependency + execution log reader + state writer + ritual TUI view. 1769 lines added.'
+  description: gid-core dependency + execution log reader + state writer + ritual TUI view. 1769 lines added.
   tags:
   - p3
   - integration
 - id: mcp-server
   title: MCP server via TypeScript wrapper (packages/mcp/)
   status: done
-  description: 'TypeScript MCP server using @modelcontextprotocol/sdk, wraps gid CLI binary. Already complete in packages/mcp/.'
+  description: TypeScript MCP server using @modelcontextprotocol/sdk, wraps gid CLI binary. Already complete in packages/mcp/.
   tags:
   - p3
   - integration
@@ -134,108 +134,126 @@ nodes:
   tags:
   - p2
   - core
+  description: 'Graph history: snapshots, diff, restore'
 - id: refactor
   title: 'Refactor: rename, merge, split, extract'
   status: done
   tags:
   - p2
   - core
+  description: Graph refactoring operations
 - id: semantify
   title: 'Semantify: upgrade file-level to semantic graph'
   status: done
   tags:
   - p2
   - ai
+  description: LLM prompt generation to add semantic meaning to graph nodes
 - id: ignore-list
   title: 'Ignore-list: .gidignore support'
   status: done
   tags:
   - p2
   - core
+  description: '.gidignore: file exclusion patterns for code graph extraction'
 - id: json-output
   title: JSON global output flag for CLI
   status: done
   tags:
   - p2
   - cli
+  description: JSON output format support for all CLI commands
 - id: ritual-skill-executor
   title: 'SkillExecutor: LLM-backed skill phase execution'
   status: done
   tags:
   - p0
   - ritual
+  description: 'SkillExecutor: runs LLM-backed skill phases with tools'
 - id: ritual-harness-executor
   title: 'HarnessExecutor: task harness phase execution'
   status: done
   tags:
   - p0
   - ritual
+  description: 'HarnessExecutor: runs multi-agent task harness'
 - id: ritual-gid-executor
   title: 'GidCommandExecutor: wire to gid CLI commands'
   status: done
   tags:
   - p1
   - ritual
+  description: 'GidCommandExecutor: runs gid CLI commands in-process'
 - id: ritual-shell-executor
   title: 'ShellExecutor: validated shell command execution'
   status: done
   tags:
   - p1
   - ritual
+  description: 'ShellExecutor: validated shell command execution with policy'
 - id: ritual-cli-run
   title: 'gid ritual run: CLI command to execute ritual end-to-end'
   status: done
   tags:
   - p0
   - ritual
+  description: 'gid ritual run: CLI command for standalone ritual execution'
 - id: ritual-toolscope
   title: 'ToolScope: per-phase capability boundaries'
   status: done
   tags:
   - p0
   - ritual
+  description: 'ToolScope: per-phase capability boundaries (tools, paths, bash policy)'
 - id: ritual-rustclaw-integration
   title: 'RustClaw ritual integration: scope filtering in agent loop'
   status: done
   tags:
   - p0
   - ritual
+  description: 'V1 RustClaw ritual integration: scope filtering in agent loop'
 - id: ritual-notifier
   title: 'Ritual notifier: Telegram/channel updates on phase transitions'
   status: done
   tags:
   - p1
   - ritual
+  description: 'Ritual notification system: progress callbacks to external channels'
 - id: ritual-engine
   title: 'RitualEngine: state machine with run/approve/skip/cancel'
   status: done
   tags:
   - p0
   - ritual
+  description: 'V1 ritual engine: while-loop based phase progression'
 - id: ritual-definition
   title: 'RitualDefinition: YAML schema with phases, approval, skip_if'
   status: done
   tags:
   - p0
   - ritual
+  description: 'Ritual YAML definition: phases, skills, conditions, failure strategies'
 - id: ritual-template
   title: 'Ritual templates: predefined workflows (feature, bugfix, research)'
   status: done
   tags:
   - p1
   - ritual
+  description: 'Ritual templates: full-dev-cycle, quick-impl, bugfix'
 - id: ritual-approval
   title: 'Approval system: required/auto/mixed per-phase gates'
   status: done
   tags:
   - p0
   - ritual
+  description: 'Phase approval gates: required/optional/auto modes'
 - id: ritual-artifact
   title: 'Artifact checking: glob-based output verification'
   status: done
   tags:
   - p0
   - ritual
+  description: 'Artifact tracking: record and verify phase outputs'
 - id: ritual-cli-basic
   title: gid ritual init/status/approve/skip/cancel CLI commands
   status: done
@@ -243,120 +261,140 @@ nodes:
   - p0
   - ritual
   - cli
+  description: 'Ritual CLI basics: init, list, status commands'
 - id: harness-scheduler
   title: 'Task harness scheduler: topological ordering + parallelism'
   status: done
   tags:
   - p0
   - harness
+  description: 'Task scheduling: dependency-aware parallel execution'
 - id: harness-executor
   title: 'Task harness executor: run tasks with agent delegation'
   status: done
   tags:
   - p0
   - harness
+  description: 'Harness executor: run individual tasks via LLM agent'
 - id: harness-replanner
   title: 'Task harness replanner: dynamic re-planning on failure'
   status: done
   tags:
   - p1
   - harness
+  description: Dynamic replanning when tasks fail
 - id: harness-verifier
   title: 'Task harness verifier: test execution + quality checks'
   status: done
   tags:
   - p0
   - harness
+  description: 'Post-task verification: build/test checks'
 - id: harness-context
   title: 'Task harness context: working memory + file tracking'
   status: done
   tags:
   - p0
   - harness
+  description: Shared context management across harness tasks
 - id: harness-telemetry
   title: 'Task harness telemetry: execution logging + metrics'
   status: done
   tags:
   - p1
   - harness
+  description: 'Execution telemetry: timing, tokens, success rates'
 - id: harness-notifier
   title: 'Task harness notifier: channel notifications on events'
   status: done
   tags:
   - p1
   - harness
+  description: Harness notification callbacks
 - id: harness-log-reader
   title: 'Task harness log reader: execution-log.jsonl parsing'
   status: done
   tags:
   - p0
   - harness
+  description: Execution log reader for gidterm integration
 - id: harness-worktree
   title: 'Task harness worktree: git branch isolation per task'
   status: done
   tags:
   - p1
   - harness
+  description: Git worktree management for parallel task isolation
 - id: harness-topology
   title: 'Task harness topology: dependency DAG analysis'
   status: done
   tags:
   - p0
   - harness
+  description: Task dependency graph topology analysis
 - id: harness-planner
   title: 'Task harness planner: initial task ordering from graph'
   status: done
   tags:
   - p0
   - harness
+  description: Initial task planning from graph analysis
 - id: harness-config
   title: 'Task harness config: YAML configuration schema'
   status: done
   tags:
   - p0
   - harness
+  description: 'Harness configuration: concurrency, timeouts, retry policies'
 - id: harness-execution-state
   title: 'Task harness execution state: persistence + recovery'
   status: done
   tags:
   - p0
   - harness
+  description: 'Execution state machine: file-based harness↔gidterm protocol'
 - id: complexity
   title: Code complexity analysis (cyclomatic, cognitive)
   status: done
   tags:
   - p2
   - code-intel
+  description: Code complexity assessment for change impact estimation
 - id: parser
   title: 'Source code parser: Rust/TS/Python entity extraction'
   status: done
   tags:
   - p1
   - code-intel
+  description: 'Source code parser: Rust, TypeScript, Python, Go'
 - id: validator
   title: 'Graph validator: consistency checks + suggestions'
   status: done
   tags:
   - p2
   - core
+  description: 'Graph validation: cycles, orphans, missing references'
 - id: task-graph-knowledge
   title: 'Task-level knowledge cache: findings + file associations'
   status: done
   tags:
   - p1
   - harness
+  description: Task graph knowledge extraction from code analysis
 - id: harness-types
   title: 'Harness shared types: TaskStatus, ExecutionPlan, etc.'
   status: done
   tags:
   - p0
   - harness
+  description: Shared types for harness subsystem
 - id: mcp-package
   title: MCP server TypeScript package (packages/mcp/)
   status: done
   tags:
   - p2
   - integration
+  description: MCP server npm package configuration
 - id: ritual-executors-req
   title: ritual-executors requirements.md
   status: done
@@ -365,6 +403,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for ritual executors subsystem
 - id: ritual-executors-design
   title: ritual-executors design.md
   status: done
@@ -373,6 +412,7 @@ nodes:
   - doc
   - design
   type: doc
+  description: Design doc for ritual executors subsystem
 - id: ritual-cli-run-req
   title: ritual-cli-run requirements.md
   status: done
@@ -381,6 +421,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for ritual CLI run command
 - id: ritual-notifier-req
   title: ritual-notifier requirements.md
   status: done
@@ -389,6 +430,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for ritual notifier
 - id: mcp-server-req
   title: mcp-server requirements.md
   status: done
@@ -397,6 +439,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for MCP server
 - id: gidterm-integration-req
   title: gidterm-integration requirements.md
   status: done
@@ -405,6 +448,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for gidterm integration
 - id: core-req
   title: core requirements.md
   status: done
@@ -413,6 +457,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for core graph subsystem
 - id: code-intel-req
   title: code-intel requirements.md
   status: done
@@ -421,6 +466,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for code intelligence subsystem
 - id: harness-req
   title: harness requirements.md
   status: done
@@ -429,6 +475,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for task harness subsystem
 - id: ritual-engine-req
   title: ritual-engine requirements.md
   status: done
@@ -437,6 +484,7 @@ nodes:
   - doc
   - requirements
   type: doc
+  description: Requirements doc for ritual engine subsystem
 - id: gid-readme
   title: .gid/README.md
   status: done
@@ -444,76 +492,61 @@ nodes:
   - meta
   - doc
   type: doc
-# ═══ Ritual V2 — Pure Function State Machine ═══
+  description: '.gid/README.md: graph directory documentation'
 - id: ritual-v2-design
   title: 'DESIGN-ritual-v2.md: pure function state machine design document'
   status: done
   tags:
   - p0
   - ritual-v2
-  file: DESIGN-ritual-v2.md
 - id: ritual-v2-state-machine
   title: 'V2 State Machine: transition(state, event) → (new_state, actions)'
   status: done
   tags:
   - p0
   - ritual-v2
-  file: crates/gid-core/src/ritual/state_machine.rs
-  notes: '29 tests. Pure function, zero IO. Invariant: every transition → terminal OR exactly 1 EP action.'
 - id: ritual-v2-executor
   title: 'V2 Executor: action executor + engine loop (run_ritual)'
   status: done
   tags:
   - p0
   - ritual-v2
-  file: crates/gid-core/src/ritual/v2_executor.rs
-  notes: '8 tests. DetectProject, RunSkill, RunShell, RunPlanning, RunHarness.'
 - id: ritual-v2-gating
   title: 'Tool Gating: block writes to source paths without active ritual'
   status: done
   tags:
   - p0
   - ritual-v2
-  file: crates/gid-core/src/ritual/gating.rs
-  notes: '21 tests. GatingConfig from .gid/config.yml. Glob+regex matching.'
 - id: ritual-v2-api-llm-client
   title: 'ApiLlmClient: shared LLM client in gid-core for standalone execution'
   status: done
   tags:
   - p1
   - ritual-v2
-  file: crates/gid-core/src/ritual/api_llm_client.rs
 - id: ritual-v2-llm-trait
-  title: 'LlmClient trait + ToolHandler types for ritual skill phases'
+  title: LlmClient trait + ToolHandler types for ritual skill phases
   status: done
   tags:
   - p0
   - ritual-v2
-  file: crates/gid-core/src/ritual/llm.rs
-  notes: 'Decoupled from agentctl-auth. Types owned by gid-core.'
 - id: ritual-v2-composer
   title: 'Dynamic ritual composer: auto-detect project state → compose phases'
   status: done
   tags:
   - p1
   - ritual-v2
-  file: crates/gid-core/src/ritual/composer.rs
 - id: rustclaw-ritual-runner
   title: 'RustClaw RitualRunner: bridges V2 state machine with RustClaw infra'
   status: done
   tags:
   - p0
   - ritual-v2
-  file: /Users/potato/rustclaw/src/ritual_runner.rs
-  notes: 'Terminal notifications, concurrent protection, 5min shell timeout.'
 - id: rustclaw-ritual-adapter
   title: 'RustClaw RitualLlmAdapter: bridges LlmClient → gid-core trait'
   status: done
   tags:
   - p0
   - ritual-v2
-  file: /Users/potato/rustclaw/src/ritual_adapter.rs
-  notes: 'Mini agent loop. Path traversal protection. UTF-8 safe truncation.'
 - id: rustclaw-start-ritual-tool
   title: 'start_ritual tool: single entry point replacing 6 V1 tools'
   status: done
@@ -526,7 +559,6 @@ nodes:
   tags:
   - p0
   - ritual-v2
-  notes: 'Saves ~70% tokens on small tasks. New states: Triaging, WaitingClarification.'
 edges:
 - from: graph-types
   to: workspace-setup
@@ -756,7 +788,6 @@ edges:
 - from: gidterm-integration-req
   to: gidterm-integration
   relation: documents
-# ═══ Ritual V2 edges ═══
 - from: ritual-v2-design
   to: ritual-v2-state-machine
   relation: specifies
@@ -796,3 +827,18 @@ edges:
 - from: ritual-v2-composer
   to: ritual-v2-executor
   relation: used_by
+- from: core-req
+  to: graph-types
+  relation: documents
+- from: harness-req
+  to: harness-scheduler
+  relation: documents
+- from: ritual-engine-req
+  to: ritual-engine
+  relation: documents
+- from: gid-readme
+  to: workspace-setup
+  relation: documents
+- from: code-intel-req
+  to: code-graph
+  relation: documents
