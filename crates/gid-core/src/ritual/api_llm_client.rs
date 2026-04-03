@@ -153,6 +153,8 @@ impl LlmClient for ApiLlmClient {
         };
 
         // Run agent loop (multi-turn with tool use)
+        tracing::info!("ApiLlmClient: starting agent loop with model='{}', tools={}, prompt_len={}", 
+            model, api_tools.len(), skill_prompt.len());
         let result = self.client.run_agent_loop(
             model,
             "You are a development assistant executing a ritual phase. Complete the task and produce the required artifacts.",
@@ -160,7 +162,12 @@ impl LlmClient for ApiLlmClient {
             &api_tools,
             20, // max turns
             &handler,
-        ).await.context("Agent loop failed")?;
+        ).await.map_err(|e| {
+            tracing::error!("ApiLlmClient: agent loop failed: {:?}", e);
+            e
+        }).context("Agent loop failed")?;
+        tracing::info!("ApiLlmClient: agent loop completed, {} tool calls, output_len={}", 
+            result.tool_calls.len(), result.final_text.len());
 
         Ok(SkillResult {
             output: result.final_text,
