@@ -347,20 +347,11 @@ impl PhaseExecutor for SkillExecutor {
 
 /// Runs a gid CLI command (design, extract, advise, etc.).
 pub struct GidCommandExecutor {
-    gid_binary: PathBuf,
 }
 
 impl GidCommandExecutor {
     pub fn new() -> Self {
-        // Try to find gid binary in PATH
-        let gid_binary = which::which("gid")
-            .unwrap_or_else(|_| PathBuf::from("gid"));
-
-        Self { gid_binary }
-    }
-
-    pub fn with_binary(gid_binary: PathBuf) -> Self {
-        Self { gid_binary }
+        Self {}
     }
 
     /// Execute a gid command in-process using gid-core APIs.
@@ -420,30 +411,19 @@ impl GidCommandExecutor {
                     health * 100.0, summary.done, summary.total_nodes
                 ))
             }
-            "design" if args.iter().any(|a| a == "--parse") => {
-                // design --parse needs LLM — fall back to CLI if available
-                let mut cmd = tokio::process::Command::new(&self.gid_binary);
-                cmd.arg(command).args(args).current_dir(&context.project_root);
-                let output = cmd.output().await
-                    .with_context(|| "gid design --parse requires LLM; falling back to CLI failed")?;
-                if output.status.success() {
-                    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-                } else {
-                    Err(anyhow::anyhow!("gid design --parse failed: {}", String::from_utf8_lossy(&output.stderr)))
-                }
+            "design" => {
+                // design --parse needs LLM — use Skill phase instead of GidCommand
+                Err(anyhow::anyhow!(
+                    "gid design requires LLM and should be a Skill phase, not a GidCommand. \
+                     Use PhaseKind::Skill {{ name: \"design-to-graph\" }} in your ritual template."
+                ))
             }
-            _ => {
-                // Unknown command — fall back to CLI
-                info!("Falling back to CLI for unknown command: {} {}", command, args.join(" "));
-                let mut cmd = tokio::process::Command::new(&self.gid_binary);
-                cmd.arg(command).args(args).current_dir(&context.project_root);
-                let output = cmd.output().await
-                    .with_context(|| format!("gid {} failed", command))?;
-                if output.status.success() {
-                    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-                } else {
-                    Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&output.stderr)))
-                }
+            other => {
+                Err(anyhow::anyhow!(
+                    "Unknown gid command '{}'. Supported in-process commands: advise, extract, plan, validate. \
+                     If you need LLM, use a Skill phase instead.",
+                    other
+                ))
             }
         }
     }
