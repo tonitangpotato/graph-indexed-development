@@ -152,11 +152,19 @@ impl LlmClient for ApiLlmClient {
             working_dir: working_dir.to_path_buf(),
         };
 
+        // Resolve model aliases to full Anthropic model IDs
+        let resolved_model = match model {
+            "sonnet" => "claude-sonnet-4-5-20250514",
+            "opus" => "claude-opus-4-0-20250514",
+            "haiku" => "claude-haiku-3-5-20241022",
+            other => other,
+        };
+
         // Run agent loop (multi-turn with tool use)
-        tracing::info!("ApiLlmClient: starting agent loop with model='{}', tools={}, prompt_len={}", 
-            model, api_tools.len(), skill_prompt.len());
+        tracing::info!("ApiLlmClient: starting agent loop with model='{}' (resolved='{}'), tools={}, prompt_len={}", 
+            model, resolved_model, api_tools.len(), skill_prompt.len());
         let result = self.client.run_agent_loop(
-            model,
+            resolved_model,
             "You are a development assistant executing a ritual phase. Complete the task and produce the required artifacts.",
             skill_prompt,
             &api_tools,
