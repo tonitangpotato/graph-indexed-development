@@ -115,7 +115,7 @@ nodes:
   - p3
   - integration
 - id: gidterm-integration
-  title: gidterm uses gid-core as dependency
+  title: gidterm as UI layer — reads execution-log.jsonl, writes execution-state.json
   status: todo
   description: Replace gidterm's graph parsing with gid-core. Shared types and logic.
   tags:
