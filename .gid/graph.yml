@@ -123,7 +123,7 @@ nodes:
   - integration
 - id: mcp-server
   title: MCP server mode using gid-core backend
-  status: todo
+  status: done
   description: 'Optional: gid serve starts MCP server backed by gid-core. Replaces TypeScript MCP server.'
   tags:
   - p3
