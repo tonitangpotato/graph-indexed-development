@@ -141,11 +141,45 @@ impl SkillExecutor {
                 .with_context(|| format!("Failed to read skill template: {}", template_skill.display()));
         }
 
-        // Fall back to a default prompt
-        Ok(format!(
-            "You are executing the '{}' skill for ritual '{}'. Complete the task described in the phase definition.",
-            skill_name, context.ritual_name
-        ))
+        // Fall back to built-in skill prompts, then generic
+        match skill_name {
+            "quick-design" => Ok(
+                "You are a software architect. Read the user's request and any existing code context.\n\
+                 Create a concise DESIGN.md in the project root with:\n\
+                 - Problem statement\n\
+                 - Proposed solution (files to create/modify)\n\
+                 - Key design decisions\n\
+                 Keep it brief — this is a quick implementation, not a full RFC.\n\
+                 Use the Write tool to create DESIGN.md.".to_string()
+            ),
+            "design-to-graph" => Ok(
+                "You are a task graph generator. Read DESIGN.md from the project root.\n\
+                 Generate a GID task graph in YAML format and write it to .gid/graph.yml.\n\n\
+                 The graph format is:\n\
+                 ```yaml\n\
+                 nodes:\n\
+                   - id: task-id\n\
+                     label: \"Human-readable title\"\n\
+                     status: todo\n\
+                     tags: [implementation]\n\
+                     description: \"What to do\"\n\
+                 edges:\n\
+                   - from: task-a\n\
+                     to: task-b\n\
+                     relation: depends_on\n\
+                 ```\n\n\
+                 Rules:\n\
+                 - Each task should be a single, concrete unit of work\n\
+                 - Use depends_on edges to express ordering\n\
+                 - Status should be 'todo' for all new tasks\n\
+                 - Read existing .gid/graph.yml first if it exists, and merge\n\
+                 Use the Read tool to read DESIGN.md, then Write tool to create .gid/graph.yml.".to_string()
+            ),
+            _ => Ok(format!(
+                "You are executing the '{}' skill for ritual '{}'. Complete the task described in the phase definition.",
+                skill_name, context.ritual_name
+            )),
+        }
     }
 
     /// Build tool definitions based on the scope.

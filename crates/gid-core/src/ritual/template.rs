@@ -410,13 +410,10 @@ impl TemplateRegistry {
                     on_failure: FailureStrategy::Skip,
                     harness_config: None,
                 },
-                // Phase 1: Generate graph from design
+                // Phase 1: Generate graph from design (Skill — uses LLM in-process)
                 PhaseDefinition {
                     id: "generate-graph".to_string(),
-                    kind: PhaseKind::GidCommand {
-                        command: "design".to_string(),
-                        args: vec!["--parse".to_string()],
-                    },
+                    kind: PhaseKind::Skill { name: "design-to-graph".to_string() },
                     model: Some("sonnet".to_string()),
                     approval: ApprovalRequirement::Optional,
                     skip_if: None,
