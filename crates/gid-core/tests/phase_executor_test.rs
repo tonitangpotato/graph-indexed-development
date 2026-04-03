@@ -55,6 +55,7 @@ fn test_context(tmp: &std::path::Path) -> PhaseContext {
         model: "sonnet".to_string(),
         ritual_name: "test".to_string(),
         phase_index: 0,
+        task_context: None,
     }
 }
 

@@ -86,6 +86,10 @@ pub struct PhaseContext {
     pub ritual_name: String,
     /// Index of the current phase.
     pub phase_index: usize,
+    /// Task context injected by the ritual engine.
+    /// Contains the user's task description and any retry/error context.
+    /// When present, prepended to the skill prompt so the LLM knows what to do.
+    pub task_context: Option<String>,
 }
 
 /// Trait for phase execution backends.
@@ -343,8 +347,15 @@ impl SkillExecutor {
             phase.id, skill_name
         );
 
-        // Load skill prompt
-        let skill_prompt = self.load_skill_prompt(skill_name, context)?;
+        // Load skill prompt and inject task context
+        let base_prompt = self.load_skill_prompt(skill_name, context)?;
+        let skill_prompt = match &context.task_context {
+            Some(ctx) => format!(
+                "## USER TASK\n{}\n\n## INSTRUCTIONS\n{}",
+                ctx, base_prompt
+            ),
+            None => base_prompt,
+        };
 
         // Get scope for this phase
         let scope = default_scope_for_phase(&phase.id);
@@ -1079,6 +1090,7 @@ mod tests {
             model: "sonnet".to_string(),
             ritual_name: "test".to_string(),
             phase_index: 0,
+            task_context: None,
         }
     }
 

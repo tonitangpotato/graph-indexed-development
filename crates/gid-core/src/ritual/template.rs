@@ -381,6 +381,7 @@ impl TemplateRegistry {
                 log_file: ".gid/execution-log.jsonl".to_string(),
                 notify: None,
             },
+            task_context: None,
         }
     }
     
@@ -462,6 +463,7 @@ impl TemplateRegistry {
                 log_file: ".gid/execution-log.jsonl".to_string(),
                 notify: None,
             },
+            task_context: None,
         }
     }
     
@@ -527,6 +529,7 @@ impl TemplateRegistry {
                 log_file: ".gid/execution-log.jsonl".to_string(),
                 notify: None,
             },
+            task_context: None,
         }
     }
 }

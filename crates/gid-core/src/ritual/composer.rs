@@ -214,6 +214,7 @@ pub fn compose_ritual(project_root: &Path, task: &str) -> RitualDefinition {
             default_model: "opus".to_string(),
             ..Default::default()
         },
+        task_context: Some(task.to_string()),
     }
 }
 

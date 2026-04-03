@@ -617,6 +617,7 @@ impl RitualEngine {
             model,
             ritual_name: self.definition.name.clone(),
             phase_index: self.state.current_phase,
+            task_context: self.definition.task_context.clone(),
         })
     }
     
@@ -705,6 +706,7 @@ mod tests {
                 },
             ],
             config: super::super::definition::RitualConfig::default(),
+            task_context: None,
         }
     }
     

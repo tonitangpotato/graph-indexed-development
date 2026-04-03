@@ -25,6 +25,10 @@ pub struct RitualDefinition {
     /// Global configuration.
     #[serde(default)]
     pub config: RitualConfig,
+    /// User's task description — injected into skill prompts as context.
+    /// Set by the caller (e.g., `/ritual` command or `compose_ritual()`).
+    #[serde(default)]
+    pub task_context: Option<String>,
 }
 
 /// Per-phase configuration.
@@ -468,6 +472,7 @@ config:
                 },
             ],
             config: RitualConfig::default(),
+            task_context: None,
         };
         
         assert!(def.validate().is_err());
