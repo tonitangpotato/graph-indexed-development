@@ -154,8 +154,8 @@ impl LlmClient for ApiLlmClient {
 
         // Resolve model aliases to full Anthropic model IDs
         let resolved_model = match model {
-            "sonnet" => "claude-sonnet-4-5-20250514",
-            "opus" => "claude-opus-4-0-20250514",
+            "sonnet" => "claude-sonnet-4-5-20250929",
+            "opus" => "claude-opus-4-6",
             "haiku" => "claude-haiku-3-5-20241022",
             other => other,
         };
