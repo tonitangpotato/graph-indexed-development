@@ -83,6 +83,9 @@ impl RitualPhase {
 /// Full ritual state — immutable transitions via builder methods.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RitualState {
+    /// Unique ritual identifier (for multi-ritual parallel support).
+    #[serde(default = "default_ritual_id")]
+    pub id: String,
     pub phase: RitualPhase,
     pub task: String,
     pub project: Option<ProjectState>,
@@ -97,6 +100,20 @@ pub struct RitualState {
     pub transitions: Vec<TransitionRecord>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_ritual_id() -> String {
+    generate_ritual_id()
+}
+
+/// Generate a short human-readable ritual ID (e.g., "r-a3f8").
+pub fn generate_ritual_id() -> String {
+    use std::time::SystemTime;
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("r-{:x}", ts & 0xFFFF)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -128,6 +145,7 @@ impl RitualState {
     pub fn new() -> Self {
         let now = Utc::now();
         Self {
+            id: generate_ritual_id(),
             phase: RitualPhase::Idle,
             task: String::new(),
             project: None,
