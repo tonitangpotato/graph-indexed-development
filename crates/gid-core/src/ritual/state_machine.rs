@@ -21,8 +21,10 @@ pub enum RitualPhase {
     Initializing,
     Triaging,
     WaitingClarification,
+    /// Writing requirements document (for large tasks).
+    WritingRequirements,
     Designing,
-    /// Reviewing a document produced by the previous phase (design, graph, requirements).
+    /// Reviewing a document produced by the previous phase (requirements, design, tasks).
     /// `review_target` in state tracks what's being reviewed and where to go next.
     Reviewing,
     /// Waiting for human to approve review findings before applying changes.
@@ -44,6 +46,7 @@ impl RitualPhase {
             Self::Initializing => "Initializing",
             Self::Triaging => "Triage",
             Self::WaitingClarification => "Waiting for Clarification",
+            Self::WritingRequirements => "Requirements",
             Self::Designing => "Design",
             Self::Reviewing => "Reviewing",
             Self::WaitingApproval => "Waiting for Approval",
@@ -62,7 +65,8 @@ impl RitualPhase {
         match self {
             Self::Initializing => Some(Self::Triaging),
             Self::Triaging => Some(Self::Designing),
-            Self::WaitingClarification => Some(Self::Designing),
+            Self::WaitingClarification => Some(Self::WritingRequirements),
+            Self::WritingRequirements => Some(Self::Reviewing),
             Self::Designing => Some(Self::Reviewing),
             Self::Reviewing => Some(Self::WaitingApproval),
             Self::WaitingApproval => Some(Self::Planning),
@@ -140,6 +144,7 @@ pub struct TransitionRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectState {
+    pub has_requirements: bool,
     pub has_design: bool,
     pub has_graph: bool,
     pub has_source: bool,
@@ -431,20 +436,34 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     ],
                 )
             } else {
-                // Large task: full flow
-                let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
-                    "update-design"
+                // Large task: start with requirements
+                let has_requirements = state.project.as_ref().map_or(false, |p| p.has_requirements);
+                if has_requirements {
+                    // Requirements exist → skip to design
+                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                        "update-design"
+                    } else {
+                        "draft-design"
+                    };
+                    (
+                        new_state.with_phase(Designing),
+                        vec![
+                            Notify { message: format!("📝 Phase 2/5: {}...", skill) },
+                            SaveState,
+                            RunSkill { name: skill.into(), context: state.task.clone() },
+                        ],
+                    )
                 } else {
-                    "draft-design"
-                };
-                (
-                    new_state.with_phase(Designing),
-                    vec![
-                        Notify { message: format!("📝 Phase 1/4: {}...", skill) },
-                        SaveState,
-                        RunSkill { name: skill.into(), context: state.task.clone() },
-                    ],
-                )
+                    // No requirements → write them first
+                    (
+                        new_state.with_phase(WritingRequirements),
+                        vec![
+                            Notify { message: "📋 Phase 1/5: Writing requirements...".into() },
+                            SaveState,
+                            RunSkill { name: "draft-requirements".into(), context: state.task.clone() },
+                        ],
+                    )
+                }
             }
         }
 
@@ -483,6 +502,16 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 Notify { message: "🔍 Re-triaging...".into() },
                 SaveState,
                 RunTriage { task: state.task.clone() },
+            ],
+        ),
+
+        // Requirements done → Review requirements
+        (WritingRequirements, SkillCompleted { .. }) => (
+            state.clone().with_phase(Reviewing).with_review_target("requirements"),
+            vec![
+                Notify { message: "📝 Reviewing requirements...".into() },
+                SaveState,
+                RunSkill { name: "review-requirements".into(), context: state.task.clone() },
             ],
         ),
 
@@ -538,6 +567,22 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
         (WaitingApproval, UserApproval { approved }) => {
             let review_target = state.review_target.clone().unwrap_or_default();
             match review_target.as_str() {
+                "requirements" => {
+                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                        "update-design"
+                    } else {
+                        "draft-design"
+                    };
+                    (
+                        state.clone().with_phase(Designing),
+                        vec![
+                            ApplyReview { approved },
+                            Notify { message: format!("📝 Phase 2/5: {}...", skill) },
+                            SaveState,
+                            RunSkill { name: skill.into(), context: state.task.clone() },
+                        ],
+                    )
+                }
                 "design" => (
                     state.clone().with_phase(Planning),
                     vec![
@@ -577,6 +622,21 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
         (WaitingApproval, UserSkipPhase) => {
             let review_target = state.review_target.clone().unwrap_or_default();
             match review_target.as_str() {
+                "requirements" => {
+                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                        "update-design"
+                    } else {
+                        "draft-design"
+                    };
+                    (
+                        state.clone().with_phase(Designing),
+                        vec![
+                            Notify { message: "⏭️ Skipping review, moving to design...".into() },
+                            SaveState,
+                            RunSkill { name: skill.into(), context: state.task.clone() },
+                        ],
+                    )
+                }
                 "design" => (
                     state.clone().with_phase(Planning),
                     vec![
@@ -614,6 +674,21 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
         (Reviewing, SkillFailed { error, .. }) => {
             let review_target = state.review_target.clone().unwrap_or_default();
             let next = match review_target.as_str() {
+                "requirements" => {
+                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                        "update-design"
+                    } else {
+                        "draft-design"
+                    };
+                    (
+                        state.clone().with_phase(Designing),
+                        vec![
+                            Notify { message: format!("⚠️ Review failed ({}), continuing to design...", error) },
+                            SaveState,
+                            RunSkill { name: skill.into(), context: state.task.clone() },
+                        ],
+                    )
+                }
                 "design" => (
                     state.clone().with_phase(Planning),
                     vec![
@@ -750,6 +825,19 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
         ),
 
         // Design failed → retry once
+        // Requirements failed → retry once, then escalate
+        (WritingRequirements, SkillFailed { error, .. }) if state.retries_for("requirements") < 1 => (
+            state.clone().with_phase(WritingRequirements).inc_phase_retry("requirements"),
+            vec![
+                Notify { message: format!("🔄 Requirements failed, retrying... ({})", truncate(&error, 100)) },
+                SaveState,
+                RunSkill {
+                    name: "draft-requirements".into(),
+                    context: format!("RETRY — previous error: {}\n\nOriginal task: {}", error, state.task),
+                },
+            ],
+        ),
+
         (Designing, SkillFailed { error, .. }) if state.retries_for("designing") < 1 => (
             state.clone().with_phase(Designing).inc_phase_retry("designing"),
             vec![
@@ -938,6 +1026,21 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         Reviewing | WaitingApproval => {
                             // Determine where to go based on current phase
                             return match phase {
+                                WritingRequirements => {
+                                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                                        "update-design"
+                                    } else {
+                                        "draft-design"
+                                    };
+                                    (
+                                        state.clone().with_phase(Designing),
+                                        vec![
+                                            Notify { message: "⏭️ Skipping review, moving to design...".into() },
+                                            SaveState,
+                                            RunSkill { name: skill.into(), context: state.task.clone() },
+                                        ],
+                                    )
+                                }
                                 Designing => (
                                     state.clone().with_phase(Planning),
                                     vec![
@@ -1074,6 +1177,7 @@ mod tests {
 
     fn project_with_design() -> ProjectState {
         ProjectState {
+            has_requirements: true,
             has_design: true,
             has_graph: false,
             has_source: true,
@@ -1086,6 +1190,7 @@ mod tests {
 
     fn project_greenfield() -> ProjectState {
         ProjectState {
+            has_requirements: false,
             has_design: false,
             has_graph: false,
             has_source: false,
@@ -1497,9 +1602,10 @@ mod tests {
             skip_design: false,
             skip_graph: false,
         }));
-        assert_eq!(s.phase, RitualPhase::Designing);
-        let has_draft = a.iter().any(|a| matches!(a, RitualAction::RunSkill { name, .. } if name == "draft-design"));
-        assert!(has_draft);
+        // Greenfield + large → starts with requirements
+        assert_eq!(s.phase, RitualPhase::WritingRequirements);
+        let has_draft_req = a.iter().any(|a| matches!(a, RitualAction::RunSkill { name, .. } if name == "draft-requirements"));
+        assert!(has_draft_req);
         assert_invariant(&s, &a);
     }
 
@@ -1598,7 +1704,7 @@ mod tests {
         assert_invariant(&s, &a);
         state = s;
 
-        // Triage says large task, full flow
+        // Triage says large task, full flow → starts with requirements (greenfield)
         let (s, a) = transition(&state, RitualEvent::TriageCompleted(TriageResult {
             clarity: "clear".into(),
             clarify_questions: vec![],
@@ -1606,6 +1712,23 @@ mod tests {
             skip_design: false,
             skip_graph: false,
         }));
+        assert_eq!(s.phase, RitualPhase::WritingRequirements);
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Requirements complete → Review requirements
+        let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "draft-requirements".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::Reviewing);
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Review → WaitingApproval → Approve → Designing
+        let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-requirements".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_invariant(&s, &a);
+        state = s;
+
+        let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
         assert_eq!(s.phase, RitualPhase::Designing);
         assert_invariant(&s, &a);
         state = s;
@@ -1659,8 +1782,8 @@ mod tests {
         assert_eq!(s.phase, RitualPhase::Done);
         assert_invariant(&s, &a);
 
-        // Transitions: Init→Triage→Design→Review→WaitApproval→Planning→Graphing→Review→WaitApproval→Implement→Verify→Done = 12
-        assert_eq!(s.transitions.len(), 12);
+        // Transitions: Init→Triage→Req→Review→WaitApproval→Design→Review→WaitApproval→Planning→Graphing→Review→WaitApproval→Implement→Verify→Done = 15
+        assert_eq!(s.transitions.len(), 15);
     }
 
     #[test]

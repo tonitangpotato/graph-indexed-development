@@ -133,6 +133,7 @@ impl V2Executor {
         let verify_command = self.read_verify_command();
 
         let ps = V2ProjectState {
+            has_requirements: cs.has_requirements,
             has_design: cs.has_design,
             has_graph: cs.has_graph,
             has_source: cs.has_source_code,

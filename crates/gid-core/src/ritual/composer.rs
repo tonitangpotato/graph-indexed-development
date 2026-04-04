@@ -20,6 +20,8 @@ pub struct ProjectState {
     pub has_gid_dir: bool,
     /// .gid/graph.yml exists and is non-empty.
     pub has_graph: bool,
+    /// Requirements file exists (.gid/requirements-*.md or REQUIREMENTS.md).
+    pub has_requirements: bool,
     /// DESIGN.md exists in project root.
     pub has_design: bool,
     /// Source code exists (src/, lib/, etc.).
@@ -54,6 +56,17 @@ impl ProjectState {
                 .map(|m| m.len() > 10)
                 .unwrap_or(false);
 
+        // Check for requirements files: .gid/requirements-*.md or REQUIREMENTS.md
+        let has_requirements = project_root.join("REQUIREMENTS.md").exists()
+            || gid_dir.is_dir() && std::fs::read_dir(&gid_dir)
+                .map(|entries| entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        name.starts_with("requirements-") && name.ends_with(".md")
+                    }))
+                .unwrap_or(false);
+
         let has_source_code = project_root.join("src").is_dir()
             || project_root.join("lib").is_dir()
             || project_root.join("crates").is_dir();
@@ -70,6 +83,7 @@ impl ProjectState {
             root: project_root.to_path_buf(),
             has_gid_dir: gid_dir.is_dir(),
             has_graph,
+            has_requirements,
             has_design: design_path.exists(),
             has_source_code,
             has_tests,
