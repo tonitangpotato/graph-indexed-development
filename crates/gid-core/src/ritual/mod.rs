@@ -54,6 +54,7 @@ pub use state_machine::{
     RitualAction as V2Action,
     ProjectState as V2ProjectState,
     ImplementStrategy,
+    TriageResult,
     transition,
     truncate,
 };

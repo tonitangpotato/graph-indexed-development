@@ -66,6 +66,7 @@ impl V2Executor {
     pub async fn execute(&self, action: &RitualAction, state: &RitualState) -> Option<RitualEvent> {
         match action {
             RitualAction::DetectProject => Some(self.detect_project().await),
+            RitualAction::RunTriage { task } => Some(self.run_triage(task, state).await),
             RitualAction::RunSkill { name, context } => {
                 Some(self.run_skill(name, context).await)
             }
@@ -144,6 +145,101 @@ impl V2Executor {
         );
 
         RitualEvent::ProjectDetected(ps)
+    }
+
+    async fn run_triage(&self, task: &str, state: &RitualState) -> RitualEvent {
+        info!(task = task, "Running triage (haiku)");
+
+        let llm = match &self.config.llm_client {
+            Some(c) => c.clone(),
+            None => {
+                warn!("No LLM client — defaulting to full flow");
+                return RitualEvent::TriageCompleted(super::state_machine::TriageResult {
+                    clarity: "clear".into(),
+                    clarify_questions: vec![],
+                    size: "large".into(),
+                    skip_design: false,
+                    skip_graph: false,
+                });
+            }
+        };
+
+        // Build project context summary for triage
+        let project_ctx = if let Some(ps) = &state.project {
+            format!(
+                "Project: lang={}, has_design={}, has_graph={}, source_files={}, has_tests={}",
+                ps.language.as_deref().unwrap_or("unknown"),
+                ps.has_design, ps.has_graph,
+                ps.source_file_count, ps.has_tests
+            )
+        } else {
+            "Project: unknown state".into()
+        };
+
+        let prompt = format!(
+            r#"You are a triage agent. Assess this development task quickly.
+
+{project_ctx}
+
+Task: "{task}"
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{
+  "clarity": "clear" or "ambiguous",
+  "clarify_questions": ["question1", ...] (only if ambiguous, otherwise empty array),
+  "size": "small", "medium", or "large",
+  "skip_design": true/false,
+  "skip_graph": true/false
+}}
+
+Guidelines:
+- "small": bug fix, add a simple command, change a config value, rename something
+- "medium": add a feature that touches 2-3 files, refactor a module
+- "large": new subsystem, architectural change, multi-file feature
+- skip_design=true if the task is small enough that a DESIGN.md update adds no value
+- skip_graph=true if the task doesn't add new architectural nodes/edges
+- "ambiguous" if the task description is vague, could mean multiple things, or lacks critical info
+- Short ≠ simple. "fix the bug" is ambiguous. "fix the auth retry loop in llm.rs" is clear and small."#
+        );
+
+        match llm.chat(&prompt, "haiku").await {
+            Ok(response) => {
+                // Parse JSON from response
+                let json_str = extract_json(&response);
+                match serde_json::from_str::<super::state_machine::TriageResult>(json_str) {
+                    Ok(result) => {
+                        info!(
+                            clarity = result.clarity,
+                            size = result.size,
+                            skip_design = result.skip_design,
+                            skip_graph = result.skip_graph,
+                            "Triage complete"
+                        );
+                        RitualEvent::TriageCompleted(result)
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse triage JSON: {}. Defaulting to full flow.", e);
+                        RitualEvent::TriageCompleted(super::state_machine::TriageResult {
+                            clarity: "clear".into(),
+                            clarify_questions: vec![],
+                            size: "large".into(),
+                            skip_design: false,
+                            skip_graph: false,
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Triage LLM call failed: {}. Defaulting to full flow.", e);
+                RitualEvent::TriageCompleted(super::state_machine::TriageResult {
+                    clarity: "clear".into(),
+                    clarify_questions: vec![],
+                    size: "large".into(),
+                    skip_design: false,
+                    skip_graph: false,
+                })
+            }
+        }
     }
 
     async fn run_skill(&self, name: &str, context: &str) -> RitualEvent {
@@ -597,7 +693,7 @@ pub async fn run_ritual(
         let (new_state, actions) = transition(&state, ev);
         state = new_state;
 
-        if state.phase.is_terminal() {
+        if state.phase.is_terminal() || state.phase.is_paused() {
             // Execute remaining fire-and-forget actions (Notify, SaveState)
             executor.execute_actions(&actions, &state).await;
             break;

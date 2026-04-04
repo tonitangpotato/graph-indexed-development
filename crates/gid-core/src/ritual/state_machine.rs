@@ -19,6 +19,8 @@ use chrono::{DateTime, Utc};
 pub enum RitualPhase {
     Idle,
     Initializing,
+    Triaging,
+    WaitingClarification,
     Designing,
     Planning,
     Graphing,
@@ -35,6 +37,8 @@ impl RitualPhase {
         match self {
             Self::Idle => "Idle",
             Self::Initializing => "Initializing",
+            Self::Triaging => "Triage",
+            Self::WaitingClarification => "Waiting for Clarification",
             Self::Designing => "Design",
             Self::Planning => "Planning",
             Self::Graphing => "Graph",
@@ -49,7 +53,9 @@ impl RitualPhase {
     /// Next phase in normal flow (for skip).
     pub fn next(&self) -> Option<RitualPhase> {
         match self {
-            Self::Initializing => Some(Self::Designing),
+            Self::Initializing => Some(Self::Triaging),
+            Self::Triaging => Some(Self::Designing),
+            Self::WaitingClarification => Some(Self::Designing),
             Self::Designing => Some(Self::Planning),
             Self::Planning => Some(Self::Graphing),
             Self::Graphing => Some(Self::Implementing),
@@ -62,6 +68,11 @@ impl RitualPhase {
     /// Whether this is a terminal state.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Escalated | Self::Cancelled)
+    }
+
+    /// Whether this is a pause state (waiting for user input, no EP actions expected).
+    pub fn is_paused(&self) -> bool {
+        matches!(self, Self::WaitingClarification)
     }
 }
 
@@ -211,6 +222,28 @@ impl Default for RitualState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Triage result
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Output of the triage LLM call (haiku, ~200 tokens, ~$0.001).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TriageResult {
+    /// "clear" or "ambiguous"
+    pub clarity: String,
+    /// Questions to ask user if ambiguous
+    #[serde(default)]
+    pub clarify_questions: Vec<String>,
+    /// "small", "medium", "large"
+    pub size: String,
+    /// Skip design phase for trivial tasks
+    #[serde(default)]
+    pub skip_design: bool,
+    /// Skip graph update for trivial tasks
+    #[serde(default)]
+    pub skip_graph: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Events
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -225,6 +258,8 @@ pub enum RitualEvent {
 
     // System events
     ProjectDetected(ProjectState),
+    TriageCompleted(TriageResult),
+    UserClarification { response: String },
     PlanDecided(ImplementStrategy),
     SkillCompleted { phase: String, artifacts: Vec<String> },
     SkillFailed { phase: String, error: String },
@@ -241,6 +276,8 @@ pub enum RitualEvent {
 pub enum RitualAction {
     /// Detect project state (filesystem scan + config read).
     DetectProject,
+    /// Run triage (lightweight haiku LLM call to assess task clarity/size).
+    RunTriage { task: String },
     /// Run a skill phase with LLM.
     RunSkill { name: String, context: String },
     /// Run a shell command (verify build/test).
@@ -265,6 +302,7 @@ impl RitualAction {
         matches!(
             self,
             RitualAction::DetectProject
+                | RitualAction::RunTriage { .. }
                 | RitualAction::RunSkill { .. }
                 | RitualAction::RunShell { .. }
                 | RitualAction::RunHarness { .. }
@@ -286,7 +324,7 @@ impl RitualAction {
 /// Zero IO, zero side effects. 100% unit-testable.
 ///
 /// Invariant: every transition produces either:
-/// - A terminal state (Done/Cancelled/Escalated) with 0 event-producing actions, OR
+/// - A terminal/paused state (Done/Cancelled/Escalated/WaitingClarification) with 0 EP actions, OR
 /// - A non-terminal state with exactly 1 event-producing action.
 pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<RitualAction>) {
     use RitualPhase::*;
@@ -308,18 +346,103 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        // Project detected → Design
-        (Initializing, ProjectDetected(ps)) => {
-            let skill = if ps.has_design { "update-design" } else { "draft-design" };
+        // Project detected → Triage
+        (Initializing, ProjectDetected(ps)) => (
+            state.clone().with_phase(Triaging).with_project(ps),
+            vec![
+                Notify { message: "🔍 Triaging task...".into() },
+                SaveState,
+                RunTriage { task: state.task.clone() },
+            ],
+        ),
+
+        // Triage complete (clear) → skip or proceed based on result
+        (Triaging, TriageCompleted(result)) if result.clarity == "clear" => {
+            let skip_design = result.skip_design;
+            let skip_graph = result.skip_graph;
+
+            // Store triage result for later reference
+            let mut new_state = state.clone();
+            new_state.error_context = Some(format!(
+                "triage: size={}, skip_design={}, skip_graph={}",
+                result.size, skip_design, skip_graph
+            ));
+
+            if skip_design && skip_graph {
+                // Small task: skip directly to implementing
+                (
+                    new_state.with_phase(Planning),
+                    vec![
+                        Notify { message: format!("⚡ Small task ({}). Skipping design & graph.", result.size) },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                )
+            } else if skip_design {
+                // Medium task: skip design, do graph
+                (
+                    new_state.with_phase(Planning),
+                    vec![
+                        Notify { message: format!("📋 Medium task ({}). Skipping design.", result.size) },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                )
+            } else {
+                // Large task: full flow
+                let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                    "update-design"
+                } else {
+                    "draft-design"
+                };
+                (
+                    new_state.with_phase(Designing),
+                    vec![
+                        Notify { message: format!("📝 Phase 1/4: {}...", skill) },
+                        SaveState,
+                        RunSkill { name: skill.into(), context: state.task.clone() },
+                    ],
+                )
+            }
+        }
+
+        // Triage: ambiguous → ask user for clarification
+        (Triaging, TriageCompleted(result)) => {
+            let questions = result.clarify_questions.join("\n• ");
             (
-                state.clone().with_phase(Designing).with_project(ps),
+                state.clone().with_phase(WaitingClarification),
                 vec![
-                    Notify { message: format!("📝 Phase 1/4: {}...", skill) },
+                    Notify { message: format!(
+                        "❓ Task needs clarification:\n• {}\n\nPlease reply with details, then /ritual retry.",
+                        questions
+                    )},
                     SaveState,
-                    RunSkill { name: skill.into(), context: state.task.clone() },
                 ],
             )
         }
+
+        // User provides clarification → re-triage with enriched task
+        (WaitingClarification, UserClarification { response }) => {
+            let enriched_task = format!("{}\n\nClarification: {}", state.task, response);
+            (
+                state.clone().with_phase(Triaging).with_task(enriched_task.clone()),
+                vec![
+                    Notify { message: "🔍 Re-triaging with clarification...".into() },
+                    SaveState,
+                    RunTriage { task: enriched_task },
+                ],
+            )
+        }
+
+        // UserRetry from WaitingClarification → re-triage
+        (WaitingClarification, UserRetry) => (
+            state.clone().with_phase(Triaging),
+            vec![
+                Notify { message: "🔍 Re-triaging...".into() },
+                SaveState,
+                RunTriage { task: state.task.clone() },
+            ],
+        ),
 
         // Design done → Planning
         (Designing, SkillCompleted { .. }) => (
@@ -568,11 +691,12 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 Graphing => { new_state.phase_retries.remove("graphing"); }
                 Implementing => { new_state.phase_retries.remove("implementing"); }
                 Planning => { new_state.phase_retries.remove("planning"); }
+                Triaging => { new_state.phase_retries.remove("triaging"); }
                 _ => {}
             }
 
-            // Design/Graph retry: re-detect project state (DESIGN.md may have been created)
-            if matches!(retry_phase, Designing | Graphing) {
+            // Design/Graph/Triage retry: re-detect project state
+            if matches!(retry_phase, Designing | Graphing | Triaging) {
                 return (
                     new_state.with_phase(Initializing),
                     vec![
@@ -612,13 +736,38 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             match phase.next() {
                 Some(next_phase) => {
                     let action = match &next_phase {
+                        Triaging => {
+                            // Skip triage → go straight to designing
+                            // Need project state, so re-detect if missing
+                            if state.project.is_none() {
+                                return (
+                                    state.clone().with_phase(Initializing),
+                                    vec![
+                                        Notify { message: format!("⏭️ Skipped {}. Detecting project...", phase.display_name()) },
+                                        SaveState,
+                                        DetectProject,
+                                    ],
+                                );
+                            }
+                            // Run triage (can't skip to Designing without project detection)
+                            RunTriage { task: state.task.clone() }
+                        }
                         Designing => {
+                            let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                                "update-design"
+                            } else {
+                                "draft-design"
+                            };
+                            RunSkill { name: skill.into(), context: state.task.clone() }
+                        }
+                        WaitingClarification => {
                             return (
-                                state.clone().with_phase(Initializing),
+                                state.clone()
+                                    .with_phase(Escalated)
+                                    .with_failed_phase(phase.clone()),
                                 vec![
-                                    Notify { message: format!("⏭️ Skipped {}. Detecting project...", phase.display_name()) },
+                                    Notify { message: "❌ Cannot skip to WaitingClarification.".into() },
                                     SaveState,
-                                    DetectProject,
                                 ],
                             );
                         }
@@ -752,9 +901,9 @@ mod tests {
 
     fn assert_invariant(state: &RitualState, actions: &[RitualAction]) {
         let ep_count = actions.iter().filter(|a| a.is_event_producing()).count();
-        if state.phase.is_terminal() {
+        if state.phase.is_terminal() || state.phase.is_paused() {
             assert_eq!(ep_count, 0,
-                "Terminal state {:?} must have 0 EP actions, got {}",
+                "Terminal/paused state {:?} must have 0 EP actions, got {}",
                 state.phase, ep_count);
         } else {
             assert_eq!(ep_count, 1,
@@ -777,10 +926,9 @@ mod tests {
     fn test_happy_path_project_detected_greenfield() {
         let state = idle_state().with_phase(RitualPhase::Initializing).with_task("test".into());
         let (s, a) = transition(&state, RitualEvent::ProjectDetected(project_greenfield()));
-        assert_eq!(s.phase, RitualPhase::Designing);
-        // Should use draft-design for greenfield
-        let has_draft = a.iter().any(|a| matches!(a, RitualAction::RunSkill { name, .. } if name == "draft-design"));
-        assert!(has_draft);
+        assert_eq!(s.phase, RitualPhase::Triaging);
+        let has_triage = a.iter().any(|a| matches!(a, RitualAction::RunTriage { .. }));
+        assert!(has_triage);
         assert_invariant(&s, &a);
     }
 
@@ -788,9 +936,9 @@ mod tests {
     fn test_happy_path_project_detected_existing() {
         let state = idle_state().with_phase(RitualPhase::Initializing).with_task("test".into());
         let (s, a) = transition(&state, RitualEvent::ProjectDetected(project_with_design()));
-        assert_eq!(s.phase, RitualPhase::Designing);
-        let has_update = a.iter().any(|a| matches!(a, RitualAction::RunSkill { name, .. } if name == "update-design"));
-        assert!(has_update);
+        assert_eq!(s.phase, RitualPhase::Triaging);
+        let has_triage = a.iter().any(|a| matches!(a, RitualAction::RunTriage { .. }));
+        assert!(has_triage);
         assert_invariant(&s, &a);
     }
 
@@ -1030,6 +1178,142 @@ mod tests {
         assert_invariant(&s, &a);
     }
 
+    // ── Triage ──
+
+    fn triage_clear_small() -> TriageResult {
+        TriageResult {
+            clarity: "clear".into(),
+            clarify_questions: vec![],
+            size: "small".into(),
+            skip_design: true,
+            skip_graph: true,
+        }
+    }
+
+    fn triage_clear_medium() -> TriageResult {
+        TriageResult {
+            clarity: "clear".into(),
+            clarify_questions: vec![],
+            size: "medium".into(),
+            skip_design: true,
+            skip_graph: false,
+        }
+    }
+
+    fn triage_ambiguous() -> TriageResult {
+        TriageResult {
+            clarity: "ambiguous".into(),
+            clarify_questions: vec!["What file?".into(), "Which module?".into()],
+            size: "medium".into(),
+            skip_design: false,
+            skip_graph: false,
+        }
+    }
+
+    #[test]
+    fn test_triage_small_skips_design_and_graph() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Triaging)
+            .with_task("fix typo".into())
+            .with_project(project_with_design());
+        let (s, a) = transition(&state, RitualEvent::TriageCompleted(triage_clear_small()));
+        // Small task: skip to Planning (which decides SingleLlm → implement directly)
+        assert_eq!(s.phase, RitualPhase::Planning);
+        let has_planning = a.iter().any(|a| matches!(a, RitualAction::RunPlanning));
+        assert!(has_planning);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_triage_medium_skips_design() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Triaging)
+            .with_task("add endpoint".into())
+            .with_project(project_with_design());
+        let (s, a) = transition(&state, RitualEvent::TriageCompleted(triage_clear_medium()));
+        assert_eq!(s.phase, RitualPhase::Planning);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_triage_large_full_flow() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Triaging)
+            .with_task("new subsystem".into())
+            .with_project(project_greenfield());
+        let (s, a) = transition(&state, RitualEvent::TriageCompleted(TriageResult {
+            clarity: "clear".into(),
+            clarify_questions: vec![],
+            size: "large".into(),
+            skip_design: false,
+            skip_graph: false,
+        }));
+        assert_eq!(s.phase, RitualPhase::Designing);
+        let has_draft = a.iter().any(|a| matches!(a, RitualAction::RunSkill { name, .. } if name == "draft-design"));
+        assert!(has_draft);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_triage_ambiguous_waits() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Triaging)
+            .with_task("fix the bug".into())
+            .with_project(project_with_design());
+        let (s, a) = transition(&state, RitualEvent::TriageCompleted(triage_ambiguous()));
+        assert_eq!(s.phase, RitualPhase::WaitingClarification);
+        // Terminal-like (no EP action — waits for user)
+        let ep_count = a.iter().filter(|a| a.is_event_producing()).count();
+        assert_eq!(ep_count, 0, "WaitingClarification is a pause state with 0 EP actions");
+    }
+
+    #[test]
+    fn test_clarification_re_triages() {
+        let state = idle_state()
+            .with_phase(RitualPhase::WaitingClarification)
+            .with_task("fix the bug".into())
+            .with_project(project_with_design());
+        let (s, a) = transition(&state, RitualEvent::UserClarification {
+            response: "the auth retry bug in llm.rs".into(),
+        });
+        assert_eq!(s.phase, RitualPhase::Triaging);
+        assert!(s.task.contains("auth retry bug"));
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_skip_triage() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Triaging)
+            .with_task("test".into())
+            .with_project(project_with_design());
+        let (s, a) = transition(&state, RitualEvent::UserSkipPhase);
+        // Skip triage → go to Designing
+        assert_eq!(s.phase, RitualPhase::Designing);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_waiting_clarification_cancel() {
+        let state = idle_state()
+            .with_phase(RitualPhase::WaitingClarification)
+            .with_task("test".into());
+        let (s, a) = transition(&state, RitualEvent::UserCancel);
+        assert_eq!(s.phase, RitualPhase::Cancelled);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_waiting_clarification_retry_re_triages() {
+        let state = idle_state()
+            .with_phase(RitualPhase::WaitingClarification)
+            .with_task("fix something".into())
+            .with_project(project_with_design());
+        let (s, a) = transition(&state, RitualEvent::UserRetry);
+        assert_eq!(s.phase, RitualPhase::Triaging);
+        assert_invariant(&s, &a);
+    }
+
     // ── Truncate ──
 
     #[test]
@@ -1048,9 +1332,9 @@ mod tests {
 
     #[test]
     fn test_full_happy_path_trace() {
-        // Idle → Start → Initializing → ProjectDetected → Designing → SkillCompleted
-        // → Planning → PlanDecided → Graphing → SkillCompleted → Implementing
-        // → SkillCompleted → Verifying → ShellCompleted(0) → Done
+        // Idle → Start → Initializing → ProjectDetected → Triaging → TriageCompleted(large)
+        // → Designing → SkillCompleted → Planning → PlanDecided → Graphing → SkillCompleted
+        // → Implementing → SkillCompleted → Verifying → ShellCompleted(0) → Done
         let mut state = idle_state();
 
         let (s, a) = transition(&state, RitualEvent::Start { task: "add X".into() });
@@ -1059,6 +1343,18 @@ mod tests {
         state = s;
 
         let (s, a) = transition(&state, RitualEvent::ProjectDetected(project_greenfield()));
+        assert_eq!(s.phase, RitualPhase::Triaging);
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Triage says large task, full flow
+        let (s, a) = transition(&state, RitualEvent::TriageCompleted(TriageResult {
+            clarity: "clear".into(),
+            clarify_questions: vec![],
+            size: "large".into(),
+            skip_design: false,
+            skip_graph: false,
+        }));
         assert_eq!(s.phase, RitualPhase::Designing);
         assert_invariant(&s, &a);
         state = s;
@@ -1087,8 +1383,8 @@ mod tests {
         assert_eq!(s.phase, RitualPhase::Done);
         assert_invariant(&s, &a);
 
-        // Should have 7 transitions recorded
-        assert_eq!(s.transitions.len(), 7);
+        // Should have 8 transitions recorded (added Triaging step)
+        assert_eq!(s.transitions.len(), 8);
     }
 
     #[test]

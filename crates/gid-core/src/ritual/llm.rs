@@ -119,6 +119,15 @@ pub trait LlmClient: Send + Sync {
         model: &str,
         working_dir: &Path,
     ) -> Result<SkillResult>;
+
+    /// Simple single-turn chat (no tools). Used for triage and other lightweight LLM calls.
+    ///
+    /// Default implementation uses `run_skill` with no tools.
+    /// Implementations can override for efficiency (e.g., skip agent loop overhead).
+    async fn chat(&self, prompt: &str, model: &str) -> Result<String> {
+        let result = self.run_skill(prompt, vec![], model, Path::new(".")).await?;
+        Ok(result.output)
+    }
 }
 
 #[cfg(test)]
