@@ -85,6 +85,12 @@ impl V2Executor {
                 self.update_graph(description);
                 None
             }
+            RitualAction::ApplyReview { approved } => {
+                // Fire-and-forget: apply review findings via apply-review skill
+                // In gid-core context, this is a no-op (RustClaw executor handles it)
+                tracing::info!("ApplyReview (approved: {})", approved);
+                None
+            }
             RitualAction::Cleanup => {
                 self.cleanup();
                 None

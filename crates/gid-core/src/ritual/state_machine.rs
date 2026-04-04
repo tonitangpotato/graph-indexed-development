@@ -22,6 +22,11 @@ pub enum RitualPhase {
     Triaging,
     WaitingClarification,
     Designing,
+    /// Reviewing a document produced by the previous phase (design, graph, requirements).
+    /// `review_target` in state tracks what's being reviewed and where to go next.
+    Reviewing,
+    /// Waiting for human to approve review findings before applying changes.
+    WaitingApproval,
     Planning,
     Graphing,
     Implementing,
@@ -40,6 +45,8 @@ impl RitualPhase {
             Self::Triaging => "Triage",
             Self::WaitingClarification => "Waiting for Clarification",
             Self::Designing => "Design",
+            Self::Reviewing => "Reviewing",
+            Self::WaitingApproval => "Waiting for Approval",
             Self::Planning => "Planning",
             Self::Graphing => "Graph",
             Self::Implementing => "Implement",
@@ -56,9 +63,11 @@ impl RitualPhase {
             Self::Initializing => Some(Self::Triaging),
             Self::Triaging => Some(Self::Designing),
             Self::WaitingClarification => Some(Self::Designing),
-            Self::Designing => Some(Self::Planning),
+            Self::Designing => Some(Self::Reviewing),
+            Self::Reviewing => Some(Self::WaitingApproval),
+            Self::WaitingApproval => Some(Self::Planning),
             Self::Planning => Some(Self::Graphing),
-            Self::Graphing => Some(Self::Implementing),
+            Self::Graphing => Some(Self::Reviewing),
             Self::Implementing => Some(Self::Verifying),
             Self::Verifying => Some(Self::Done),
             _ => None,
@@ -72,7 +81,7 @@ impl RitualPhase {
 
     /// Whether this is a pause state (waiting for user input, no EP actions expected).
     pub fn is_paused(&self) -> bool {
-        matches!(self, Self::WaitingClarification)
+        matches!(self, Self::WaitingClarification | Self::WaitingApproval)
     }
 }
 
@@ -94,6 +103,10 @@ pub struct RitualState {
     pub phase_retries: HashMap<String, u32>,
     pub failed_phase: Option<RitualPhase>,
     pub error_context: Option<String>,
+    /// Tracks which phase the review is for and where to go after approval.
+    /// Format: "design", "graph", "requirements" — maps to review skill name.
+    #[serde(default)]
+    pub review_target: Option<String>,
     /// Tokens used per phase (e.g. "design" -> 5432, "implement" -> 28000).
     #[serde(default)]
     pub phase_tokens: HashMap<String, u64>,
@@ -155,6 +168,7 @@ impl RitualState {
             phase_retries: HashMap::new(),
             failed_phase: None,
             error_context: None,
+            review_target: None,
             phase_tokens: HashMap::new(),
             transitions: Vec::new(),
             started_at: now,
@@ -186,6 +200,11 @@ impl RitualState {
 
     pub fn with_strategy(mut self, strategy: ImplementStrategy) -> Self {
         self.strategy = Some(strategy);
+        self
+    }
+
+    pub fn with_review_target(mut self, target: &str) -> Self {
+        self.review_target = Some(target.to_string());
         self
     }
 
@@ -279,6 +298,8 @@ pub enum RitualEvent {
     ProjectDetected(ProjectState),
     TriageCompleted(TriageResult),
     UserClarification { response: String },
+    /// User approves specific review findings (e.g., "FINDING-1,3,5" or "all").
+    UserApproval { approved: String },
     PlanDecided(ImplementStrategy),
     SkillCompleted { phase: String, artifacts: Vec<String> },
     SkillFailed { phase: String, error: String },
@@ -313,6 +334,8 @@ pub enum RitualAction {
     SaveState,
     /// Cleanup temporary files.
     Cleanup,
+    /// Apply approved review findings (fire-and-forget, runs apply-review skill).
+    ApplyReview { approved: String },
 }
 
 impl RitualAction {
@@ -463,13 +486,13 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        // Design done → Planning
+        // Design done → Review design document
         (Designing, SkillCompleted { .. }) => (
-            state.clone().with_phase(Planning),
+            state.clone().with_phase(Reviewing).with_review_target("design"),
             vec![
-                Notify { message: "🧠 Planning implementation strategy...".into() },
+                Notify { message: "📝 Reviewing design document...".into() },
                 SaveState,
-                RunPlanning,
+                RunSkill { name: "review-design".into(), context: state.task.clone() },
             ],
         ),
 
@@ -490,21 +513,142 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             )
         }
 
-        // Graph done → Implementing
-        (Graphing, SkillCompleted { .. }) => {
-            let action = match &state.strategy {
-                Some(ImplementStrategy::MultiAgent { tasks }) => RunHarness { tasks: tasks.clone() },
-                _ => RunSkill { name: "implement".into(), context: state.task.clone() },
-            };
-            (
-                state.clone().with_phase(Implementing),
-                vec![
-                    Notify { message: "💻 Phase 3/4: Implementing...".into() },
-                    SaveState,
-                    action,
-                ],
-            )
+        // Graph done → Review tasks
+        (Graphing, SkillCompleted { .. }) => (
+            state.clone().with_phase(Reviewing).with_review_target("tasks"),
+            vec![
+                Notify { message: "📝 Reviewing task breakdown...".into() },
+                SaveState,
+                RunSkill { name: "review-tasks".into(), context: state.task.clone() },
+            ],
+        ),
+
+        // ─── Review cycle transitions ─────────────────────────────────────
+
+        // Review skill completed → WaitingApproval (pause for human)
+        (Reviewing, SkillCompleted { .. }) => (
+            state.clone().with_phase(WaitingApproval),
+            vec![
+                Notify { message: "📋 Review complete. Check `.gid/reviews/` for findings.\nWhich findings should I apply? (e.g., 'apply FINDING-1,3,5' or 'apply all' or 'skip')".into() },
+                SaveState,
+            ],
+        ),
+
+        // User approves findings → apply changes (fire-and-forget), then continue to next phase
+        (WaitingApproval, UserApproval { approved }) => {
+            let review_target = state.review_target.clone().unwrap_or_default();
+            match review_target.as_str() {
+                "design" => (
+                    state.clone().with_phase(Planning),
+                    vec![
+                        ApplyReview { approved },
+                        Notify { message: "🧠 Planning implementation strategy...".into() },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                ),
+                "tasks" => {
+                    let action = match &state.strategy {
+                        Some(ImplementStrategy::MultiAgent { tasks }) => RunHarness { tasks: tasks.clone() },
+                        _ => RunSkill { name: "implement".into(), context: state.task.clone() },
+                    };
+                    (
+                        state.clone().with_phase(Implementing),
+                        vec![
+                            ApplyReview { approved },
+                            Notify { message: "💻 Implementing...".into() },
+                            SaveState,
+                            action,
+                        ],
+                    )
+                }
+                _ => (
+                    state.clone().with_phase(Planning),
+                    vec![
+                        ApplyReview { approved },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                ),
+            }
         }
+
+        // User skips review → continue to next phase without applying
+        (WaitingApproval, UserSkipPhase) => {
+            let review_target = state.review_target.clone().unwrap_or_default();
+            match review_target.as_str() {
+                "design" => (
+                    state.clone().with_phase(Planning),
+                    vec![
+                        Notify { message: "⏭️ Skipping review, moving to planning...".into() },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                ),
+                "tasks" => {
+                    let action = match &state.strategy {
+                        Some(ImplementStrategy::MultiAgent { tasks }) => RunHarness { tasks: tasks.clone() },
+                        _ => RunSkill { name: "implement".into(), context: state.task.clone() },
+                    };
+                    (
+                        state.clone().with_phase(Implementing),
+                        vec![
+                            Notify { message: "⏭️ Skipping review, moving to implementation...".into() },
+                            SaveState,
+                            action,
+                        ],
+                    )
+                }
+                _ => (
+                    state.clone().with_phase(Planning),
+                    vec![
+                        Notify { message: "⏭️ Skipping review...".into() },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                ),
+            }
+        }
+
+        // Review failed → log and continue (don't block the ritual for review failure)
+        (Reviewing, SkillFailed { error, .. }) => {
+            let review_target = state.review_target.clone().unwrap_or_default();
+            let next = match review_target.as_str() {
+                "design" => (
+                    state.clone().with_phase(Planning),
+                    vec![
+                        Notify { message: format!("⚠️ Review failed ({}), continuing to planning...", error) },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                ),
+                "tasks" => {
+                    let action = match &state.strategy {
+                        Some(ImplementStrategy::MultiAgent { tasks }) => RunHarness { tasks: tasks.clone() },
+                        _ => RunSkill { name: "implement".into(), context: state.task.clone() },
+                    };
+                    (
+                        state.clone().with_phase(Implementing),
+                        vec![
+                            Notify { message: format!("⚠️ Review failed ({}), continuing to implementation...", error) },
+                            SaveState,
+                            action,
+                        ],
+                    )
+                }
+                _ => (
+                    state.clone().with_phase(Planning),
+                    vec![
+                        Notify { message: format!("⚠️ Review failed ({}), continuing...", error) },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                ),
+            };
+            next
+        }
+
+        // ─── End review cycle transitions ────────────────────────────────
 
         // Implement done → Verifying
         (Implementing, SkillCompleted { .. }) => {
@@ -790,6 +934,42 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                 ],
                             );
                         }
+                        // Skip review → go to the phase after review
+                        Reviewing | WaitingApproval => {
+                            // Determine where to go based on current phase
+                            return match phase {
+                                Designing => (
+                                    state.clone().with_phase(Planning),
+                                    vec![
+                                        Notify { message: "⏭️ Skipping review, moving to planning...".into() },
+                                        SaveState,
+                                        RunPlanning,
+                                    ],
+                                ),
+                                Graphing => {
+                                    let action = match &state.strategy {
+                                        Some(ImplementStrategy::MultiAgent { tasks }) => RunHarness { tasks: tasks.clone() },
+                                        _ => RunSkill { name: "implement".into(), context: state.task.clone() },
+                                    };
+                                    (
+                                        state.clone().with_phase(Implementing),
+                                        vec![
+                                            Notify { message: "⏭️ Skipping review, moving to implementation...".into() },
+                                            SaveState,
+                                            action,
+                                        ],
+                                    )
+                                }
+                                _ => (
+                                    state.clone().with_phase(Planning),
+                                    vec![
+                                        Notify { message: "⏭️ Skipping review...".into() },
+                                        SaveState,
+                                        RunPlanning,
+                                    ],
+                                ),
+                            };
+                        }
                         Planning => RunPlanning,
                         Graphing => {
                             let skill = if state.project.as_ref().map_or(false, |p| p.has_graph) {
@@ -963,10 +1143,22 @@ mod tests {
 
     #[test]
     fn test_happy_path_design_complete() {
+        // Design → Reviewing
         let state = idle_state().with_phase(RitualPhase::Designing);
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "design".into(), artifacts: vec![] });
-        assert_eq!(s.phase, RitualPhase::Planning);
+        assert_eq!(s.phase, RitualPhase::Reviewing);
+        assert_eq!(s.review_target, Some("design".to_string()));
         assert_invariant(&s, &a);
+
+        // Review → WaitingApproval
+        let (s2, a2) = transition(&s, RitualEvent::SkillCompleted { phase: "review-design".into(), artifacts: vec![] });
+        assert_eq!(s2.phase, RitualPhase::WaitingApproval);
+        assert_invariant(&s2, &a2);
+
+        // Approval → Planning
+        let (s3, a3) = transition(&s2, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s3.phase, RitualPhase::Planning);
+        assert_invariant(&s3, &a3);
     }
 
     #[test]
@@ -981,10 +1173,19 @@ mod tests {
 
     #[test]
     fn test_happy_path_graph_complete() {
+        // Graph → Reviewing
         let state = idle_state().with_phase(RitualPhase::Graphing);
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "graph".into(), artifacts: vec![] });
-        assert_eq!(s.phase, RitualPhase::Implementing);
+        assert_eq!(s.phase, RitualPhase::Reviewing);
+        assert_eq!(s.review_target, Some("tasks".to_string()));
         assert_invariant(&s, &a);
+
+        // Review → WaitingApproval → Approval → Implementing
+        let (s2, _) = transition(&s, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
+        assert_eq!(s2.phase, RitualPhase::WaitingApproval);
+        let (s3, a3) = transition(&s2, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s3.phase, RitualPhase::Implementing);
+        assert_invariant(&s3, &a3);
     }
 
     #[test]
@@ -1141,10 +1342,32 @@ mod tests {
 
     #[test]
     fn test_skip_design_to_planning() {
+        // Skip from Designing → skips review → goes to Planning
         let state = idle_state().with_phase(RitualPhase::Designing).with_task("test".into());
         let (s, a) = transition(&state, RitualEvent::UserSkipPhase);
         assert_eq!(s.phase, RitualPhase::Planning);
         assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_skip_review_approval() {
+        // Skip from WaitingApproval (design) → Planning
+        let state = idle_state()
+            .with_phase(RitualPhase::WaitingApproval)
+            .with_review_target("design")
+            .with_task("test".into());
+        let (s, a) = transition(&state, RitualEvent::UserSkipPhase);
+        assert_eq!(s.phase, RitualPhase::Planning);
+        assert_invariant(&s, &a);
+
+        // Skip from WaitingApproval (tasks) → Implementing
+        let state2 = idle_state()
+            .with_phase(RitualPhase::WaitingApproval)
+            .with_review_target("tasks")
+            .with_task("test".into());
+        let (s2, a2) = transition(&state2, RitualEvent::UserSkipPhase);
+        assert_eq!(s2.phase, RitualPhase::Implementing);
+        assert_invariant(&s2, &a2);
     }
 
     #[test]
@@ -1190,11 +1413,18 @@ mod tests {
         let state = idle_state()
             .with_phase(RitualPhase::Graphing)
             .with_strategy(ImplementStrategy::MultiAgent { tasks: vec!["task1".into(), "task2".into()] });
+        // Graph → Reviewing
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "graph".into(), artifacts: vec![] });
-        assert_eq!(s.phase, RitualPhase::Implementing);
-        let has_harness = a.iter().any(|a| matches!(a, RitualAction::RunHarness { .. }));
-        assert!(has_harness);
+        assert_eq!(s.phase, RitualPhase::Reviewing);
         assert_invariant(&s, &a);
+
+        // Review → WaitingApproval → Approve → Implementing with Harness
+        let (s2, _) = transition(&s, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
+        let (s3, a3) = transition(&s2, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s3.phase, RitualPhase::Implementing);
+        let has_harness = a3.iter().any(|a| matches!(a, RitualAction::RunHarness { .. }));
+        assert!(has_harness);
+        assert_invariant(&s3, &a3);
     }
 
     // ── Triage ──
@@ -1351,8 +1581,10 @@ mod tests {
 
     #[test]
     fn test_full_happy_path_trace() {
-        // Idle → Start → Initializing → ProjectDetected → Triaging → TriageCompleted(large)
-        // → Designing → SkillCompleted → Planning → PlanDecided → Graphing → SkillCompleted
+        // Idle → Start → Init → ProjectDetected → Triage → TriageCompleted(large)
+        // → Designing → SkillCompleted → Reviewing(design) → SkillCompleted → WaitingApproval
+        // → UserApproval → Planning → PlanDecided → Graphing → SkillCompleted
+        // → Reviewing(tasks) → SkillCompleted → WaitingApproval → UserApproval
         // → Implementing → SkillCompleted → Verifying → ShellCompleted(0) → Done
         let mut state = idle_state();
 
@@ -1378,7 +1610,20 @@ mod tests {
         assert_invariant(&s, &a);
         state = s;
 
+        // Design complete → Review design
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "draft-design".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::Reviewing);
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Review complete → WaitingApproval
+        let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-design".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_invariant(&s, &a);
+        state = s;
+
+        // User approves → Planning
+        let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
         assert_eq!(s.phase, RitualPhase::Planning);
         assert_invariant(&s, &a);
         state = s;
@@ -1388,7 +1633,19 @@ mod tests {
         assert_invariant(&s, &a);
         state = s;
 
+        // Graph complete → Review tasks
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "generate-graph".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::Reviewing);
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Review → WaitingApproval → Approve → Implementing
+        let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_invariant(&s, &a);
+        state = s;
+
+        let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
         assert_eq!(s.phase, RitualPhase::Implementing);
         assert_invariant(&s, &a);
         state = s;
@@ -1402,8 +1659,8 @@ mod tests {
         assert_eq!(s.phase, RitualPhase::Done);
         assert_invariant(&s, &a);
 
-        // Should have 8 transitions recorded (added Triaging step)
-        assert_eq!(s.transitions.len(), 8);
+        // Transitions: Init→Triage→Design→Review→WaitApproval→Planning→Graphing→Review→WaitApproval→Implement→Verify→Done = 12
+        assert_eq!(s.transitions.len(), 12);
     }
 
     #[test]
