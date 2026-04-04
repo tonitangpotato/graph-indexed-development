@@ -106,14 +106,15 @@ fn default_ritual_id() -> String {
     generate_ritual_id()
 }
 
-/// Generate a short human-readable ritual ID (e.g., "r-a3f8").
+/// Generate a short human-readable ritual ID (e.g., "r-a3f81b").
+/// Uses lower 24 bits of millisecond timestamp (~4.6 hour cycle) for uniqueness.
 pub fn generate_ritual_id() -> String {
     use std::time::SystemTime;
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("r-{:x}", ts & 0xFFFF)
+    format!("r-{:06x}", ts & 0xFFFFFF)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
