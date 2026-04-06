@@ -20,7 +20,7 @@
 
 ---
 
-## ISS-002 [improvement] [P0] [open]
+## ISS-002 [improvement] [P0] [closed] ✅
 **发现日期**: 2026-04-05
 **更新日期**: 2026-04-05
 **发现者**: potato + RustClaw
