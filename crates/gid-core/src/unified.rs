@@ -34,11 +34,11 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
         
         let node_type = match code_node.kind {
             NodeKind::File => "file",
-            NodeKind::Class => "class",
-            NodeKind::Function => "function",
+            NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => "class",
+            NodeKind::Function | NodeKind::Constant => "function",
             NodeKind::Module => "module",
         };
-        
+
         let mut metadata = HashMap::new();
         metadata.insert("original_id".to_string(), serde_json::json!(code_node.id));
         metadata.insert("file_path".to_string(), serde_json::json!(code_node.file_path));
@@ -151,11 +151,11 @@ pub fn merge_relevant_code(
         
         let node_type = match code_node.kind {
             NodeKind::File => "file",
-            NodeKind::Class => "class",
-            NodeKind::Function => "function",
+            NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => "class",
+            NodeKind::Function | NodeKind::Constant => "function",
             NodeKind::Module => "module",
         };
-        
+
         let mut metadata = HashMap::new();
         metadata.insert("file_path".to_string(), serde_json::json!(code_node.file_path));
         if let Some(line) = code_node.line {

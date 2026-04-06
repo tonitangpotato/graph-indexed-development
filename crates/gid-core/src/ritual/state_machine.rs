@@ -101,6 +101,11 @@ pub struct RitualState {
     pub id: String,
     pub phase: RitualPhase,
     pub task: String,
+    /// The target project directory for this ritual.
+    /// Set at ritual start time. All file operations (detect, skill, verify) use this path.
+    /// If None, falls back to the runner's workspace root.
+    #[serde(default)]
+    pub target_root: Option<String>,
     pub project: Option<ProjectState>,
     pub strategy: Option<ImplementStrategy>,
     pub verify_retries: u32,
@@ -170,6 +175,7 @@ impl RitualState {
             id: generate_ritual_id(),
             phase: RitualPhase::Idle,
             task: String::new(),
+            target_root: None,
             project: None,
             strategy: None,
             verify_retries: 0,
@@ -199,6 +205,11 @@ impl RitualState {
 
     pub fn with_task(mut self, task: String) -> Self {
         self.task = task;
+        self
+    }
+
+    pub fn with_target_root(mut self, root: String) -> Self {
+        self.target_root = Some(root);
         self
     }
 

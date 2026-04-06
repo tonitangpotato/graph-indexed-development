@@ -128,6 +128,11 @@ impl CodeGraph {
                 NodeKind::Class => "🔷",
                 NodeKind::Function => "🔹",
                 NodeKind::Module => "📦",
+                NodeKind::Constant => "🔸",
+                NodeKind::Interface => "🔶",
+                NodeKind::Enum => "🔷",
+                NodeKind::TypeAlias => "📐",
+                NodeKind::Trait => "⚙️",
             };
             let line_info = node.line.map(|l| format!(" (line {})", l)).unwrap_or_default();
             result.push_str(&format!(
@@ -167,7 +172,7 @@ impl CodeGraph {
 
         let relevant_classes: Vec<&&CodeNode> = relevant
             .iter()
-            .filter(|n| n.kind == NodeKind::Class)
+            .filter(|n| matches!(n.kind, NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait))
             .collect();
 
         if !relevant_classes.is_empty() {
@@ -183,7 +188,7 @@ impl CodeGraph {
         }
 
         let file_count = self.nodes.iter().filter(|n| n.kind == NodeKind::File).count();
-        let class_count = self.nodes.iter().filter(|n| n.kind == NodeKind::Class).count();
+        let class_count = self.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait)).count();
         let import_count = self
             .edges
             .iter()
@@ -221,7 +226,7 @@ impl CodeGraph {
             let classes: Vec<String> = self
                 .nodes
                 .iter()
-                .filter(|n| n.kind == NodeKind::Class && n.file_path == file.file_path)
+                .filter(|n| matches!(n.kind, NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait) && n.file_path == file.file_path)
                 .map(|n| n.name.clone())
                 .collect();
 
@@ -524,6 +529,11 @@ impl CodeGraph {
             NodeKind::Class => "Class",
             NodeKind::Function => "Function",
             NodeKind::Module => "Module",
+            NodeKind::Constant => "Constant",
+            NodeKind::Interface => "Interface",
+            NodeKind::Enum => "Enum",
+            NodeKind::TypeAlias => "TypeAlias",
+            NodeKind::Trait => "Trait",
         }).collect();
 
         let edge_relations: HashSet<&str> = self.edges.iter().map(|e| match e.relation {
@@ -556,7 +566,7 @@ impl CodeGraph {
         }
 
         let classes: Vec<&str> = file_nodes.iter()
-            .filter(|n| n.kind == NodeKind::Class)
+            .filter(|n| matches!(n.kind, NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait))
             .map(|n| n.name.as_str())
             .collect();
 

@@ -17,3 +17,6 @@ packages/*/dist/
 
 # Internal docs (not for public repo)
 docs/
+.gid/code-graph.json
+.gid/extract-meta.json
+**/execution-log.jsonl

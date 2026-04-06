@@ -90,8 +90,8 @@ impl CodeGraph {
             
             let (node_type, layer) = match code_node.kind {
                 NodeKind::File => ("File".to_string(), "infrastructure"),
-                NodeKind::Class => ("Component".to_string(), "domain"),
-                NodeKind::Function | NodeKind::Module => ("Component".to_string(), "application"),
+                NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => ("Component".to_string(), "domain"),
+                NodeKind::Function | NodeKind::Constant | NodeKind::Module => ("Component".to_string(), "application"),
             };
             
             let snippet = snippets.get(&code_node.id).cloned();

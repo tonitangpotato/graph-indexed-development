@@ -2248,8 +2248,8 @@ fn cmd_code_search(dir: &PathBuf, keywords_str: &str, format_llm: Option<usize>,
                 for n in nodes.iter().take(50) {
                     let icon = match n.kind {
                         NodeKind::File | NodeKind::Module => "📄",
-                        NodeKind::Class => "🔷",
-                        NodeKind::Function => "🔹",
+                        NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => "🔷",
+                        NodeKind::Function | NodeKind::Constant => "🔹",
                     };
                     let line = n.line.map(|l| format!(":L{}", l)).unwrap_or_default();
                     println!("  {} {} ({}{})", icon, n.name, n.file_path, line);
@@ -2302,8 +2302,8 @@ fn cmd_code_symptoms(dir: &PathBuf, problem: &str, tests: &str, json: bool) -> R
             println!("Found {} symptom nodes:\n", nodes.len());
             for n in &nodes {
                 let icon = if n.is_test { "🧪" } else { match n.kind {
-                    NodeKind::Class => "🔷",
-                    NodeKind::Function => "🔹",
+                    NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => "🔷",
+                    NodeKind::Function | NodeKind::Constant => "🔹",
                     NodeKind::File | NodeKind::Module => "📄",
                 }};
                 let line = n.line.map(|l| format!(":L{}", l)).unwrap_or_default();

@@ -202,6 +202,81 @@ impl CodeNode {
             is_test: name.starts_with("test_") || name.starts_with("Test") || path.contains("/test"),
         }
     }
+
+    pub fn new_constant(path: &str, name: &str, line: usize) -> Self {
+        Self {
+            id: format!("const:{}:{}", path, name),
+            kind: NodeKind::Constant,
+            name: name.to_string(),
+            file_path: path.to_string(),
+            line: Some(line),
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 0,
+            is_test: false,
+        }
+    }
+
+    pub fn new_interface(path: &str, name: &str, line: usize) -> Self {
+        Self {
+            id: format!("interface:{}:{}", path, name),
+            kind: NodeKind::Interface,
+            name: name.to_string(),
+            file_path: path.to_string(),
+            line: Some(line),
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 0,
+            is_test: false,
+        }
+    }
+
+    pub fn new_enum(path: &str, name: &str, line: usize) -> Self {
+        Self {
+            id: format!("enum:{}:{}", path, name),
+            kind: NodeKind::Enum,
+            name: name.to_string(),
+            file_path: path.to_string(),
+            line: Some(line),
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 0,
+            is_test: false,
+        }
+    }
+
+    pub fn new_type_alias(path: &str, name: &str, line: usize) -> Self {
+        Self {
+            id: format!("type:{}:{}", path, name),
+            kind: NodeKind::TypeAlias,
+            name: name.to_string(),
+            file_path: path.to_string(),
+            line: Some(line),
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 0,
+            is_test: false,
+        }
+    }
+
+    pub fn new_trait(path: &str, name: &str, line: usize) -> Self {
+        Self {
+            id: format!("trait:{}:{}", path, name),
+            kind: NodeKind::Trait,
+            name: name.to_string(),
+            file_path: path.to_string(),
+            line: Some(line),
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 0,
+            is_test: false,
+        }
+    }
 }
 
 /// Kind of code node.
@@ -212,6 +287,11 @@ pub enum NodeKind {
     Class,
     Function,
     Module,
+    Constant,
+    Interface,
+    Enum,
+    TypeAlias,
+    Trait,
 }
 
 /// An edge in the code graph.

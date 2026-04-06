@@ -35,7 +35,7 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 tokio = { version = "1", features = ["full"], optional = true }
 futures = { version = "0.3", optional = true }
 async-trait = { version = "0.1", optional = true }
-agentctl-auth = { path = "../../../agentctl/crates/agentctl-auth", optional = true }
+agentctl-auth = { version = "0.1.0", path = "../../../agentctl/crates/agentctl-auth", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 
 # Optional dependencies for ritual feature

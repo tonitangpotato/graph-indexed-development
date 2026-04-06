@@ -48,6 +48,9 @@ fn collect_source_files(
     module_map: &mut HashMap<String, String>,
 ) -> Vec<(String, String, Language)> {
     let mut file_entries: Vec<(String, String, Language)> = Vec::new();
+    // Collect partial path candidates: partial → Vec<file_id>
+    // We defer insertion so we can detect ambiguous partials (same basename in different dirs).
+    let mut partial_candidates: HashMap<String, Vec<String>> = HashMap::new();
 
     for entry in WalkDir::new(dir)
         .follow_links(false)
@@ -109,16 +112,26 @@ fn collect_source_files(
             .to_string();
 
         let file_id = format!("file:{}", rel_path);
+        // Register full module path (always unique since it includes full relative path)
         module_map.insert(module_path.clone(), file_id.clone());
 
-        // Also map partial paths
+        // Collect partial path candidates (defer insertion to detect ambiguity)
         let parts: Vec<&str> = module_path.split('.').collect();
         for start in 1..parts.len() {
             let partial = parts[start..].join(".");
-            module_map.entry(partial).or_insert_with(|| file_id.clone());
+            partial_candidates.entry(partial).or_default().push(file_id.clone());
         }
 
         file_entries.push((rel_path, content, lang));
+    }
+
+    // Only register unambiguous partials — if two files share the same partial,
+    // register neither to avoid ghost nodes (ISS-007).
+    for (partial, candidates) in partial_candidates {
+        if candidates.len() == 1 {
+            module_map.entry(partial).or_insert_with(|| candidates.into_iter().next().unwrap());
+        }
+        // If len > 1, skip — ambiguous partial, don't register
     }
 
     file_entries
@@ -455,6 +468,32 @@ fn resolve_references(
     resolved_edges
 }
 
+/// Remove phantom file nodes — nodes with `kind == File` whose `file_path`
+/// doesn't exist in the set of actual files we walked. Also removes edges
+/// referencing removed nodes. (ISS-007 fix)
+fn remove_phantom_nodes(
+    nodes: &mut Vec<CodeNode>,
+    edges: &mut Vec<CodeEdge>,
+    valid_file_paths: &HashSet<&str>,
+) {
+    let before_nodes = nodes.len();
+    nodes.retain(|n| {
+        if n.kind == NodeKind::File {
+            valid_file_paths.contains(n.file_path.as_str())
+        } else {
+            true
+        }
+    });
+    let removed = before_nodes - nodes.len();
+    if removed > 0 {
+        tracing::debug!("Removed {} phantom file node(s)", removed);
+        let valid_node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        edges.retain(|e| {
+            valid_node_ids.contains(e.from.as_str()) && valid_node_ids.contains(e.to.as_str())
+        });
+    }
+}
+
 /// Deduplicate call edges, compute call_count, and compute weights.
 fn dedup_and_finalize_edges(edges: Vec<CodeEdge>, nodes: &[CodeNode]) -> Vec<CodeEdge> {
     let mut edge_map: HashMap<(String, String), CodeEdge> = HashMap::new();
@@ -646,7 +685,11 @@ impl CodeGraph {
         );
 
         // Deduplicate and finalize
-        let final_edges = dedup_and_finalize_edges(resolved, &state.nodes);
+        let mut final_edges = dedup_and_finalize_edges(resolved, &state.nodes);
+
+        // Remove phantom file nodes — files that don't exist on disk (ISS-007)
+        let valid_file_paths: HashSet<&str> = file_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+        remove_phantom_nodes(&mut state.nodes, &mut final_edges, &valid_file_paths);
 
         let mut graph = CodeGraph {
             nodes: state.nodes,
@@ -951,6 +994,10 @@ impl CodeGraph {
         let final_edges = dedup_and_finalize_edges(graph.edges, &graph.nodes);
         graph.edges = final_edges;
 
+        // Remove phantom file nodes — files that don't exist on disk (ISS-007)
+        let valid_file_paths: HashSet<&str> = file_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+        remove_phantom_nodes(&mut graph.nodes, &mut graph.edges, &valid_file_paths);
+
         // Rebuild indexes
         graph.outgoing.clear();
         graph.incoming.clear();
@@ -1047,7 +1094,11 @@ impl CodeGraph {
             &state.func_map,
             &state.module_map,
         );
-        let final_edges = dedup_and_finalize_edges(resolved, &state.nodes);
+        let mut final_edges = dedup_and_finalize_edges(resolved, &state.nodes);
+
+        // Remove phantom file nodes — files that don't exist on disk (ISS-007)
+        let valid_file_paths: HashSet<&str> = file_entries.iter().map(|(p, _, _)| p.as_str()).collect();
+        remove_phantom_nodes(&mut state.nodes, &mut final_edges, &valid_file_paths);
 
         let mut graph = CodeGraph {
             nodes: state.nodes,

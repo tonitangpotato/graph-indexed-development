@@ -496,4 +496,70 @@ class Helper {
         assert_eq!(result, Some("file:src/components/Stats.tsx".to_string()),
             "Should resolve @/components/Stats path alias");
     }
+
+    /// ISS-007: Verify no ghost nodes when same-named files exist in different directories.
+    #[test]
+    fn test_no_ghost_nodes_same_basename() {
+        use std::io::Write;
+        use crate::code_graph::CodeGraph;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+
+        // Create two files with the same basename in different directories
+        std::fs::create_dir_all(src.join("components")).unwrap();
+
+        let mut f1 = std::fs::File::create(src.join("Tool.ts")).unwrap();
+        writeln!(f1, "export class Tool {{ run() {{}} }}").unwrap();
+
+        let mut f2 = std::fs::File::create(src.join("components/Tool.ts")).unwrap();
+        writeln!(f2, "export class ToolComponent {{ render() {{}} }}").unwrap();
+
+        // A file that imports "Tool" — which one should it resolve to?
+        let mut f3 = std::fs::File::create(src.join("main.ts")).unwrap();
+        writeln!(f3, "import {{ Tool }} from './Tool';").unwrap();
+        writeln!(f3, "export function main() {{ const t = new Tool(); return t; }}").unwrap();
+
+        let graph = CodeGraph::extract_from_dir(&src);
+
+        // Count file nodes
+        let file_nodes: Vec<&CodeNode> = graph.nodes.iter()
+            .filter(|n| n.kind == NodeKind::File)
+            .collect();
+
+        let actual_files = vec!["Tool.ts", "components/Tool.ts", "main.ts"];
+
+        // There should be exactly 3 file nodes — no ghosts
+        assert_eq!(
+            file_nodes.len(), actual_files.len(),
+            "Expected {} file nodes but got {}. File nodes: {:?}",
+            actual_files.len(),
+            file_nodes.len(),
+            file_nodes.iter().map(|n| &n.file_path).collect::<Vec<_>>()
+        );
+
+        // Every file node's file_path should be one of the actual files
+        for node in &file_nodes {
+            assert!(
+                actual_files.contains(&node.file_path.as_str()),
+                "Ghost file node detected: {} (file_path: {})",
+                node.id, node.file_path
+            );
+        }
+
+        // No edges should reference non-existent nodes
+        let node_ids: HashSet<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
+        for edge in &graph.edges {
+            assert!(
+                node_ids.contains(edge.from.as_str()),
+                "Edge from non-existent node: {} -> {}",
+                edge.from, edge.to
+            );
+            assert!(
+                node_ids.contains(edge.to.as_str()),
+                "Edge to non-existent node: {} -> {}",
+                edge.from, edge.to
+            );
+        }
+    }
 }

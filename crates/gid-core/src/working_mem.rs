@@ -41,8 +41,8 @@ impl NodeInfo {
             file: node.file_path.clone(),
             kind: match node.kind {
                 NodeKind::File => "file",
-                NodeKind::Class => "class",
-                NodeKind::Function => "function",
+                NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => "class",
+                NodeKind::Function | NodeKind::Constant => "function",
                 NodeKind::Module => "module",
             }.to_string(),
             callers,

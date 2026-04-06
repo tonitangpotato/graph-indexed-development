@@ -99,8 +99,8 @@ impl CodeGraph {
             for node in &report.affected_source {
                 let prefix = match node.kind {
                     NodeKind::File => "📄",
-                    NodeKind::Class => "🔷",
-                    NodeKind::Function => "🔹",
+                    NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => "🔷",
+                    NodeKind::Function | NodeKind::Constant => "🔹",
                     NodeKind::Module => "📦",
                 };
                 result.push_str(&format!("{} {} (`{}`)\n", prefix, node.name, node.file_path));
