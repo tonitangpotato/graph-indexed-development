@@ -1221,6 +1221,15 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
                             stats.languages_used.join(", ")
                         }
                     );
+                    if stats.references_queried > 0 || stats.implementations_queried > 0 {
+                        eprintln!(
+                            "LSP enrichment: {} references queried → {} new call edges, {} implementations queried → {} new impl edges",
+                            stats.references_queried,
+                            stats.references_edges_added,
+                            stats.implementations_queried,
+                            stats.implementation_edges_added,
+                        );
+                    }
                 }
             }
             Err(e) => {

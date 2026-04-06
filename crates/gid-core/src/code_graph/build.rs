@@ -379,6 +379,177 @@ impl CodeGraph {
                 self.edges.remove(idx);
             }
 
+            // ── Pass 2: References enrichment ──────────────────────────
+            // For each function/method node, query LSP for references to discover
+            // call edges that tree-sitter missed (indirect calls, macro-generated, etc.)
+            {
+                // Collect existing edge set for dedup
+                let existing_edges: HashSet<(String, String)> = self.edges
+                    .iter()
+                    .filter(|e| e.relation == EdgeRelation::Calls)
+                    .map(|e| (e.from.clone(), e.to.clone()))
+                    .collect();
+
+                // Rebuild def_index after removals above
+                let def_index = build_definition_target_index(&self.nodes);
+
+                // Collect function/method nodes for this language
+                let func_nodes: Vec<(String, String, u32)> = self.nodes
+                    .iter()
+                    .filter(|n| n.kind == NodeKind::Function)
+                    .filter(|n| {
+                        let ext = n.file_path.rsplit('.').next().unwrap_or("");
+                        let node_lang = extension_to_language_id(ext);
+                        (node_lang == lang_id.as_str())
+                            || (lang_id == "typescript"
+                                && (node_lang == "javascript" || node_lang == "typescript"))
+                    })
+                    .filter_map(|n| {
+                        n.line.map(|l| (n.id.clone(), n.file_path.clone(), l.saturating_sub(1) as u32))
+                    })
+                    .collect();
+
+                let mut new_call_edges: Vec<CodeEdge> = Vec::new();
+
+                for (node_id, file_path, def_line) in &func_nodes {
+                    let lsp_path = to_lsp_path(file_path);
+                    stats.references_queried += 1;
+
+                    match client.get_references(&lsp_path, *def_line, 0, false) {
+                        Ok(locations) => {
+                            for loc in locations {
+                                let graph_path = from_lsp_path(&loc.file_path);
+                                // Find which function/method node contains this reference
+                                if let Some(file_index) = def_index.get(&graph_path) {
+                                    if let Some(caller_id) = find_closest_node(file_index, loc.line, 5) {
+                                        // Skip self-references
+                                        if &caller_id == node_id {
+                                            continue;
+                                        }
+                                        // Only add if the caller is a function/method
+                                        let caller_is_func = self.node_by_id(&caller_id)
+                                            .map(|n| n.kind == NodeKind::Function)
+                                            .unwrap_or(false);
+                                        if !caller_is_func {
+                                            continue;
+                                        }
+                                        // Dedup: check existing + already-queued new edges
+                                        let key = (caller_id.clone(), node_id.clone());
+                                        if !existing_edges.contains(&key)
+                                            && !new_call_edges.iter().any(|e| e.from == key.0 && e.to == key.1)
+                                        {
+                                            let mut edge = CodeEdge::calls(&caller_id, node_id);
+                                            edge.confidence = 0.95;
+                                            new_call_edges.push(edge);
+                                            stats.references_edges_added += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("[LSP] references failed for {}:{}: {}", file_path, def_line, e);
+                        }
+                    }
+                }
+
+                self.edges.extend(new_call_edges);
+            }
+
+            // ── Pass 3: Implementation enrichment ──────────────────────
+            // For trait/interface methods, query LSP to discover concrete implementations
+            // and add Implements edges.
+            {
+                // Rebuild def_index after pass 2 modifications
+                let def_index = build_definition_target_index(&self.nodes);
+
+                // Build set of class node IDs that are traits/interfaces
+                let trait_class_ids: HashSet<String> = self.nodes
+                    .iter()
+                    .filter(|n| n.kind == NodeKind::Class)
+                    .filter(|n| {
+                        // Detect trait (Rust) or interface (TS) by signature
+                        n.signature.as_deref().map_or(false, |sig| {
+                            sig.contains("trait ") || sig.contains("interface ")
+                        })
+                    })
+                    .map(|n| n.id.clone())
+                    .collect();
+
+                // Find methods that are DefinedIn a trait/interface
+                let trait_methods: Vec<(String, String, u32)> = self.nodes
+                    .iter()
+                    .filter(|n| n.kind == NodeKind::Function)
+                    .filter(|n| {
+                        let ext = n.file_path.rsplit('.').next().unwrap_or("");
+                        let node_lang = extension_to_language_id(ext);
+                        (node_lang == lang_id.as_str())
+                            || (lang_id == "typescript"
+                                && (node_lang == "javascript" || node_lang == "typescript"))
+                    })
+                    .filter(|n| {
+                        // Check if this method is DefinedIn a trait/interface class node
+                        self.edges.iter().any(|e| {
+                            e.from == n.id
+                                && e.relation == EdgeRelation::DefinedIn
+                                && trait_class_ids.contains(&e.to)
+                        })
+                    })
+                    .filter_map(|n| {
+                        n.line.map(|l| (n.id.clone(), n.file_path.clone(), l.saturating_sub(1) as u32))
+                    })
+                    .collect();
+
+                // Collect existing Implements edges for dedup
+                let existing_impl_edges: HashSet<(String, String)> = self.edges
+                    .iter()
+                    .filter(|e| e.relation == EdgeRelation::Implements)
+                    .map(|e| (e.from.clone(), e.to.clone()))
+                    .collect();
+
+                let mut new_impl_edges: Vec<CodeEdge> = Vec::new();
+
+                for (trait_method_id, file_path, def_line) in &trait_methods {
+                    let lsp_path = to_lsp_path(file_path);
+                    stats.implementations_queried += 1;
+
+                    match client.get_implementations(&lsp_path, *def_line, 0) {
+                        Ok(locations) => {
+                            for loc in locations {
+                                let graph_path = from_lsp_path(&loc.file_path);
+                                if let Some(file_index) = def_index.get(&graph_path) {
+                                    if let Some(impl_id) = find_closest_node(file_index, loc.line, 5) {
+                                        // Skip self-references
+                                        if &impl_id == trait_method_id {
+                                            continue;
+                                        }
+                                        // Edge: concrete impl → trait method
+                                        let key = (impl_id.clone(), trait_method_id.clone());
+                                        if !existing_impl_edges.contains(&key)
+                                            && !new_impl_edges.iter().any(|e| e.from == key.0 && e.to == key.1)
+                                        {
+                                            let mut edge = CodeEdge::new(
+                                                &impl_id,
+                                                trait_method_id,
+                                                EdgeRelation::Implements,
+                                            );
+                                            edge.confidence = 1.0;
+                                            new_impl_edges.push(edge);
+                                            stats.implementation_edges_added += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("[LSP] implementations failed for {}:{}: {}", file_path, def_line, e);
+                        }
+                    }
+                }
+
+                self.edges.extend(new_impl_edges);
+            }
+
             // Shutdown LSP
             if let Err(e) = client.shutdown() {
                 tracing::debug!("LSP shutdown error: {}", e);
