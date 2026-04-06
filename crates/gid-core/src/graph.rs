@@ -189,6 +189,8 @@ pub struct Edge {
     pub relation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 fn default_relation() -> String {
@@ -202,6 +204,7 @@ impl Edge {
             to: to.to_string(),
             relation: relation.to_string(),
             weight: None,
+            confidence: None,
         }
     }
 

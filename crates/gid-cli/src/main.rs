@@ -167,6 +167,9 @@ enum Commands {
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Use LSP servers for precise call edge resolution
+        #[arg(long)]
+        lsp: bool,
     },
 
     /// Analyze a file's code dependencies
@@ -566,7 +569,7 @@ fn main() -> Result<()> {
             QueryCommands::Topo => cmd_query_topo(resolve_graph_path(cli.graph)?, cli.json),
         },
         Commands::EditGraph { operations } => cmd_edit_graph(resolve_graph_path(cli.graph)?, &operations, cli.json),
-        Commands::Extract { dir, format, output } => cmd_extract(&dir, &format, output.as_deref(), cli.json),
+        Commands::Extract { dir, format, output, lsp } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
         Commands::CodeFailures { changed, p2p, f2p, dir } => cmd_code_failures(&dir, &changed, p2p.as_deref(), f2p.as_deref(), cli.json),
@@ -1182,7 +1185,7 @@ fn cmd_edit_graph(path: PathBuf, operations_json: &str, json: bool) -> Result<()
     Ok(())
 }
 
-fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool) -> Result<()> {
+fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool) -> Result<()> {
     let dir = if dir.is_absolute() {
         dir.clone()
     } else {
@@ -1196,7 +1199,37 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
     if !json_flag {
         eprintln!("Extracting code graph from {}...", dir.display());
     }
-    let code_graph = CodeGraph::extract_from_dir(&dir);
+    let mut code_graph = CodeGraph::extract_from_dir(&dir);
+
+    // LSP refinement pass
+    if lsp {
+        if !json_flag {
+            eprintln!("Refining call edges with LSP...");
+        }
+        match code_graph.refine_with_lsp(&dir) {
+            Ok(stats) => {
+                if !json_flag {
+                    eprintln!(
+                        "LSP refinement: {} refined, {} removed, {} failed, {} skipped (languages: {})",
+                        stats.refined,
+                        stats.removed,
+                        stats.failed,
+                        stats.skipped,
+                        if stats.languages_used.is_empty() {
+                            "none".to_string()
+                        } else {
+                            stats.languages_used.join(", ")
+                        }
+                    );
+                }
+            }
+            Err(e) => {
+                if !json_flag {
+                    eprintln!("LSP refinement failed: {}, using tree-sitter edges only", e);
+                }
+            }
+        }
+    }
     
     // Load existing graph if output file exists (for merge behavior)
     let existing_graph = if let Some(out_path) = output {

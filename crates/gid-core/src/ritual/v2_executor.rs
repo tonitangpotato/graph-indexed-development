@@ -26,6 +26,37 @@ use super::state_machine::{
 /// Callback for sending notifications (fire-and-forget).
 pub type NotifyFn = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Build the triage prompt for a given task and project context.
+/// Single source of truth — used by both gid-core and external consumers (e.g., RustClaw).
+pub fn build_triage_prompt(task: &str, project_ctx: &str) -> String {
+    format!(
+        r#"You are a triage agent. Assess this development task quickly.
+
+{project_ctx}
+
+Task: "{task}"
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{
+  "clarity": "clear" or "ambiguous",
+  "clarify_questions": ["question1", ...] (only if ambiguous, otherwise empty array),
+  "size": "small", "medium", or "large",
+  "skip_design": true/false,
+  "skip_graph": true/false
+}}
+
+Guidelines:
+- "small": bug fix, add a simple command, change a config value, rename something
+- "medium": add a feature that touches 2-3 files, refactor a module
+- "large": new subsystem, architectural change, multi-file feature
+- skip_design=true if the task is small enough that a DESIGN.md update adds no value
+- skip_graph=true ONLY if the task modifies existing code without adding new modules, files, or components
+- skip_graph=false if the task adds ANY new files, modules, subsystems, or architectural components — even if a graph already exists, it needs to be UPDATED with new nodes
+- "ambiguous" if the task description is vague, could mean multiple things, or lacks critical info
+- Short ≠ simple. "fix the bug" is ambiguous. "fix the auth retry loop in llm.rs" is clear and small."#
+    )
+}
+
 /// V2 executor configuration.
 pub struct V2ExecutorConfig {
     /// Project root directory.
@@ -183,31 +214,7 @@ impl V2Executor {
             "Project: unknown state".into()
         };
 
-        let prompt = format!(
-            r#"You are a triage agent. Assess this development task quickly.
-
-{project_ctx}
-
-Task: "{task}"
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{{
-  "clarity": "clear" or "ambiguous",
-  "clarify_questions": ["question1", ...] (only if ambiguous, otherwise empty array),
-  "size": "small", "medium", or "large",
-  "skip_design": true/false,
-  "skip_graph": true/false
-}}
-
-Guidelines:
-- "small": bug fix, add a simple command, change a config value, rename something
-- "medium": add a feature that touches 2-3 files, refactor a module
-- "large": new subsystem, architectural change, multi-file feature
-- skip_design=true if the task is small enough that a DESIGN.md update adds no value
-- skip_graph=true if the task doesn't add new architectural nodes/edges
-- "ambiguous" if the task description is vague, could mean multiple things, or lacks critical info
-- Short ≠ simple. "fix the bug" is ambiguous. "fix the auth retry loop in llm.rs" is clear and small."#
-        );
+        let prompt = build_triage_prompt(task, &project_ctx);
 
         match llm.chat(&prompt, "haiku").await {
             Ok(response) => {
@@ -577,19 +584,86 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
             ),
             "generate-graph" | "design-to-graph" => Ok(
                 "Read DESIGN.md from the project root. Generate a GID graph in YAML format \
-                 and write it to .gid/graph.yml. Include component nodes, file nodes, and \
-                 task nodes with proper edges."
+                 and write it to .gid/graph.yml.\n\n\
+                 The graph has multiple node types:\n\
+                 ```yaml\n\
+                 nodes:\n\
+                   # Feature/module nodes (semantic — the architecture)\n\
+                   - id: feat-dashboard\n\
+                     title: \"Dashboard Module\"\n\
+                     type: feature\n\
+                     status: todo\n\
+                     tags: [module]\n\
+                     description: \"HTTP dashboard server\"\n\
+                   # File nodes (what gets changed)\n\
+                   - id: file-dashboard-rs\n\
+                     title: \"src/dashboard.rs\"\n\
+                     type: file\n\
+                     status: todo\n\
+                   # Task nodes (concrete work items)\n\
+                   - id: task-add-health-endpoint\n\
+                     title: \"Add health check endpoint\"\n\
+                     type: task\n\
+                     status: todo\n\
+                     tags: [implementation]\n\
+                     description: \"Add health check endpoint returning uptime and stats\"\n\
+                 edges:\n\
+                   - from: task-add-health-endpoint\n\
+                     to: feat-dashboard\n\
+                     relation: implements\n\
+                   - from: feat-dashboard\n\
+                     to: file-dashboard-rs\n\
+                     relation: contains\n\
+                   - from: task-a\n\
+                     to: task-b\n\
+                     relation: depends_on\n\
+                 ```\n\n\
+                 Node types: feature, component, file, task, layer, doc\n\
+                 Edge relations: depends_on, implements, modifies, contains, tests, related_to\n\n\
+                 Rules:\n\
+                 - Create feature/component nodes for modules and architectural units\n\
+                 - Create file nodes for files being created/modified\n\
+                 - Create task nodes for concrete work items (status: todo)\n\
+                 - Link tasks to features they implement (relation: implements)\n\
+                 - Link features to files they contain (relation: contains)\n\
+                 - Link tasks to tasks they depend on (relation: depends_on)\n\
+                 - Include metadata (design_ref, goals, file_path) on task nodes\n\
+                 Use the Read tool to read DESIGN.md, then Write tool to create .gid/graph.yml."
                     .to_string(),
             ),
             "update-graph" => Ok(
                 "Read the existing .gid/graph.yml and DESIGN.md. Update the graph to reflect \
-                 any new tasks or changes from the design. Add new task nodes as needed."
+                 any new tasks or changes from the design.\n\n\
+                 CRITICAL RULES:\n\
+                 - Read the existing graph FIRST\n\
+                 - PRESERVE all existing nodes and edges — do NOT delete or modify them\n\
+                 - Only ADD new nodes (task, feature, component, file) and edges for the new work\n\
+                 - New task nodes should have status: todo\n\
+                 - Link new tasks to features they implement (relation: implements)\n\
+                 - Link tasks to tasks they depend on (relation: depends_on)\n\n\
+                 Node types: feature, component, file, task, layer, doc\n\
+                 Edge relations: depends_on, implements, modifies, contains, tests, related_to\n\n\
+                 Use Read to load existing graph and DESIGN.md, then Write to update .gid/graph.yml."
                     .to_string(),
             ),
             "implement" => Ok(
-                "Implement the described changes. Read relevant source files, make the \
-                 necessary code changes, and ensure the code compiles. Follow existing \
-                 patterns and conventions."
+                "Implement the described changes following the graph-driven layer approach:\n\n\
+                 PROCESS:\n\
+                 1. Read .gid/graph.yml to find all task nodes and their layer assignments\n\
+                 2. Process layers in order (Layer 0 first, then Layer 1, etc.)\n\
+                 3. Within each layer, implement each task node sequentially:\n\
+                    a. Read the design doc section relevant to this task\n\
+                    b. Read any dependency modules (from prior layers) to understand their public API\n\
+                    c. Write the code for this task\n\
+                    d. Update the task node's status to 'done' in graph.yml\n\
+                 4. After completing ALL tasks in a layer, run the project's build/check command\n\
+                    to verify compilation before proceeding to the next layer\n\
+                 5. If build fails, fix the issues within the current layer before moving on\n\n\
+                 RULES:\n\
+                 - Follow existing patterns and conventions in the codebase\n\
+                 - Only implement tasks that are status: todo — skip tasks already marked done\n\
+                 - Layer order is mandatory: never implement a task before its dependencies are done\n\
+                 - Update graph.yml status incrementally, not all at once at the end"
                     .to_string(),
             ),
             _ => anyhow::bail!("Unknown skill: {}", skill_name),

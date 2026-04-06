@@ -85,6 +85,7 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             EdgeRelation::Calls => "calls",
             EdgeRelation::TestsFor => "tests",
             EdgeRelation::Overrides => "overrides",
+            EdgeRelation::Implements => "implements",
         };
         
         let edge_key = (from.clone(), to.clone(), relation.to_string());
@@ -97,6 +98,11 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             to,
             relation: relation.to_string(),
             weight: Some(code_edge.weight as f64),
+            confidence: if code_edge.confidence > 0.0 {
+                Some(code_edge.confidence as f64)
+            } else {
+                None
+            },
         });
     }
     
@@ -206,6 +212,7 @@ pub fn link_tasks_to_code(code_graph: &CodeGraph, task_graph: &mut Graph) {
                         to: code_id,
                         relation: "relates_to".to_string(),
                         weight: None,
+                        confidence: None,
                     });
                 }
             }

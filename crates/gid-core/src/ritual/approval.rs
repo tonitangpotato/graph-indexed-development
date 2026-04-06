@@ -94,9 +94,7 @@ impl ApprovalGate {
                 match name.as_str() {
                     "requirements" | "idea-intake" => {
                         if artifact_count > 0 {
-                            let first = artifacts[0].file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "requirements".to_string());
+                            let first = artifacts[0].to_string_lossy();
                             format!("Generated requirements. Review `{}`", first)
                         } else {
                             "Generated requirements document.".to_string()
@@ -104,9 +102,7 @@ impl ApprovalGate {
                     }
                     "design-doc" | "design" => {
                         if artifact_count > 0 {
-                            let first = artifacts[0].file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "design".to_string());
+                            let first = artifacts[0].to_string_lossy();
                             format!("Generated design document. Review `{}`", first)
                         } else {
                             "Generated design document.".to_string()

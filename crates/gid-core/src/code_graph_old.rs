@@ -128,6 +128,12 @@ pub struct CodeEdge {
     pub in_error_path: bool,
     #[serde(default)]
     pub confidence: f32,
+    /// 0-indexed line of the call site expression (for LSP refinement)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_site_line: Option<u32>,
+    /// 0-indexed column of the call site expression (for LSP refinement)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_site_column: Option<u32>,
 }
 
 impl CodeEdge {
@@ -140,6 +146,8 @@ impl CodeEdge {
             call_count: 1,
             in_error_path: false,
             confidence: 1.0,
+            call_site_line: None,
+            call_site_column: None,
         }
     }
 
@@ -187,6 +195,8 @@ pub enum EdgeRelation {
     TestsFor,
     /// Method overrides parent method
     Overrides,
+    /// Concrete method implements a trait/interface method
+    Implements,
 }
 
 impl std::fmt::Display for EdgeRelation {
@@ -198,6 +208,7 @@ impl std::fmt::Display for EdgeRelation {
             EdgeRelation::Calls => write!(f, "calls"),
             EdgeRelation::TestsFor => write!(f, "tests_for"),
             EdgeRelation::Overrides => write!(f, "overrides"),
+            EdgeRelation::Implements => write!(f, "implements"),
         }
     }
 }
@@ -320,6 +331,9 @@ impl CodeGraph {
         // File → imported function/module names
         let mut file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
 
+        // Struct name → { field_name → type_name } for receiver type heuristics
+        let mut all_struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+
         // Collect file entries first
         let mut file_entries: Vec<(String, String, Language)> = Vec::new();
 
@@ -413,12 +427,17 @@ impl CodeGraph {
                     )
                 }
                 Language::Rust => {
-                    extract_rust_tree_sitter(
+                    let (nodes, edges, imports, field_types) = extract_rust_tree_sitter(
                         rel_path,
                         content,
                         &mut parser,
                         &mut class_map,
-                    )
+                    );
+                    // Store struct field types for receiver type heuristics
+                    for (struct_name, fields) in field_types {
+                        all_struct_field_types.insert(struct_name, fields);
+                    }
+                    (nodes, edges, imports)
                 }
                 Language::TypeScript => {
                     let ext = rel_path.rsplit('.').next().unwrap_or("ts");
@@ -563,6 +582,8 @@ impl CodeGraph {
                                         call_count: 1,
                                         in_error_path: false,
                                         confidence: 1.0,
+                                        call_site_line: None,
+                                        call_site_column: None,
                                     });
                                 }
                             }
@@ -587,6 +608,8 @@ impl CodeGraph {
                             &method_to_class,
                             &file_func_ids,
                             &node_pkg_map,
+                            &file_imported_names,
+                            &all_struct_field_types,
                             &mut edges,
                         );
                     }
@@ -642,6 +665,8 @@ impl CodeGraph {
                         call_count: edge.call_count,
                         in_error_path: edge.in_error_path,
                         confidence: edge.confidence,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             } else if edge.to.starts_with("module_ref:") {
@@ -665,6 +690,8 @@ impl CodeGraph {
                         call_count: edge.call_count,
                         in_error_path: edge.in_error_path,
                         confidence: edge.confidence,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             } else if edge.to.starts_with("func_ref:") {
@@ -679,6 +706,8 @@ impl CodeGraph {
                             call_count: edge.call_count,
                             in_error_path: edge.in_error_path,
                             confidence: edge.confidence,
+                            call_site_line: None,
+                            call_site_column: None,
                         });
                     }
                 }
@@ -2009,6 +2038,7 @@ impl CodeGraph {
             EdgeRelation::Calls => "calls",
             EdgeRelation::TestsFor => "tests_for",
             EdgeRelation::Overrides => "overrides",
+            EdgeRelation::Implements => "implements",
         }).collect();
 
         format!(
@@ -2447,6 +2477,394 @@ impl CodeGraph {
             edges,
         }
     }
+
+    /// Refine call edges using LSP servers for precise definition resolution.
+    ///
+    /// For each call edge with confidence < 1.0, queries the language server's
+    /// `textDocument/definition` to resolve the exact target. This replaces
+    /// name-matching heuristics with compiler-level precision.
+    ///
+    /// Requires language servers to be installed (tsserver, rust-analyzer, pyright).
+    /// Falls back gracefully: if no LSP is available for a language, keeps the
+    /// tree-sitter edges with their original confidence.
+    pub fn refine_with_lsp(
+        &mut self,
+        root_dir: &Path,
+    ) -> anyhow::Result<crate::lsp_client::LspRefinementStats> {
+        use crate::lsp_client::*;
+
+        let mut stats = LspRefinementStats::default();
+
+        // Find the actual project root by looking for config files
+        // The user passes the source directory (e.g., src/), but LSP needs the project root
+        // (where tsconfig.json, package.json, Cargo.toml, etc. live)
+        let project_root = find_project_root(root_dir);
+        let extract_dir = root_dir.canonicalize().unwrap_or_else(|_| root_dir.to_path_buf());
+        let project_root_canon = project_root.canonicalize().unwrap_or_else(|_| project_root.clone());
+
+        // Compute prefix: if extract_dir is a subdirectory of project_root, this is the relative path
+        // e.g., project_root=/tmp/project, extract_dir=/tmp/project/src → prefix = "src"
+        let dir_prefix = extract_dir
+            .strip_prefix(&project_root_canon)
+            .ok()
+            .and_then(|p| {
+                let s = p.to_string_lossy().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            });
+
+        // Detect available language servers
+        let configs = LspServerConfig::detect_available();
+        if configs.is_empty() {
+            // No LSP servers available; mark all call edges as skipped
+            stats.skipped = self
+                .edges
+                .iter()
+                .filter(|e| e.relation == EdgeRelation::Calls)
+                .count();
+            stats.total_call_edges = stats.skipped;
+            return Ok(stats);
+        }
+
+        // Build definition target index: (file_path, line) → node_id
+        let def_index = build_definition_target_index(&self.nodes);
+
+        // Collect file contents by language (we need them to open in LSP)
+        // file_path in nodes is relative to extract dir (e.g., "math.ts")
+        // For LSP, we need paths relative to project root (e.g., "src/math.ts")
+        let to_lsp_path = |graph_path: &str| -> String {
+            match &dir_prefix {
+                Some(prefix) => format!("{}/{}", prefix, graph_path),
+                None => graph_path.to_string(),
+            }
+        };
+        let from_lsp_path = |lsp_path: &str| -> String {
+            match &dir_prefix {
+                Some(prefix) => {
+                    let prefix_slash = format!("{}/", prefix);
+                    lsp_path.strip_prefix(&prefix_slash).unwrap_or(lsp_path).to_string()
+                }
+                None => lsp_path.to_string(),
+            }
+        };
+
+        let mut files_by_lang: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for node in &self.nodes {
+            if node.kind == NodeKind::File {
+                let ext = node
+                    .file_path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("");
+                let lang_id = extension_to_language_id(ext).to_string();
+
+                if !files_by_lang.contains_key(&lang_id) || lang_id != "plaintext" {
+                    let full_path = root_dir.join(&node.file_path);
+                    if let Ok(content) = std::fs::read_to_string(&full_path) {
+                        // Store with graph-relative path (node.file_path), content
+                        files_by_lang
+                            .entry(lang_id)
+                            .or_default()
+                            .push((node.file_path.clone(), content));
+                    }
+                }
+            }
+        }
+
+        // Group call edges by source language for batch processing
+        let call_edge_indices: Vec<usize> = self
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.relation == EdgeRelation::Calls)
+            .map(|(i, _)| i)
+            .collect();
+
+        stats.total_call_edges = call_edge_indices.len();
+
+        // Process each language that has a server config
+        for config in &configs {
+            let lang_id = &config.language_id;
+
+            // Find call edges for this language
+            let lang_edge_indices: Vec<usize> = call_edge_indices
+                .iter()
+                .filter(|&&idx| {
+                    let edge = &self.edges[idx];
+                    let caller_file = self
+                        .node_by_id(&edge.from)
+                        .map(|n| &n.file_path)
+                        .unwrap_or(&String::new())
+                        .clone();
+                    let ext = caller_file.rsplit('.').next().unwrap_or("");
+                    let edge_lang = extension_to_language_id(ext);
+                    // TS/JS share tsserver
+                    (edge_lang == lang_id.as_str())
+                        || (lang_id == "typescript"
+                            && (edge_lang == "javascript" || edge_lang == "typescript"))
+                })
+                .copied()
+                .collect();
+
+
+            if lang_edge_indices.is_empty() {
+                continue;
+            }
+
+            // Start LSP server
+            let mut client = match LspClient::start(config, &project_root) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("[LSP] Failed to start {} server: {}", lang_id, e);
+                    stats.failed += lang_edge_indices.len();
+                    continue;
+                }
+            };
+
+            stats.languages_used.push(lang_id.clone());
+
+            // Open all files for this language
+            if let Some(files) = files_by_lang.get(lang_id) {
+                for (path, content) in files {
+                    let lsp_path = to_lsp_path(path);
+                    let ext = path.rsplit('.').next().unwrap_or("");
+                    let file_lang = extension_to_language_id(ext);
+                    if let Err(e) = client.open_file(&lsp_path, content, file_lang) {
+                        tracing::warn!("[LSP] Failed to open {}: {}", lsp_path, e);
+                    }
+                }
+            }
+            // Also open JS files if we're using tsserver
+            if lang_id == "typescript" {
+                if let Some(files) = files_by_lang.get("javascript") {
+                    for (path, content) in files {
+                        let lsp_path = to_lsp_path(path);
+                        if let Err(e) = client.open_file(&lsp_path, content, "javascript") {
+                            tracing::warn!("[LSP] Failed to open {}: {}", lsp_path, e);
+                        }
+                    }
+                }
+            }
+
+            // Give LSP a moment to index
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+
+            // Build source content map for finding call sites
+            let mut source_map: HashMap<String, String> = HashMap::new();
+            if let Some(files) = files_by_lang.get(lang_id) {
+                for (path, content) in files {
+                    source_map.insert(path.clone(), content.clone());
+                }
+            }
+            if lang_id == "typescript" {
+                if let Some(files) = files_by_lang.get("javascript") {
+                    for (path, content) in files {
+                        source_map.insert(path.clone(), content.clone());
+                    }
+                }
+            }
+
+            // Process each call edge
+            let mut edges_to_update: Vec<(usize, Option<String>, f32)> = Vec::new();
+            let mut edges_to_remove: Vec<usize> = Vec::new();
+
+            for &idx in &lang_edge_indices {
+                let edge = &self.edges[idx];
+
+                // Skip already high-confidence edges
+                if edge.confidence >= 0.95 {
+                    continue;
+                }
+
+                // Find call site position
+                let (file_path, call_line, call_col) =
+                    if let (Some(line), Some(col)) = (edge.call_site_line, edge.call_site_column) {
+                        // Have exact position from extraction
+                        let caller = self.node_by_id(&edge.from);
+                        let fp = caller.map(|n| n.file_path.clone()).unwrap_or_default();
+                        (fp, line, col)
+                    } else {
+                        // Need to find position by searching source
+                        let caller = match self.node_by_id(&edge.from) {
+                            Some(n) => n,
+                            None => {
+                                stats.failed += 1;
+                                continue;
+                            }
+                        };
+                        let source = match source_map.get(&caller.file_path) {
+                            Some(s) => s,
+                            None => {
+                                stats.failed += 1;
+                                continue;
+                            }
+                        };
+
+                        // Extract callee name from edge.to (format: func:path:name or method:path:Class.method)
+                        let raw_callee = edge
+                            .to
+                            .rsplit(':')
+                            .next()
+                            .unwrap_or(&edge.to);
+                        
+                        // For method calls like "Calculator.add", extract just the method name
+                        let callee_name = if raw_callee.contains('.') {
+                            raw_callee.rsplit('.').next().unwrap_or(raw_callee)
+                        } else {
+                            raw_callee
+                        };
+
+                        // Search for callee name in the caller's line range
+                        let caller_start = caller.line.unwrap_or(0);
+                        let caller_end = caller_start + caller.line_count;
+
+                        let mut found_pos = None;
+                        for (line_idx, line_text) in source.lines().enumerate() {
+                            let line_num = line_idx; // 0-indexed
+                            if line_num >= caller_start && line_num <= caller_end {
+                                // Search for the callee name as a function call
+                                if let Some(col_pos) = find_call_position(line_text, callee_name) {
+                                    found_pos = Some((line_num as u32, col_pos as u32));
+                                    break;
+                                }
+                            }
+                        }
+
+                        match found_pos {
+                            Some((line, col)) => (caller.file_path.clone(), line, col),
+                            None => {
+                                // Can't find call site in source
+                                stats.failed += 1;
+                                continue;
+                            }
+                        }
+                    };
+
+                // Query LSP for definition (convert graph path to LSP path)
+                let lsp_file_path = to_lsp_path(&file_path);
+                match client.get_definition(&lsp_file_path, call_line, call_col) {
+                    Ok(Some(location)) => {
+                        // LSP found a definition in our project
+                        // Convert LSP path back to graph-relative path
+                        let graph_file_path = from_lsp_path(&location.file_path);
+                        // Try to match to a known node
+                        if let Some(file_index) = def_index.get(&graph_file_path) {
+                            if let Some(target_id) =
+                                find_closest_node(file_index, location.line, 5)
+                            {
+                                // Update edge target and confidence
+                                edges_to_update.push((idx, Some(target_id), 1.0));
+                                stats.refined += 1;
+                            } else {
+                                // Definition found but doesn't match any known node
+                                // Keep original edge but note it was checked
+                                edges_to_update.push((idx, None, edge.confidence.max(0.6)));
+                                stats.refined += 1;
+                            }
+                        } else {
+                            // Definition in an unindexed file
+                            edges_to_update.push((idx, None, edge.confidence.max(0.6)));
+                            stats.refined += 1;
+                        }
+                    }
+                    Ok(None) => {
+                        // Definition is outside project (stdlib, node_modules, etc.)
+                        edges_to_remove.push(idx);
+                        stats.removed += 1;
+                    }
+                    Err(e) => {
+                        tracing::debug!("[LSP] definition failed for {}:{},{}: {}", file_path, call_line, call_col, e);
+                        stats.failed += 1;
+                    }
+                }
+            }
+
+            // Apply updates
+            for (idx, new_target, new_confidence) in edges_to_update {
+                if let Some(target) = new_target {
+                    self.edges[idx].to = target;
+                }
+                self.edges[idx].confidence = new_confidence;
+            }
+
+            // Remove external/false-positive edges (reverse order to maintain indices)
+            edges_to_remove.sort_unstable();
+            edges_to_remove.dedup();
+            for &idx in edges_to_remove.iter().rev() {
+                self.edges.remove(idx);
+            }
+
+            // Shutdown LSP
+            if let Err(e) = client.shutdown() {
+                tracing::debug!("LSP shutdown error: {}", e);
+            }
+        }
+
+        // Count skipped (languages with no LSP)
+        let handled_langs: std::collections::HashSet<&str> =
+            configs.iter().flat_map(|c| c.extensions.iter().map(|e| e.as_str())).collect();
+        stats.skipped = call_edge_indices
+            .iter()
+            .filter(|&&idx| {
+                if idx >= self.edges.len() {
+                    return false;
+                }
+                let edge = &self.edges[idx];
+                let caller_file = self
+                    .node_by_id(&edge.from)
+                    .map(|n| &n.file_path)
+                    .unwrap_or(&String::new())
+                    .clone();
+                let ext = caller_file.rsplit('.').next().unwrap_or("");
+                !handled_langs.contains(ext)
+            })
+            .count();
+
+        // Rebuild adjacency indexes
+        self.build_indexes();
+
+        Ok(stats)
+    }
+}
+
+/// Walk up from `dir` to find the project root by looking for config files.
+/// Looks for: tsconfig.json, package.json, Cargo.toml, pyproject.toml, .git
+fn find_project_root(dir: &Path) -> std::path::PathBuf {
+    let markers = ["tsconfig.json", "package.json", "Cargo.toml", "pyproject.toml", ".git"];
+    let abs_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+
+    let mut current = abs_dir.as_path();
+    loop {
+        for marker in &markers {
+            if current.join(marker).exists() {
+                return current.to_path_buf();
+            }
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    // Fallback: use the original directory
+    abs_dir
+}
+
+/// Find the column position of a function call in a line of source code.
+/// Looks for patterns like `callee_name(` or `.callee_name(`.
+fn find_call_position(line: &str, callee_name: &str) -> Option<usize> {
+    // Look for `callee_name(` pattern
+    let pattern = format!("{}(", callee_name);
+    if let Some(pos) = line.find(&pattern) {
+        return Some(pos);
+    }
+
+    // Look for `.callee_name(` pattern (method call)
+    let dot_pattern = format!(".{}(", callee_name);
+    if let Some(pos) = line.find(&dot_pattern) {
+        // Return position of the method name, not the dot
+        return Some(pos + 1);
+    }
+
+    None
 }
 
 /// Result of build_unified_graph — a simplified graph structure for task planning
@@ -2660,6 +3078,8 @@ fn extract_python_tree_sitter(
                             call_count: 1,
                             in_error_path: false,
                             confidence: 1.0,
+                            call_site_line: None,
+                            call_site_column: None,
                         });
                     }
                 }
@@ -2678,6 +3098,8 @@ fn extract_python_tree_sitter(
                                 call_count: 1,
                                 in_error_path: false,
                                 confidence: 1.0,
+                                call_site_line: None,
+                                call_site_column: None,
                             });
                         }
                         break;
@@ -2694,6 +3116,8 @@ fn extract_python_tree_sitter(
                                 call_count: 1,
                                 in_error_path: false,
                                 confidence: 1.0,
+                                call_site_line: None,
+                                call_site_column: None,
                             });
                         }
                         break;
@@ -2777,6 +3201,8 @@ fn extract_class_node(
         call_count: 1,
         in_error_path: false,
         confidence: 1.0,
+        call_site_line: None,
+        call_site_column: None,
     });
 
     class_id_map.insert(class_name.clone(), class_id.clone());
@@ -2798,6 +3224,8 @@ fn extract_class_node(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 1.0,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -2901,6 +3329,8 @@ fn extract_method_node(
         call_count: 1,
         in_error_path: false,
         confidence: 1.0,
+        call_site_line: None,
+        call_site_column: None,
     });
 }
 
@@ -2963,6 +3393,8 @@ fn extract_function_node(
         call_count: 1,
         in_error_path: false,
         confidence: 1.0,
+        call_site_line: None,
+        call_site_column: None,
     });
 }
 
@@ -3294,6 +3726,8 @@ fn resolve_and_add_call_edge(
                     call_count: 1,
                     in_error_path: false,
                     confidence,
+                    call_site_line: None,
+                    call_site_column: None,
                 });
             }
         }
@@ -3347,6 +3781,8 @@ fn resolve_and_add_call_edge(
                         call_count: 1,
                         in_error_path: false,
                         confidence,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -3402,6 +3838,8 @@ fn resolve_self_method_call(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 0.9,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -3416,6 +3854,8 @@ fn resolve_self_method_call(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 0.6,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -3464,6 +3904,8 @@ fn add_override_edges(nodes: &[CodeNode], edges: &mut Vec<CodeEdge>) {
                         call_count: 1,
                         in_error_path: false,
                         confidence: 0.6,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -3484,19 +3926,20 @@ fn extract_rust_tree_sitter(
     content: &str,
     parser: &mut Parser,
     class_id_map: &mut HashMap<String, String>,
-) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
+) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>, HashMap<String, HashMap<String, String>>) {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut imports = HashSet::new();
+    let mut struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     // Set language for parser
     if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
-        return (nodes, edges, imports);
+        return (nodes, edges, imports, struct_field_types);
     }
 
     let tree = match parser.parse(content, None) {
         Some(t) => t,
-        None => return (nodes, edges, imports),
+        None => return (nodes, edges, imports, struct_field_types),
     };
 
     let file_id = format!("file:{}", path);
@@ -3519,11 +3962,12 @@ fn extract_rust_tree_sitter(
             class_id_map,
             &mut impl_target_map,
             &mut imports,
+            &mut struct_field_types,
             "",  // no parent module prefix at root
         );
     }
 
-    (nodes, edges, imports)
+    (nodes, edges, imports, struct_field_types)
 }
 
 /// Recursively extract Rust nodes from AST
@@ -3538,6 +3982,7 @@ fn extract_rust_node(
     class_id_map: &mut HashMap<String, String>,
     impl_target_map: &mut HashMap<String, String>,
     imports: &mut HashSet<String>,
+    struct_field_types: &mut HashMap<String, HashMap<String, String>>,
     module_prefix: &str,
 ) {
     let text = |n: tree_sitter::Node| -> String {
@@ -3546,7 +3991,7 @@ fn extract_rust_node(
 
     match node.kind() {
         "use_declaration" => {
-            // Extract import path
+            // Extract import path and leaf symbol names
             let use_text = text(node);
             // Parse: use crate::foo::bar; or use std::collections::HashMap;
             if let Some(path_part) = use_text.strip_prefix("use ") {
@@ -3568,8 +4013,51 @@ fn extract_rust_node(
                             call_count: 1,
                             in_error_path: false,
                             confidence: 1.0,
+                            call_site_line: None,
+                            call_site_column: None,
                         });
                         imports.insert(module);
+                    }
+                    // Also extract leaf symbol names for call edge filtering
+                    // use crate::foo::Bar → "Bar"
+                    // use crate::foo::{Bar, Baz} → "Bar", "Baz"
+                    // use crate::foo::bar_fn → "bar_fn"
+                    if clean_path.contains('{') {
+                        // Brace group: use foo::{Bar, Baz, qux}
+                        if let Some(start) = clean_path.find('{') {
+                            if let Some(end) = clean_path.find('}') {
+                                let names_part = &clean_path[start + 1..end];
+                                for name in names_part.split(',') {
+                                    let clean = name.trim();
+                                    // Handle `self` rename: `use foo::{self as bar}` → skip
+                                    if !clean.is_empty() && clean != "self" && !clean.starts_with("self ") {
+                                        // Handle rename: `Bar as Baz` → insert "Baz"
+                                        let leaf = if let Some(alias) = clean.split(" as ").nth(1) {
+                                            alias.trim()
+                                        } else {
+                                            clean
+                                        };
+                                        if !leaf.is_empty() {
+                                            imports.insert(leaf.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if clean_path.contains("::") {
+                        // Simple path: use crate::foo::Bar → "Bar"
+                        if let Some(leaf) = clean_path.rsplit("::").next() {
+                            let leaf = leaf.trim();
+                            // Handle rename: `use foo::Bar as Baz` → insert "Baz"
+                            let actual = if let Some(alias) = leaf.split(" as ").nth(1) {
+                                alias.trim()
+                            } else {
+                                leaf
+                            };
+                            if !actual.is_empty() && actual != "*" && actual != "self" {
+                                imports.insert(actual.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -3605,6 +4093,33 @@ fn extract_rust_node(
 
             edges.push(CodeEdge::defined_in(&class_id, file_id));
             class_id_map.insert(name.clone(), class_id);
+
+            // Extract struct field name → type mappings for receiver type heuristics
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut fields_map = HashMap::new();
+                let mut field_cursor = body.walk();
+                for field in body.children(&mut field_cursor) {
+                    if field.kind() == "field_declaration" {
+                        let field_name = field.child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        let field_type = field.child_by_field_name("type")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("");
+                        if !field_name.is_empty() && !field_type.is_empty() {
+                            // Extract the base type name (strip generics, references, etc.)
+                            // Arc<HttpClient> → HttpClient, &str → str, Option<Foo> → Foo
+                            let base_type = extract_base_type_name(field_type);
+                            if !base_type.is_empty() {
+                                fields_map.insert(field_name.to_string(), base_type);
+                            }
+                        }
+                    }
+                }
+                if !fields_map.is_empty() {
+                    struct_field_types.insert(name.clone(), fields_map);
+                }
+            }
         }
 
         "enum_item" => {
@@ -3739,6 +4254,8 @@ fn extract_rust_node(
                     call_count: 1,
                     in_error_path: false,
                     confidence: 1.0,
+                    call_site_line: None,
+                    call_site_column: None,
                 });
             }
 
@@ -3811,6 +4328,7 @@ fn extract_rust_node(
                         class_id_map,
                         impl_target_map,
                         imports,
+                        struct_field_types,
                         &new_prefix,
                     );
                 }
@@ -3967,6 +4485,8 @@ fn extract_rust_method(
         call_count: 1,
         in_error_path: false,
         confidence: 1.0,
+        call_site_line: None,
+        call_site_column: None,
     });
 }
 
@@ -4153,6 +4673,8 @@ fn extract_typescript_node(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 1.0,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
                 imports.insert(module.to_string());
@@ -4478,6 +5000,8 @@ fn extract_typescript_class(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 1.0,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -4563,6 +5087,8 @@ fn extract_typescript_method(
         call_count: 1,
         in_error_path: false,
         confidence: 1.0,
+        call_site_line: None,
+        call_site_column: None,
     });
 }
 
@@ -4917,6 +5443,81 @@ fn is_stdlib(module: &str) -> bool {
     stdlib_prefixes.contains(&first_part)
 }
 
+/// Infer the type of a method call receiver using struct field type mappings.
+/// For `self.client.send()`, receiver is "self.client":
+///   - Extract field name "client" 
+///   - Look up impl_type in struct_field_types to find field type
+/// For chained calls like `self.foo.bar.baz()`, uses first field after self.
+/// Returns None if type cannot be inferred.
+fn infer_receiver_type(
+    receiver: &str,
+    impl_type: Option<&str>,
+    struct_field_types: &HashMap<String, HashMap<String, String>>,
+) -> Option<String> {
+    let impl_type = impl_type?;
+    
+    // Extract the struct name from impl_type (e.g., "class:path/file.rs:MyStruct" → "MyStruct")
+    let struct_name = impl_type.rsplit(':').next().unwrap_or(impl_type);
+    
+    // Get field types for this struct
+    let fields = struct_field_types.get(struct_name)?;
+    
+    // Extract the first field name from receiver
+    // "self.client" → "client"
+    // "self.client.inner" → "client" (use first field only)
+    // "foo" → "foo" (non-self receiver, try as-is)
+    let field_name = if receiver.starts_with("self.") {
+        let after_self = &receiver[5..]; // skip "self."
+        after_self.split('.').next().unwrap_or(after_self)
+    } else {
+        // Direct variable name — can't resolve type without local variable analysis
+        return None;
+    };
+    
+    fields.get(field_name).cloned()
+}
+
+/// Extract the base type name from a Rust type annotation.
+/// Strips references, generics, wrappers to get the core type name.
+/// Arc<HttpClient> → "HttpClient", &str → "str", Option<Vec<Foo>> → "Foo"
+/// Box<dyn Trait> → "Trait", HashMap<K, V> → "HashMap"
+fn extract_base_type_name(type_str: &str) -> String {
+    let s = type_str.trim();
+    // Strip references: &, &mut, &'a
+    let s = s.trim_start_matches('&');
+    let s = if s.starts_with("'") {
+        // Lifetime: &'a T → skip lifetime
+        s.split_whitespace().nth(1).unwrap_or(s)
+    } else {
+        s.trim_start_matches("mut ")
+    };
+    let s = s.trim();
+
+    // For common wrapper types, extract the inner type
+    let wrappers = ["Option", "Box", "Arc", "Rc", "Mutex", "RwLock", "RefCell", "Vec", "Cell"];
+    for wrapper in wrappers {
+        if s.starts_with(wrapper) && s[wrapper.len()..].starts_with('<') {
+            let inner = &s[wrapper.len() + 1..];
+            if let Some(end) = inner.rfind('>') {
+                let inner = inner[..end].trim();
+                // Recurse for nested wrappers: Arc<Mutex<Foo>> → Foo
+                return extract_base_type_name(inner);
+            }
+        }
+    }
+
+    // Strip "dyn " prefix for trait objects: Box<dyn Trait> → Trait
+    let s = s.strip_prefix("dyn ").unwrap_or(s);
+
+    // Get the last segment of a path: foo::bar::Baz → Baz
+    let s = s.rsplit("::").next().unwrap_or(s);
+
+    // Strip generic params: HashMap<K, V> → HashMap
+    let s = if let Some(idx) = s.find('<') { &s[..idx] } else { s };
+
+    s.trim().to_string()
+}
+
 /// Check if a Rust call is a builtin/macro to skip
 fn is_rust_builtin(name: &str) -> bool {
     // Strip trailing ! for macro calls
@@ -5223,6 +5824,8 @@ fn extract_calls_rust(
     method_to_class: &HashMap<String, String>,
     file_func_ids: &HashSet<String>,
     node_pkg_map: &HashMap<String, String>,
+    file_imported_names: &HashMap<String, HashSet<String>>,
+    struct_field_types: &HashMap<String, HashMap<String, String>>,
     edges: &mut Vec<CodeEdge>,
 ) {
     // Build scope map
@@ -5303,6 +5906,10 @@ fn extract_calls_rust(
                                     package_dir,
                                     node_pkg_map,
                                     false,
+                                    file_imported_names,
+                                    rel_path,
+                                    None,
+                                    method_to_class,
                                     edges,
                                 );
                             }
@@ -5314,7 +5921,8 @@ fn extract_calls_rust(
                     if let Some(args_node) = node.child_by_field_name("arguments") {
                         scan_args_for_fn_refs(
                             args_node, source, caller_id,
-                            func_name_map, file_func_ids, package_dir, node_pkg_map, edges,
+                            func_name_map, file_func_ids, package_dir, node_pkg_map,
+                            file_imported_names, rel_path, edges,
                         );
                     }
                 }
@@ -5353,7 +5961,12 @@ fn extract_calls_rust(
                                 edges,
                             );
                         } else {
-                            // Regular method call — resolve by method name only
+                            // Regular method call on an object — try to infer receiver type
+                            // For self.client.send(), receiver is "self.client"
+                            // Extract field name and look up type via struct_field_types
+                            let receiver_type = infer_receiver_type(
+                                receiver, impl_ctx.as_deref(), struct_field_types,
+                            );
                             resolve_rust_call_edge(
                                 caller_id,
                                 method_name,
@@ -5362,6 +5975,10 @@ fn extract_calls_rust(
                                 package_dir,
                                 node_pkg_map,
                                 true,
+                                file_imported_names,
+                                rel_path,
+                                receiver_type.as_deref(),
+                                method_to_class,
                                 edges,
                             );
                         }
@@ -5371,7 +5988,8 @@ fn extract_calls_rust(
                     if let Some(args_node) = node.child_by_field_name("arguments") {
                         scan_args_for_fn_refs(
                             args_node, source, caller_id,
-                            func_name_map, file_func_ids, package_dir, node_pkg_map, edges,
+                            func_name_map, file_func_ids, package_dir, node_pkg_map,
+                            file_imported_names, rel_path, edges,
                         );
                     }
                 }
@@ -5406,6 +6024,8 @@ fn extract_calls_rust(
                                         call_count: 1,
                                         in_error_path: false,
                                         confidence: 0.7,
+                                        call_site_line: None,
+                                        call_site_column: None,
                                     });
                                 }
                             }
@@ -5441,6 +6061,9 @@ fn extract_calls_rust(
                             file_func_ids,
                             package_dir,
                             node_pkg_map,
+                            file_imported_names,
+                            rel_path,
+                            struct_field_types,
                             edges,
                         );
                     }
@@ -5469,6 +6092,8 @@ fn scan_args_for_fn_refs(
     file_func_ids: &HashSet<String>,
     package_dir: &str,
     node_pkg_map: &HashMap<String, String>,
+    file_imported_names: &HashMap<String, HashSet<String>>,
+    rel_path: &str,
     edges: &mut Vec<CodeEdge>,
 ) {
     let mut cursor = args_node.walk();
@@ -5483,7 +6108,8 @@ fn scan_args_for_fn_refs(
             {
                 resolve_rust_call_edge(
                     caller_id, name, func_name_map, file_func_ids,
-                    package_dir, node_pkg_map, false, edges,
+                    package_dir, node_pkg_map, false,
+                    file_imported_names, rel_path, None, &HashMap::new(), edges,
                 );
             }
         }
@@ -5503,6 +6129,9 @@ fn extract_calls_from_token_tree(
     file_func_ids: &HashSet<String>,
     package_dir: &str,
     node_pkg_map: &HashMap<String, String>,
+    file_imported_names: &HashMap<String, HashSet<String>>,
+    rel_path: &str,
+    struct_field_types: &HashMap<String, HashMap<String, String>>,
     edges: &mut Vec<CodeEdge>,
 ) {
     let mut cursor = token_tree.walk();
@@ -5560,6 +6189,10 @@ fn extract_calls_from_token_tree(
                         package_dir,
                         node_pkg_map,
                         false,
+                        file_imported_names,
+                        rel_path,
+                        None,
+                        method_to_class,
                         edges,
                     );
                 }
@@ -5578,6 +6211,9 @@ fn extract_calls_from_token_tree(
                 file_func_ids,
                 package_dir,
                 node_pkg_map,
+                file_imported_names,
+                rel_path,
+                struct_field_types,
                 edges,
             );
         }
@@ -5680,14 +6316,69 @@ fn resolve_rust_call_edge(
     package_dir: &str,
     node_pkg_map: &HashMap<String, String>,
     is_method_call: bool,
+    file_imported_names: &HashMap<String, HashSet<String>>,
+    rel_path: &str,
+    receiver_type: Option<&str>,
+    method_to_class: &HashMap<String, String>,
     edges: &mut Vec<CodeEdge>,
 ) {
     if let Some(callee_ids) = func_name_map.get(callee_name) {
-        // Prioritize: same file > same package > global (limited)
+        // Level 2: If we know the receiver type, filter by it first
+        if let Some(recv_type) = receiver_type {
+            let type_matched: Vec<&String> = callee_ids
+                .iter()
+                .filter(|id| {
+                    method_to_class
+                        .get(*id)
+                        .map(|cls| {
+                            // cls is like "class:path/file.rs:TypeName"
+                            // Match if the class name contains the receiver type
+                            cls.rsplit(':').next()
+                                .map(|name| name == recv_type)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if !type_matched.is_empty() {
+                for callee_id in type_matched {
+                    if callee_id != caller_id {
+                        edges.push(CodeEdge {
+                            from: caller_id.to_string(),
+                            to: callee_id.clone(),
+                            relation: EdgeRelation::Calls,
+                            weight: 0.5,
+                            call_count: 1,
+                            in_error_path: false,
+                            confidence: 0.95,
+                            call_site_line: None,
+                            call_site_column: None,
+                        });
+                    }
+                }
+                return;
+            }
+            // Fall through to normal resolution if receiver type didn't match anything
+        }
+
+        // Prioritize: same file > imported > same package > global (limited)
         let same_file: Vec<&String> = callee_ids
             .iter()
             .filter(|id| file_func_ids.contains(*id))
             .collect();
+
+        // Level 1: Import-scoped filtering
+        let imported: Vec<&String> = callee_ids
+            .iter()
+            .filter(|_id| {
+                file_imported_names
+                    .get(rel_path)
+                    .map(|names| names.contains(callee_name))
+                    .unwrap_or(false)
+            })
+            .collect();
+
         let same_pkg: Vec<&String> = callee_ids
             .iter()
             .filter(|id| {
@@ -5702,6 +6393,8 @@ fn resolve_rust_call_edge(
 
         let (targets, confidence): (Vec<&String>, f32) = if !same_file.is_empty() {
             (same_file, 0.9)
+        } else if !imported.is_empty() {
+            (imported, 0.8)
         } else if !same_pkg.is_empty() {
             (same_pkg, 0.7)
         } else if callee_ids.len() <= global_limit {
@@ -5720,6 +6413,8 @@ fn resolve_rust_call_edge(
                     call_count: 1,
                     in_error_path: false,
                     confidence,
+                    call_site_line: None,
+                    call_site_column: None,
                 });
             }
         }
@@ -5770,6 +6465,8 @@ fn resolve_rust_self_method_call(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 0.9,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -5785,6 +6482,8 @@ fn resolve_rust_self_method_call(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 0.6,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -6068,6 +6767,8 @@ fn extract_calls_typescript(
                                             call_count: 1,
                                             in_error_path: false,
                                             confidence: 0.7,
+                                            call_site_line: None,
+                                            call_site_column: None,
                                         });
                                     }
                                 }
@@ -6194,6 +6895,8 @@ fn resolve_typescript_call_edge(
                     call_count: 1,
                     in_error_path: false,
                     confidence,
+                    call_site_line: None,
+                    call_site_column: None,
                 });
             }
         }
@@ -6243,6 +6946,8 @@ fn resolve_typescript_self_method_call(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 0.9,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -6258,6 +6963,8 @@ fn resolve_typescript_self_method_call(
                         call_count: 1,
                         in_error_path: false,
                         confidence: 0.6,
+                        call_site_line: None,
+                        call_site_column: None,
                     });
                 }
             }
@@ -6313,7 +7020,7 @@ pub fn top_level() {}
 "#;
         let mut parser = Parser::new();
         let mut class_map = HashMap::new();
-        let (nodes, edges, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
+        let (nodes, edges, _, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
 
         assert!(nodes.iter().any(|n| n.name == "MyStruct"), "Should find MyStruct");
         assert!(nodes.iter().any(|n| n.name == "method"), "Should find method");
@@ -6376,7 +7083,7 @@ fn test_something() {}
 "#;
         let mut parser = Parser::new();
         let mut class_map = HashMap::new();
-        let (nodes, edges, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
+        let (nodes, edges, _, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
 
         // Structs and enums
         assert!(nodes.iter().any(|n| n.name == "Person"), "Should find Person struct");
@@ -6563,7 +7270,7 @@ pub fn create_and_use() {
         parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
         
         let mut class_map = HashMap::new();
-        let (nodes, mut edges, _) = extract_rust_tree_sitter("calc.rs", content, &mut parser, &mut class_map);
+        let (nodes, mut edges, _, _) = extract_rust_tree_sitter("calc.rs", content, &mut parser, &mut class_map);
 
         // Build func_map for call extraction
         let func_map: HashMap<String, Vec<String>> = nodes
@@ -6604,6 +7311,8 @@ pub fn create_and_use() {
             &method_to_class,
             &file_func_ids,
             &node_pkg_map,
+            &HashMap::new(),
+            &HashMap::new(),
             &mut edges,
         );
 

@@ -45,7 +45,7 @@ pub use llm::{LlmClient, ToolDefinition, SkillResult};
 pub use api_llm_client::ApiLlmClient;
 pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
 pub use composer::{compose_ritual, ProjectState as ComposerProjectState, ProjectLanguage};
-pub use v2_executor::{V2Executor, V2ExecutorConfig, NotifyFn, run_ritual};
+pub use v2_executor::{V2Executor, V2ExecutorConfig, NotifyFn, run_ritual, build_triage_prompt};
 pub use gating::{GatingConfig, GatingResult, CommandPattern, PatternType, check_gating, load_gating_config, save_gating_config};
 pub use state_machine::{
     RitualPhase as V2Phase,

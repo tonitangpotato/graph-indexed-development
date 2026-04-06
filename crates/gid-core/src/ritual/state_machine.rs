@@ -111,6 +111,9 @@ pub struct RitualState {
     /// Format: "design", "graph", "requirements" — maps to review skill name.
     #[serde(default)]
     pub review_target: Option<String>,
+    /// Triage-assessed task size: "small", "medium", "large".
+    #[serde(default)]
+    pub triage_size: Option<String>,
     /// Tokens used per phase (e.g. "design" -> 5432, "implement" -> 28000).
     #[serde(default)]
     pub phase_tokens: HashMap<String, u64>,
@@ -177,6 +180,7 @@ impl RitualState {
             phase_tokens: HashMap::new(),
             transitions: Vec::new(),
             started_at: now,
+            triage_size: None,
             updated_at: now,
         }
     }
@@ -410,6 +414,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
 
             // Store triage result for later reference
             let mut new_state = state.clone();
+            new_state.triage_size = Some(result.size.clone());
             new_state.error_context = Some(format!(
                 "triage: size={}, skip_design={}, skip_graph={}",
                 result.size, skip_design, skip_graph
@@ -515,15 +520,32 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        // Design done → Review design document
-        (Designing, SkillCompleted { .. }) => (
-            state.clone().with_phase(Reviewing).with_review_target("design"),
-            vec![
-                Notify { message: "📝 Reviewing design document...".into() },
-                SaveState,
-                RunSkill { name: "review-design".into(), context: state.task.clone() },
-            ],
-        ),
+        // Design done → Review or skip review based on whether design was updated vs created
+        (Designing, SkillCompleted { .. }) => {
+            let design_was_updated = state.project.as_ref().map_or(false, |p| p.has_design);
+            let is_large = state.triage_size.as_deref() == Some("large");
+            if design_was_updated && !is_large {
+                // Design already existed + not a large task — incremental update, skip review
+                (
+                    state.clone().with_phase(Planning),
+                    vec![
+                        Notify { message: "📝 Design updated (incremental). Skipping review → Planning...".into() },
+                        SaveState,
+                        RunPlanning,
+                    ],
+                )
+            } else {
+                // New design created — review it
+                (
+                    state.clone().with_phase(Reviewing).with_review_target("design"),
+                    vec![
+                        Notify { message: "📝 Reviewing design document...".into() },
+                        SaveState,
+                        RunSkill { name: "review-design".into(), context: state.task.clone() },
+                    ],
+                )
+            }
+        }
 
         // Planning decided → Graphing
         (Planning, PlanDecided(strategy)) => {
@@ -542,15 +564,36 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             )
         }
 
-        // Graph done → Review tasks
-        (Graphing, SkillCompleted { .. }) => (
-            state.clone().with_phase(Reviewing).with_review_target("tasks"),
-            vec![
-                Notify { message: "📝 Reviewing task breakdown...".into() },
-                SaveState,
-                RunSkill { name: "review-tasks".into(), context: state.task.clone() },
-            ],
-        ),
+        // Graph done → Review or skip review based on whether graph was updated vs created
+        (Graphing, SkillCompleted { .. }) => {
+            let graph_was_updated = state.project.as_ref().map_or(false, |p| p.has_graph);
+            let is_large = state.triage_size.as_deref() == Some("large");
+            if graph_was_updated && !is_large {
+                // Graph already existed + not large — incremental update, skip review → implement
+                let action = match &state.strategy {
+                    Some(ImplementStrategy::MultiAgent { tasks }) => RunHarness { tasks: tasks.clone() },
+                    _ => RunSkill { name: "implement".into(), context: state.task.clone() },
+                };
+                (
+                    state.clone().with_phase(Implementing),
+                    vec![
+                        Notify { message: "📊 Graph updated (incremental). Skipping review → Implementing...".into() },
+                        SaveState,
+                        action,
+                    ],
+                )
+            } else {
+                // New graph created — review it
+                (
+                    state.clone().with_phase(Reviewing).with_review_target("tasks"),
+                    vec![
+                        Notify { message: "📝 Reviewing task breakdown...".into() },
+                        SaveState,
+                        RunSkill { name: "review-tasks".into(), context: state.task.clone() },
+                    ],
+                )
+            }
+        }
 
         // ─── Review cycle transitions ─────────────────────────────────────
 
@@ -607,10 +650,11 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         ],
                     )
                 }
-                _ => (
+                other => (
                     state.clone().with_phase(Planning),
                     vec![
                         ApplyReview { approved },
+                        Notify { message: format!("⚠️ Unknown review_target '{}', defaulting to Planning", other) },
                         SaveState,
                         RunPlanning,
                     ],
@@ -659,10 +703,10 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         ],
                     )
                 }
-                _ => (
+                other => (
                     state.clone().with_phase(Planning),
                     vec![
-                        Notify { message: "⏭️ Skipping review...".into() },
+                        Notify { message: format!("⚠️ Skipping review (unknown review_target '{}'), defaulting to Planning", other) },
                         SaveState,
                         RunPlanning,
                     ],
@@ -711,10 +755,10 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         ],
                     )
                 }
-                _ => (
+                other => (
                     state.clone().with_phase(Planning),
                     vec![
-                        Notify { message: format!("⚠️ Review failed ({}), continuing...", error) },
+                        Notify { message: format!("⚠️ Review failed ({}) for unknown target '{}', defaulting to Planning", error, other) },
                         SaveState,
                         RunPlanning,
                     ],
@@ -824,9 +868,8 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        // Design failed → retry once
-        // Requirements failed → retry once, then escalate
-        (WritingRequirements, SkillFailed { error, .. }) if state.retries_for("requirements") < 1 => (
+        // Requirements failed → retry up to 2 times, then escalate
+        (WritingRequirements, SkillFailed { error, .. }) if state.retries_for("requirements") < 2 => (
             state.clone().with_phase(WritingRequirements).inc_phase_retry("requirements"),
             vec![
                 Notify { message: format!("🔄 Requirements failed, retrying... ({})", truncate(&error, 100)) },
@@ -838,7 +881,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        (Designing, SkillFailed { error, .. }) if state.retries_for("designing") < 1 => (
+        (Designing, SkillFailed { error, .. }) if state.retries_for("designing") < 2 => (
             state.clone().with_phase(Designing).inc_phase_retry("designing"),
             vec![
                 Notify { message: format!("🔄 Design failed, retrying... ({})", truncate(&error, 100)) },
@@ -854,8 +897,8 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        // Graphing failed → retry once
-        (Graphing, SkillFailed { error, .. }) if state.retries_for("graphing") < 1 => (
+        // Graphing failed → retry up to 2 times
+        (Graphing, SkillFailed { error, .. }) if state.retries_for("graphing") < 2 => (
             state.clone().with_phase(Graphing).inc_phase_retry("graphing"),
             vec![
                 Notify { message: format!("🔄 Graph generation failed, retrying... ({})", truncate(&error, 100)) },
@@ -871,8 +914,8 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        // Planning failed → retry once
-        (Planning, SkillFailed { error, .. }) if state.retries_for("planning") < 1 => (
+        // Planning failed → retry up to 2 times
+        (Planning, SkillFailed { error, .. }) if state.retries_for("planning") < 2 => (
             state.clone().with_phase(Planning).inc_phase_retry("planning"),
             vec![
                 Notify { message: format!("🔄 Planning failed, retrying... ({})", truncate(&error, 100)) },
@@ -881,8 +924,8 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             ],
         ),
 
-        // Implementing failed → retry once
-        (Implementing, SkillFailed { error, .. }) if state.retries_for("implementing") < 1 => (
+        // Implementing failed → retry up to 2 times
+        (Implementing, SkillFailed { error, .. }) if state.retries_for("implementing") < 2 => (
             state.clone().with_phase(Implementing).inc_phase_retry("implementing"),
             vec![
                 Notify { message: format!("🔄 Implementation failed, retrying... ({})", truncate(&error, 100)) },
@@ -1353,7 +1396,7 @@ mod tests {
         let mut state = idle_state()
             .with_phase(RitualPhase::Designing)
             .with_task("test".into());
-        state.phase_retries.insert("designing".into(), 1);
+        state.phase_retries.insert("designing".into(), 2);
         let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "design".into(), error: "oops".into() });
         assert_eq!(s.phase, RitualPhase::Escalated);
         assert_invariant(&s, &a);
@@ -1439,7 +1482,7 @@ mod tests {
         let mut state = idle_state()
             .with_phase(RitualPhase::Planning)
             .with_task("test".into());
-        state.phase_retries.insert("planning".into(), 1);
+        state.phase_retries.insert("planning".into(), 2);
         let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "planning".into(), error: "oops".into() });
         assert_eq!(s.phase, RitualPhase::Escalated);
         assert_invariant(&s, &a);

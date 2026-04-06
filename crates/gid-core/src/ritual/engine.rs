@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use anyhow::{Context, Result, bail};
 
+use tracing::warn;
+
 use super::definition::{
     RitualDefinition, PhaseDefinition, PhaseKind,
     SkipCondition, FailureStrategy,
@@ -184,9 +186,25 @@ impl RitualEngine {
         
         let content = std::fs::read_to_string(&state_path)
             .context("Failed to read ritual state file")?;
-        let state: RitualState = serde_json::from_str(&content)
+        let mut state: RitualState = serde_json::from_str(&content)
             .context("Failed to parse ritual state")?;
-        
+
+        // Fix orphaned Running phases: if a phase is stuck in Running status
+        // (e.g. due to a crash), reset it to Pending so it can be re-executed.
+        for phase_state in &mut state.phase_states {
+            if phase_state.status == PhaseStatus::Running {
+                warn!(
+                    "Phase '{}' was in Running state on resume (likely crashed), resetting to Pending",
+                    phase_state.phase_id
+                );
+                phase_state.status = PhaseStatus::Pending;
+                phase_state.started_at = None;
+            }
+        }
+
+        // If overall status was Running but we just reset orphaned phases, keep it Running
+        // so the engine will pick up from the current_phase index.
+
         Ok(Self {
             definition,
             state,
@@ -376,6 +394,8 @@ impl RitualEngine {
             FailureStrategy::Retry { max_attempts } => {
                 let retry_count = self.state.phase_states[phase_idx].retry_count;
                 if retry_count < *max_attempts {
+                    // Clean up stale artifacts from the failed attempt
+                    self.cleanup_phase_artifacts(phase_idx);
                     self.state.phase_states[phase_idx].retry_count += 1;
                     self.state.phase_states[phase_idx].status = PhaseStatus::Pending;
                     self.save_state()?;
@@ -494,8 +514,17 @@ impl RitualEngine {
         self.save_state()
     }
     
-    /// Cancel the ritual.
+    /// Cancel the ritual, cleaning up artifacts from incomplete phases.
     pub fn cancel(&mut self) -> Result<()> {
+        // Clean up artifacts from any in-progress or pending phases
+        for idx in 0..self.state.phase_states.len() {
+            if matches!(
+                self.state.phase_states[idx].status,
+                PhaseStatus::Running | PhaseStatus::Pending
+            ) {
+                self.cleanup_phase_artifacts(idx);
+            }
+        }
         self.state.status = RitualStatus::Cancelled;
         self.save_state()
     }
@@ -578,9 +607,13 @@ impl RitualEngine {
             PhaseKind::Harness { config_overrides } => {
                 if let Some(ref llm_client) = self.llm_client {
                     let executor = HarnessExecutor::new(&self.project_root, llm_client.clone());
-                    // Also check the phase-level harness_config
-                    let overrides = config_overrides.as_ref().or(phase.harness_config.as_ref());
-                    executor.execute_harness(phase, &context, overrides).await
+                    // Merge both config sources: phase.harness_config as base,
+                    // PhaseKind::Harness config_overrides on top (higher priority).
+                    let merged = super::executor::merge_harness_configs(
+                        phase.harness_config.as_ref(),
+                        config_overrides.as_ref(),
+                    );
+                    executor.execute_harness(phase, &context, merged.as_ref()).await
                 } else {
                     // Stub implementation when no LLM client provided
                     tracing::warn!(
@@ -644,6 +677,26 @@ impl RitualEngine {
         Ok(())
     }
     
+    /// Clean up artifacts produced by a phase (e.g. before retrying).
+    /// Removes artifact files from disk and clears the recorded artifact list.
+    fn cleanup_phase_artifacts(&mut self, phase_idx: usize) {
+        let artifacts: Vec<String> = self.state.phase_states[phase_idx].artifacts_produced.drain(..).collect();
+        let phase_id = self.state.phase_states[phase_idx].phase_id.clone();
+        for artifact_path in &artifacts {
+            let full_path = self.project_root.join(artifact_path);
+            if full_path.exists() {
+                if let Err(e) = std::fs::remove_file(&full_path) {
+                    warn!(
+                        "Failed to clean up artifact '{}' from phase '{}': {}",
+                        artifact_path, phase_id, e
+                    );
+                }
+            }
+        }
+        // Also clear from artifact manager
+        self.artifact_manager.clear_phase(&phase_id);
+    }
+
     /// Save state to disk.
     fn save_state(&self) -> Result<()> {
         // Ensure .gid directory exists

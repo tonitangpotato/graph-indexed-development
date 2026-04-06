@@ -48,15 +48,18 @@ impl ArtifactManager {
                 let matching: Vec<PathBuf> = produced.iter()
                     .filter(|p| {
                         let p_str = p.to_string_lossy();
-                        // Simple pattern matching (could use glob crate for full support)
                         if pattern.contains('*') || pattern.contains('{') {
-                            // For now, just check if the produced path contains
-                            // any part of the pattern (without wildcards)
-                            let clean_pattern = pattern
-                                .replace('*', "")
-                                .replace('{', "")
-                                .replace('}', "");
-                            p_str.contains(&clean_pattern)
+                            // Replace template variables with glob wildcards
+                            let glob_pattern = pattern
+                                .replace("{feature}", "*")
+                                .replace("{component}", "*")
+                                .replace("{module}", "*")
+                                .replace("{service}", "*");
+                            if let Ok(compiled) = glob::Pattern::new(&glob_pattern) {
+                                compiled.matches(&p_str)
+                            } else {
+                                false
+                            }
                         } else {
                             p_str.ends_with(pattern) || **p == self.project_root.join(pattern)
                         }
@@ -80,7 +83,9 @@ impl ArtifactManager {
         // For now, just replace with wildcard for glob matching
         let glob_pattern = pattern
             .replace("{feature}", "*")
-            .replace("{component}", "*");
+            .replace("{component}", "*")
+            .replace("{module}", "*")
+            .replace("{service}", "*");
         
         let full_pattern = self.project_root.join(&glob_pattern);
         let pattern_str = full_pattern.to_string_lossy().to_string();
@@ -128,7 +133,12 @@ impl ArtifactManager {
     pub fn clear(&mut self) {
         self.produced.clear();
     }
-    
+
+    /// Clear recorded artifacts for a specific phase.
+    pub fn clear_phase(&mut self, phase_id: &str) {
+        self.produced.remove(phase_id);
+    }
+
     /// Rebuild artifact records by scanning the filesystem based on phase outputs.
     pub fn rebuild_from_disk(&mut self, phases: &[super::definition::PhaseDefinition]) {
         self.produced.clear();

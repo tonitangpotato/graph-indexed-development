@@ -704,12 +704,35 @@ impl PhaseExecutor for HarnessExecutor {
     ) -> Result<PhaseResult> {
         match &phase.kind {
             PhaseKind::Harness { config_overrides } => {
-                // Also check the phase-level harness_config
-                let overrides = config_overrides.as_ref().or(phase.harness_config.as_ref());
-                self.execute_harness(phase, context, overrides).await
+                // Merge both config sources: phase.harness_config as base,
+                // PhaseKind::Harness config_overrides on top (higher priority).
+                let merged = merge_harness_configs(
+                    phase.harness_config.as_ref(),
+                    config_overrides.as_ref(),
+                );
+                self.execute_harness(phase, context, merged.as_ref()).await
             }
             _ => bail!("HarnessExecutor can only execute Harness phases"),
         }
+    }
+}
+
+/// Merge two optional HarnessConfigOverride sources.
+/// `base` is the phase-level harness_config, `top` is the PhaseKind::Harness config_overrides.
+/// Fields in `top` take priority over `base`; if both are None, returns None.
+pub fn merge_harness_configs(
+    base: Option<&HarnessConfigOverride>,
+    top: Option<&HarnessConfigOverride>,
+) -> Option<HarnessConfigOverride> {
+    match (base, top) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(t)) => Some(t.clone()),
+        (Some(b), Some(t)) => Some(HarnessConfigOverride {
+            max_concurrent: t.max_concurrent.or(b.max_concurrent),
+            max_retries: t.max_retries.or(b.max_retries),
+            model: t.model.clone().or(b.model.clone()),
+        }),
     }
 }
 

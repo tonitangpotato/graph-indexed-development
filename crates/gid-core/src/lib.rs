@@ -14,6 +14,7 @@ pub mod refactor;
 pub mod ignore;
 pub mod task_graph_knowledge;
 pub mod complexity;
+pub mod lsp_client;
 pub mod harness;
 
 // Ritual module (requires "ritual" feature)
@@ -69,6 +70,9 @@ pub use task_graph_knowledge::{
 pub use complexity::{
     Complexity, ComplexityReport, assess_complexity_from_graph, assess_complexity,
     is_high_risk_change, assess_risk_level,
+};
+pub use lsp_client::{
+    LspClient, LspEnrichmentStats, LspLocation, LspRefinementStats, LspServerConfig,
 };
 
 // Ritual re-exports (requires "ritual" feature)
