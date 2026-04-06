@@ -1013,8 +1013,11 @@ pub(crate) fn extract_calls_typescript(
 
                 if let Some((_start, _end, caller_id, caller_class)) = scope {
                     if let Some(func_node) = node.child_by_field_name("function") {
+                        let edges_before = edges.len();
+                        let callee_pos_node; // Track callee name node for position
                         match func_node.kind() {
                             "identifier" => {
+                                callee_pos_node = func_node;
                                 let callee_name = func_node.utf8_text(source).unwrap_or("");
                                 if !callee_name.is_empty() && !is_typescript_builtin(callee_name) {
                                     resolve_typescript_call_edge(
@@ -1035,6 +1038,7 @@ pub(crate) fn extract_calls_typescript(
                                 // obj.method()
                                 let obj_node = func_node.child_by_field_name("object");
                                 let prop_node = func_node.child_by_field_name("property");
+                                callee_pos_node = prop_node.unwrap_or(func_node);
 
                                 if let (Some(obj), Some(prop)) = (obj_node, prop_node) {
                                     let obj_text = obj.utf8_text(source).unwrap_or("");
@@ -1073,7 +1077,17 @@ pub(crate) fn extract_calls_typescript(
                                     }
                                 }
                             }
-                            _ => {}
+                            _ => {
+                                callee_pos_node = func_node;
+                            }
+                        }
+                        // Patch call site position on newly added edges
+                        let call_pos = callee_pos_node.start_position();
+                        for e in &mut edges[edges_before..] {
+                            if e.call_site_line.is_none() {
+                                e.call_site_line = Some(call_pos.row as u32);
+                                e.call_site_column = Some(call_pos.column as u32);
+                            }
                         }
                     }
                 }
@@ -1090,6 +1104,7 @@ pub(crate) fn extract_calls_typescript(
                 if let Some((_start, _end, caller_id, _)) = scope {
                     if let Some(constructor) = node.child_by_field_name("constructor") {
                         let class_name = constructor.utf8_text(source).unwrap_or("");
+                        let ctor_pos = constructor.start_position();
                         
                         // Skip builtins like new Promise, new Error, etc.
                         if !class_name.is_empty() 
@@ -1113,8 +1128,8 @@ pub(crate) fn extract_calls_typescript(
                                             call_count: 1,
                                             in_error_path: false,
                                             confidence: 0.7,
-                                            call_site_line: None,
-                                            call_site_column: None,
+                                            call_site_line: Some(ctor_pos.row as u32),
+                                            call_site_column: Some(ctor_pos.column as u32),
                                         });
                                     }
                                 }

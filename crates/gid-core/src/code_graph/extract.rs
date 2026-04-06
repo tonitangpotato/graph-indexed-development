@@ -410,8 +410,8 @@ impl CodeGraph {
                         call_count: edge.call_count,
                         in_error_path: edge.in_error_path,
                         confidence: edge.confidence,
-                        call_site_line: None,
-                        call_site_column: None,
+                        call_site_line: edge.call_site_line,
+                        call_site_column: edge.call_site_column,
                     });
                 }
             } else if edge.to.starts_with("module_ref:") {
@@ -435,8 +435,8 @@ impl CodeGraph {
                         call_count: edge.call_count,
                         in_error_path: edge.in_error_path,
                         confidence: edge.confidence,
-                        call_site_line: None,
-                        call_site_column: None,
+                        call_site_line: edge.call_site_line,
+                        call_site_column: edge.call_site_column,
                     });
                 }
             } else if edge.to.starts_with("func_ref:") {
@@ -451,8 +451,8 @@ impl CodeGraph {
                             call_count: edge.call_count,
                             in_error_path: edge.in_error_path,
                             confidence: edge.confidence,
-                            call_site_line: None,
-                            call_site_column: None,
+                            call_site_line: edge.call_site_line,
+                            call_site_column: edge.call_site_column,
                         });
                     }
                 }

@@ -1024,18 +1024,20 @@ pub(crate) fn extract_calls_rust(
 
                         if is_self_call {
                             // Extract method name from field_expression
-                            let method_name = func_node.child_by_field_name("field")
+                            let method_name_node = func_node.child_by_field_name("field")
                                 .or_else(|| {
                                     // fallback: last child that is field_identifier
                                     let mut cursor = func_node.walk();
                                     func_node.children(&mut cursor)
                                         .filter(|c| c.kind() == "field_identifier")
                                         .last()
-                                })
+                                });
+                            let method_name = method_name_node
                                 .and_then(|n| n.utf8_text(source).ok())
                                 .unwrap_or("");
 
                             if !method_name.is_empty() && !is_rust_builtin(method_name) {
+                                let edges_before = edges.len();
                                 resolve_rust_self_method_call(
                                     caller_id,
                                     method_name,
@@ -1045,11 +1047,20 @@ pub(crate) fn extract_calls_rust(
                                     file_func_ids,
                                     edges,
                                 );
+                                // Patch call site position using the method name node
+                                let call_pos = method_name_node.unwrap_or(func_node).start_position();
+                                for e in &mut edges[edges_before..] {
+                                    if e.call_site_line.is_none() {
+                                        e.call_site_line = Some(call_pos.row as u32);
+                                        e.call_site_column = Some(call_pos.column as u32);
+                                    }
+                                }
                             }
                         } else {
                             let callee_name = extract_rust_call_target(func_node, source);
                             
                             if !callee_name.is_empty() && !is_rust_builtin(&callee_name) {
+                                let edges_before = edges.len();
                                 resolve_rust_call_edge(
                                     caller_id,
                                     &callee_name,
@@ -1064,6 +1075,14 @@ pub(crate) fn extract_calls_rust(
                                     method_to_class,
                                     edges,
                                 );
+                                // Patch call site position using the callee identifier node
+                                let call_pos = func_node.start_position();
+                                for e in &mut edges[edges_before..] {
+                                    if e.call_site_line.is_none() {
+                                        e.call_site_line = Some(call_pos.row as u32);
+                                        e.call_site_column = Some(call_pos.column as u32);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1090,8 +1109,8 @@ pub(crate) fn extract_calls_rust(
 
                 if let Some((_start, _end, caller_id, impl_ctx)) = scope {
                     // Get method name
-                    let method_name = node
-                        .child_by_field_name("name")
+                    let method_name_node = node.child_by_field_name("name");
+                    let method_name = method_name_node
                         .and_then(|n| n.utf8_text(source).ok())
                         .unwrap_or("");
 
@@ -1101,6 +1120,7 @@ pub(crate) fn extract_calls_rust(
                             .and_then(|n| n.utf8_text(source).ok())
                             .unwrap_or("");
 
+                        let edges_before = edges.len();
                         if receiver == "self" || receiver == "Self" {
                             // Self method call — resolve within impl type
                             resolve_rust_self_method_call(
@@ -1134,6 +1154,14 @@ pub(crate) fn extract_calls_rust(
                                 edges,
                             );
                         }
+                        // Patch call site position using the method name node
+                        let call_pos = method_name_node.unwrap_or(node).start_position();
+                        for e in &mut edges[edges_before..] {
+                            if e.call_site_line.is_none() {
+                                e.call_site_line = Some(call_pos.row as u32);
+                                e.call_site_column = Some(call_pos.column as u32);
+                            }
+                        }
                     }
                     
                     // Scan arguments for function references
@@ -1151,10 +1179,11 @@ pub(crate) fn extract_calls_rust(
                 let call_line = node.start_position().row + 1;
 
                 // Get macro name
-                let macro_name = node
-                    .child_by_field_name("macro")
+                let macro_name_node = node.child_by_field_name("macro");
+                let macro_name = macro_name_node
                     .and_then(|n| n.utf8_text(source).ok())
                     .unwrap_or("");
+                let macro_call_pos = macro_name_node.unwrap_or(node).start_position();
 
                 let scope = scope_map
                     .iter()
@@ -1176,8 +1205,8 @@ pub(crate) fn extract_calls_rust(
                                         call_count: 1,
                                         in_error_path: false,
                                         confidence: 0.7,
-                                        call_site_line: None,
-                                        call_site_column: None,
+                                        call_site_line: Some(macro_call_pos.row as u32),
+                                        call_site_column: Some(macro_call_pos.column as u32),
                                     });
                                 }
                             }
@@ -1258,11 +1287,20 @@ pub(crate) fn scan_args_for_fn_refs(
                 && !is_rust_builtin(name)
                 && name.chars().next().map(|c| c.is_lowercase()).unwrap_or(false)
             {
+                let edges_before = edges.len();
                 resolve_rust_call_edge(
                     caller_id, name, func_name_map, file_func_ids,
                     package_dir, node_pkg_map, false,
                     file_imported_names, rel_path, None, &HashMap::new(), edges,
                 );
+                // Patch call site position using the identifier node
+                let call_pos = child.start_position();
+                for e in &mut edges[edges_before..] {
+                    if e.call_site_line.is_none() {
+                        e.call_site_line = Some(call_pos.row as u32);
+                        e.call_site_column = Some(call_pos.column as u32);
+                    }
+                }
             }
         }
     }
@@ -1306,6 +1344,7 @@ pub(crate) fn extract_calls_from_token_tree(
             {
                 let method_name = method.utf8_text(source).unwrap_or("");
                 if !method_name.is_empty() && !is_rust_builtin(method_name) {
+                    let edges_before = edges.len();
                     resolve_rust_self_method_call(
                         caller_id,
                         method_name,
@@ -1315,6 +1354,14 @@ pub(crate) fn extract_calls_from_token_tree(
                         file_func_ids,
                         edges,
                     );
+                    // Patch call site position using the method identifier node
+                    let call_pos = method.start_position();
+                    for e in &mut edges[edges_before..] {
+                        if e.call_site_line.is_none() {
+                            e.call_site_line = Some(call_pos.row as u32);
+                            e.call_site_column = Some(call_pos.column as u32);
+                        }
+                    }
                 }
                 i += 4;
                 continue;
@@ -1333,6 +1380,7 @@ pub(crate) fn extract_calls_from_token_tree(
                     // Skip common non-function identifiers in format strings
                     && callee_name.chars().next().map(|c| c.is_lowercase()).unwrap_or(false)
                 {
+                    let edges_before = edges.len();
                     resolve_rust_call_edge(
                         caller_id,
                         callee_name,
@@ -1347,6 +1395,14 @@ pub(crate) fn extract_calls_from_token_tree(
                         method_to_class,
                         edges,
                     );
+                    // Patch call site position using the identifier node
+                    let call_pos = child.start_position();
+                    for e in &mut edges[edges_before..] {
+                        if e.call_site_line.is_none() {
+                            e.call_site_line = Some(call_pos.row as u32);
+                            e.call_site_column = Some(call_pos.column as u32);
+                        }
+                    }
                 }
             }
         }

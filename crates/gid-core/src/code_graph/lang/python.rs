@@ -549,8 +549,10 @@ pub(crate) fn extract_calls_from_tree(
             if let Some((_start, _end, caller_id, caller_class)) = scope {
                 if let Some(function_node) = node.child_by_field_name("function") {
                     let edges_before = edges.len();
+                    let callee_pos_node; // Track the callee name node for position
                     match function_node.kind() {
                         "identifier" => {
+                            callee_pos_node = Some(function_node);
                             let callee_name = function_node.utf8_text(source).unwrap_or("");
                             if !callee_name.is_empty() && !is_python_builtin(callee_name) {
                                 resolve_and_add_call_edge(
@@ -571,6 +573,7 @@ pub(crate) fn extract_calls_from_tree(
                         "attribute" => {
                             let obj_node = function_node.child_by_field_name("object");
                             let attr_node = function_node.child_by_field_name("attribute");
+                            callee_pos_node = attr_node.or(Some(function_node));
 
                             if let (Some(obj), Some(attr)) = (obj_node, attr_node) {
                                 let obj_text = obj.utf8_text(source).unwrap_or("");
@@ -604,7 +607,18 @@ pub(crate) fn extract_calls_from_tree(
                                 }
                             }
                         }
-                        _ => {}
+                        _ => {
+                            callee_pos_node = Some(function_node);
+                        }
+                    }
+                    // Patch call site position on newly added edges
+                    let pos_node = callee_pos_node.unwrap_or(function_node);
+                    let call_pos = pos_node.start_position();
+                    for e in &mut edges[edges_before..] {
+                        if e.call_site_line.is_none() {
+                            e.call_site_line = Some(call_pos.row as u32);
+                            e.call_site_column = Some(call_pos.column as u32);
+                        }
                     }
                     if error_path {
                         for edge in edges[edges_before..].iter_mut() {
