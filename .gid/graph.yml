@@ -836,7 +836,7 @@ nodes:
 # Layer 0: Foundation
 - id: ug-t0.1-edge-source-helper
   title: 'Edge.source() helper method'
-  status: todo
+  status: done
   type: task
   description: 'Add pub fn source(&self) -> Option<&str> on Edge. Extracts metadata.source from Option<serde_json::Value>. Covers ADR-2 convention.'
   tags: [unified-graph, layer-0, p0]
@@ -845,7 +845,7 @@ nodes:
     files: 'crates/gid-core/src/graph.rs'
 - id: ug-t0.2-layer-filter-helpers
   title: 'Layer filtering helpers on Graph (code_nodes, project_nodes, etc.)'
-  status: todo
+  status: done
   type: task
   description: 'Add code_nodes(), project_nodes(), code_edges(), project_edges(), bridge_edges() on Graph. Update summary() and ready_tasks() to exclude code nodes.'
   tags: [unified-graph, layer-0, p0]
@@ -856,7 +856,7 @@ nodes:
 # Layer 1: Extract Core
 - id: ug-t1.1-codegraph-conversion
   title: 'CodeGraph → Graph node/edge conversion (unify.rs)'
-  status: todo
+  status: done
   type: task
   description: 'Create codegraph_to_graph_nodes() in new unify.rs. Maps CodeNode→Node (source=extract, node_type=code, node_kind=raw). Maps CodeEdge→Edge with snake_case relations.'
   tags: [unified-graph, layer-1, p0]
@@ -865,7 +865,7 @@ nodes:
     files: 'crates/gid-core/src/unify.rs'
 - id: ug-t1.2-extract-writes-graphyml
   title: 'Extract writes code nodes to graph.yml (core change)'
-  status: todo
+  status: done
   type: task
   description: 'Modify extract flow: parse→CodeGraph→convert→load graph.yml→remove old code nodes→append new→atomic write. --force clears all code nodes. No more code_graph.json output.'
   tags: [unified-graph, layer-1, p0]
@@ -874,7 +874,7 @@ nodes:
     files: 'crates/gid-cli/src/main.rs, crates/gid-core/src/unify.rs'
 - id: ug-t1.3-extract-meta-semantics
   title: 'Update extract-meta.json to reference graph.yml node IDs'
-  status: todo
+  status: done
   type: task
   description: 'FileState.node_ids now refers to graph.yml nodes. Incremental extract removes changed files nodes from graph.yml. Update extract-meta.json after extract.'
   tags: [unified-graph, layer-1, p1]
@@ -885,7 +885,7 @@ nodes:
 # Layer 2: Auto-features
 - id: ug-t2.1-auto-semantify
   title: 'Auto-semantify after extract + --no-semantify flag'
-  status: todo
+  status: done
   type: task
   description: 'After code nodes written to graph.yml, auto-run semantify on code nodes. Add --no-semantify flag to skip.'
   tags: [unified-graph, layer-2, p0]
@@ -894,7 +894,7 @@ nodes:
     files: 'crates/gid-cli/src/main.rs, crates/gid-core/src/semantify.rs'
 - id: ug-t2.2-bridge-edges
   title: 'Bridge edge generation (code_paths + fallback matching)'
-  status: todo
+  status: done
   type: task
   description: 'Generate maps_to bridge edges. Priority: code_paths metadata > ID prefix matching. Delete all auto-bridge edges first, then regenerate. Confidence: 1.0/0.8.'
   tags: [unified-graph, layer-2, p1]
@@ -903,7 +903,7 @@ nodes:
     files: 'crates/gid-core/src/unify.rs'
 - id: ug-t2.3-layer-cli
   title: '--layer and --type CLI filters for all commands'
-  status: todo
+  status: done
   type: task
   description: 'Add --layer <code|project|all> to tasks/visual/read/query. Per-command defaults. Add --type filter for query. Layer→node filter→edge filter (both endpoints visible).'
   tags: [unified-graph, layer-2, p0]
@@ -912,7 +912,7 @@ nodes:
     files: 'crates/gid-cli/src/main.rs, crates/gid-core/src/query.rs'
 - id: ug-t2.4-stats-layer
   title: 'gid stats per-layer breakdown'
-  status: todo
+  status: done
   type: task
   description: 'Update gid stats to show project/code/bridge counts.'
   tags: [unified-graph, layer-2, p2]
@@ -923,7 +923,7 @@ nodes:
 # Layer 3: Migration & Deprecation
 - id: ug-t3.1-working-mem-migration
   title: 'working_mem.rs: CodeGraph → Graph parameter migration'
-  status: todo
+  status: done
   type: task
   description: 'Change query_gid_context, analyze_impact params from &CodeGraph to &Graph. Use graph.code_nodes() internally. Update FunctionInfo to accept &Node.'
   tags: [unified-graph, layer-3, p0]
@@ -932,7 +932,7 @@ nodes:
     files: 'crates/gid-core/src/working_mem.rs'
 - id: ug-t3.2-cli-extract-migration
   title: 'CLI cmd_extract: remove build_unified_graph() call'
-  status: todo
+  status: done
   type: task
   description: 'cmd_extract stops calling build_unified_graph(). Extract writes to graph.yml (T1.2), then reloads.'
   tags: [unified-graph, layer-3, p0]
@@ -941,7 +941,7 @@ nodes:
     files: 'crates/gid-cli/src/main.rs'
 - id: ug-t3.3-scheduler-migration
   title: 'harness scheduler: remove build_unified_graph() call'
-  status: todo
+  status: done
   type: task
   description: 'post_layer_extract loads graph from graph.yml directly.'
   tags: [unified-graph, layer-3, p0]
@@ -950,7 +950,7 @@ nodes:
     files: 'crates/gid-core/src/harness/scheduler.rs'
 - id: ug-t3.4-ritual-executor-migration
   title: 'ritual executor: remove build_unified_graph() call'
-  status: todo
+  status: done
   type: task
   description: 'Extract phase in ritual uses graph.yml directly.'
   tags: [unified-graph, layer-3, p0]
@@ -959,7 +959,7 @@ nodes:
     files: 'crates/gid-core/src/ritual/executor.rs'
 - id: ug-t3.5-deprecate-unified
   title: 'Deprecate build_unified_graph(), mark CodeGraph pub API'
-  status: todo
+  status: done
   type: task
   description: 'Add #[deprecated] to build_unified_graph(), merge_relevant_code(), link_tasks_to_code(). Remove re-exports from lib.rs.'
   tags: [unified-graph, layer-3, p1]
@@ -968,7 +968,7 @@ nodes:
     files: 'crates/gid-core/src/unified.rs, crates/gid-core/src/lib.rs'
 - id: ug-t3.6-schema-migration
   title: 'gid schema: read from graph.yml code nodes first'
-  status: todo
+  status: done
   type: task
   description: 'gid schema reads code nodes from graph.yml. If found → generate schema. If not → fallback to running extract.'
   tags: [unified-graph, layer-3, p1]
@@ -997,7 +997,7 @@ nodes:
     files: 'rustclaw/src/tools.rs'
 - id: ug-t4.3-cross-layer-test
   title: 'ADR-5 verification: cross-layer query integration test'
-  status: todo
+  status: done
   type: task
   description: 'Test task→feature→code traversal via bridge edges. Verify impact() and deps() cross layers. No query engine changes needed.'
   tags: [unified-graph, layer-4, p0]
@@ -1006,7 +1006,7 @@ nodes:
     files: 'crates/gid-core/src/query.rs'
 - id: ug-t4.4-perf-benchmark
   title: 'Performance benchmark: extract + tasks latency'
-  status: todo
+  status: done
   type: task
   description: 'Benchmark gid tasks with 0 vs 2000 code nodes (<2x). Benchmark extract time (<1.2x). 500 files, 2000 nodes.'
   tags: [unified-graph, layer-4, p1]

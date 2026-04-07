@@ -464,10 +464,11 @@ impl GidCommandExecutor {
                     context.project_root.join(&args[0])
                 };
                 let code_graph = crate::code_graph::CodeGraph::extract_from_dir(&src_dir);
-                let graph = crate::load_graph(&graph_path).unwrap_or_default();
-                let unified = crate::unified::build_unified_graph(&code_graph, &graph);
-                let stats = unified.summary();
-                crate::save_graph(&unified, &graph_path)?;
+                let mut graph = crate::load_graph(&graph_path).unwrap_or_default();
+                let (code_nodes, code_edges) = crate::unify::codegraph_to_graph_nodes(&code_graph, &context.project_root);
+                crate::unify::merge_code_layer(&mut graph, code_nodes, code_edges);
+                let stats = graph.summary();
+                crate::save_graph(&graph, &graph_path)?;
                 Ok(format!("Extracted code graph: {} total nodes, {} edges", stats.total_nodes, stats.total_edges))
             }
             "plan" => {

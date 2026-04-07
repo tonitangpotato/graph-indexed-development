@@ -1,7 +1,8 @@
 //! Unify — convert CodeGraph to graph::Node/Edge for unified graph storage.
+//! Also provides reverse conversion (Graph → CodeGraph) for legacy command compatibility.
 
 use crate::graph::{Graph, Node, Edge, NodeStatus};
-use crate::code_graph::CodeGraph;
+use crate::code_graph::{CodeGraph, CodeNode, CodeEdge, NodeKind, EdgeRelation};
 
 
 /// Convert CodeGraph nodes and edges to graph-layer Nodes and Edges.
@@ -61,6 +62,101 @@ pub fn codegraph_to_graph_nodes(cg: &CodeGraph, _project_root: &std::path::Path)
     }
 
     (nodes, edges)
+}
+
+/// Reconstruct a CodeGraph from graph.yml code-layer nodes and edges.
+///
+/// This is the reverse of `codegraph_to_graph_nodes()`. Used by legacy CLI commands
+/// (schema, code-search, code-trace, etc.) that still operate on CodeGraph APIs.
+/// Reads only code-layer nodes (`source == "extract"`) and code-layer edges.
+pub fn graph_to_codegraph(graph: &Graph) -> CodeGraph {
+    let code_nodes_refs = graph.code_nodes();
+    let code_edges_refs = graph.code_edges();
+
+    let mut nodes = Vec::with_capacity(code_nodes_refs.len());
+    let mut edges = Vec::with_capacity(code_edges_refs.len());
+
+    for n in &code_nodes_refs {
+        let kind = match n.node_kind.as_deref() {
+            Some("File") => NodeKind::File,
+            Some("Class") => NodeKind::Class,
+            Some("Function") => NodeKind::Function,
+            Some("Module") => NodeKind::Module,
+            Some("Constant") => NodeKind::Constant,
+            Some("Interface") => NodeKind::Interface,
+            Some("Enum") => NodeKind::Enum,
+            Some("TypeAlias") => NodeKind::TypeAlias,
+            Some("Trait") => NodeKind::Trait,
+            Some("Method") => NodeKind::Function, // Methods map to Function in CodeGraph
+            _ => NodeKind::File, // safe fallback
+        };
+
+        let is_test = n.metadata.get("is_test")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let line_count = n.metadata.get("line_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let decorators: Vec<String> = n.metadata.get("decorators")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+
+        nodes.push(CodeNode {
+            id: n.id.clone(),
+            kind,
+            name: n.title.clone(),
+            file_path: n.file_path.as_deref().unwrap_or("").to_string(),
+            line: n.start_line,
+            decorators,
+            signature: n.signature.clone(),
+            docstring: n.doc_comment.clone(),
+            line_count,
+            is_test,
+        });
+    }
+
+    for e in &code_edges_refs {
+        let relation = match e.relation.as_str() {
+            "imports" => EdgeRelation::Imports,
+            "inherits" => EdgeRelation::Inherits,
+            "defined_in" => EdgeRelation::DefinedIn,
+            "calls" => EdgeRelation::Calls,
+            "tests_for" => EdgeRelation::TestsFor,
+            "overrides" => EdgeRelation::Overrides,
+            "implements" => EdgeRelation::Implements,
+            "belongs_to" => EdgeRelation::BelongsTo,
+            _ => continue, // skip non-code relations
+        };
+
+        let meta = e.metadata.as_ref();
+        let weight = meta.and_then(|m| m.get("weight")).and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+        let call_count = meta.and_then(|m| m.get("call_count")).and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        let in_error_path = meta.and_then(|m| m.get("in_error_path")).and_then(|v| v.as_bool()).unwrap_or(false);
+        let confidence = meta.and_then(|m| m.get("confidence")).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+
+        edges.push(CodeEdge {
+            from: e.from.clone(),
+            to: e.to.clone(),
+            relation,
+            weight,
+            call_count,
+            in_error_path,
+            confidence,
+            call_site_line: None,
+            call_site_column: None,
+        });
+    }
+
+    let mut cg = CodeGraph {
+        nodes,
+        edges,
+        outgoing: Default::default(),
+        incoming: Default::default(),
+        node_index: Default::default(),
+    };
+    cg.build_indexes();
+    cg
 }
 
 /// Merge code-layer nodes/edges into an existing graph.
@@ -536,5 +632,124 @@ mod tests {
         println!("summary() — project_only: {:?}, mixed: {:?}, ratio: {:.2}x", summary_project, summary_mixed, summary_ratio);
 
         assert!(summary_mixed.as_millis() < 100, "summary() on 2050-node graph should be < 100ms for {} iters", iterations);
+    }
+
+    #[test]
+    fn test_graph_to_codegraph_roundtrip() {
+        use crate::code_graph::{CodeGraph, CodeNode, CodeEdge, NodeKind, EdgeRelation};
+
+        // Build a CodeGraph
+        let mut cg = CodeGraph {
+            nodes: vec![
+                CodeNode {
+                    id: "file:src/main.rs".to_string(),
+                    kind: NodeKind::File,
+                    name: "main.rs".to_string(),
+                    file_path: "src/main.rs".to_string(),
+                    line: None,
+                    decorators: vec![],
+                    signature: None,
+                    docstring: None,
+                    line_count: 100,
+                    is_test: false,
+                },
+                CodeNode {
+                    id: "fn:src/main.rs:main".to_string(),
+                    kind: NodeKind::Function,
+                    name: "main".to_string(),
+                    file_path: "src/main.rs".to_string(),
+                    line: Some(10),
+                    decorators: vec!["#[tokio::main]".to_string()],
+                    signature: Some("async fn main() -> Result<()>".to_string()),
+                    docstring: Some("Entry point".to_string()),
+                    line_count: 50,
+                    is_test: false,
+                },
+                CodeNode {
+                    id: "class:src/lib.rs:Config".to_string(),
+                    kind: NodeKind::Class,
+                    name: "Config".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    line: Some(1),
+                    decorators: vec![],
+                    signature: None,
+                    docstring: None,
+                    line_count: 20,
+                    is_test: true,
+                },
+            ],
+            edges: vec![
+                CodeEdge {
+                    from: "fn:src/main.rs:main".to_string(),
+                    to: "file:src/main.rs".to_string(),
+                    relation: EdgeRelation::DefinedIn,
+                    weight: 0.5,
+                    call_count: 1,
+                    in_error_path: false,
+                    confidence: 1.0,
+                    call_site_line: None,
+                    call_site_column: None,
+                },
+                CodeEdge {
+                    from: "fn:src/main.rs:main".to_string(),
+                    to: "class:src/lib.rs:Config".to_string(),
+                    relation: EdgeRelation::Calls,
+                    weight: 0.8,
+                    call_count: 3,
+                    in_error_path: true,
+                    confidence: 0.9,
+                    call_site_line: None,
+                    call_site_column: None,
+                },
+            ],
+            outgoing: Default::default(),
+            incoming: Default::default(),
+            node_index: Default::default(),
+        };
+        cg.build_indexes();
+
+        // Forward: CodeGraph → Graph nodes/edges
+        let (graph_nodes, graph_edges) = codegraph_to_graph_nodes(&cg, std::path::Path::new("."));
+        let mut graph = Graph::new();
+        graph.nodes = graph_nodes;
+        graph.edges = graph_edges;
+
+        // Reverse: Graph → CodeGraph
+        let roundtrip = graph_to_codegraph(&graph);
+
+        // Verify nodes
+        assert_eq!(roundtrip.nodes.len(), 3);
+        let file_node = roundtrip.nodes.iter().find(|n| n.id == "file:src/main.rs").unwrap();
+        assert_eq!(file_node.kind, NodeKind::File);
+        assert_eq!(file_node.name, "main.rs");
+        assert_eq!(file_node.line_count, 100);
+        assert!(!file_node.is_test);
+
+        let fn_node = roundtrip.nodes.iter().find(|n| n.id == "fn:src/main.rs:main").unwrap();
+        assert_eq!(fn_node.kind, NodeKind::Function);
+        assert_eq!(fn_node.signature.as_deref(), Some("async fn main() -> Result<()>"));
+        assert_eq!(fn_node.docstring.as_deref(), Some("Entry point"));
+        assert_eq!(fn_node.line, Some(10));
+        assert_eq!(fn_node.decorators, vec!["#[tokio::main]".to_string()]);
+
+        let class_node = roundtrip.nodes.iter().find(|n| n.id == "class:src/lib.rs:Config").unwrap();
+        assert_eq!(class_node.kind, NodeKind::Class);
+        assert!(class_node.is_test);
+
+        // Verify edges
+        assert_eq!(roundtrip.edges.len(), 2);
+        let defined_edge = roundtrip.edges.iter().find(|e| e.relation == EdgeRelation::DefinedIn).unwrap();
+        assert_eq!(defined_edge.from, "fn:src/main.rs:main");
+        assert_eq!(defined_edge.to, "file:src/main.rs");
+
+        let calls_edge = roundtrip.edges.iter().find(|e| e.relation == EdgeRelation::Calls).unwrap();
+        assert_eq!(calls_edge.call_count, 3);
+        assert!(calls_edge.in_error_path);
+        assert!((calls_edge.weight - 0.8).abs() < 0.01);
+        assert!((calls_edge.confidence - 0.9).abs() < 0.01);
+
+        // Verify indexes were built
+        assert!(!roundtrip.node_index.is_empty());
+        assert!(!roundtrip.outgoing.is_empty());
     }
 }

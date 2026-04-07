@@ -24,7 +24,7 @@ use super::types::{
     ExecutionEvent, VerifyResult, TaskInfo, TaskResult, NewTask,
 };
 use crate::code_graph::CodeGraph;
-use crate::unified::build_unified_graph;
+
 use crate::advise::analyze as advise_analyze;
 use crate::save_graph;
 
@@ -491,9 +491,9 @@ async fn post_layer_extract(graph: &mut Graph) -> Result<()> {
     info!(project_root = %project_root.display(), "Extracting code graph");
     let code_graph = CodeGraph::extract_from_dir(&src_dir);
     
-    // Merge code nodes into existing graph, preserving semantic nodes
-    let unified = build_unified_graph(&code_graph, graph);
-    *graph = unified;
+    // Convert CodeGraph → graph nodes/edges and merge into existing graph
+    let (code_nodes, code_edges) = crate::unify::codegraph_to_graph_nodes(&code_graph, &project_root);
+    crate::unify::merge_code_layer(graph, code_nodes, code_edges);
     
     info!(
         code_nodes = code_graph.nodes.len(),

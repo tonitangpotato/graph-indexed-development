@@ -6,9 +6,10 @@ mod llm_client;
 // ApiLlmClient now lives in gid-core (ritual::api_llm_client)
 
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::io::{self, Read};
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use gid_core::{
     Graph, Node, Edge, NodeStatus,
     load_graph, save_graph,
@@ -18,7 +19,7 @@ use gid_core::{
     CodeGraph, CodeNode, NodeKind,
     analyze_impact, analyze_impact_filtered, format_impact_for_llm,
     assess_complexity_from_graph, assess_risk_level,
-    build_unified_graph,
+    unify::{codegraph_to_graph_nodes, merge_code_layer, graph_to_codegraph},
     // New modules
     HistoryManager,
     render, VisualFormat,
@@ -67,7 +68,11 @@ enum Commands {
     },
 
     /// Read and dump the graph as YAML
-    Read,
+    Read {
+        /// Filter by layer: code, project, all (default: all)
+        #[arg(long, value_enum, default_value = "all")]
+        layer: LayerFilter,
+    },
 
     /// Validate the graph (cycles, orphans, missing refs)
     Validate,
@@ -80,6 +85,9 @@ enum Commands {
         /// Show only ready tasks (todo with all deps done)
         #[arg(short, long)]
         ready: bool,
+        /// Filter by layer: code, project, all (default: project)
+        #[arg(long, value_enum, default_value = "project")]
+        layer: LayerFilter,
     },
 
     /// Update a task's status
@@ -173,6 +181,9 @@ enum Commands {
         /// Force full rebuild (ignore cached metadata)
         #[arg(long)]
         force: bool,
+        /// Skip auto-semantify after extract
+        #[arg(long)]
+        no_semantify: bool,
     },
 
     /// Analyze a file's code dependencies
@@ -310,6 +321,9 @@ enum Commands {
         /// Output to file instead of stdout
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Filter by layer: code, project, all (default: all)
+        #[arg(long, value_enum, default_value = "all")]
+        layer: LayerFilter,
     },
 
     /// Analyze graph and suggest improvements
@@ -396,6 +410,12 @@ enum QueryCommands {
         /// Filter by edge relation(s), comma-separated (e.g., depends_on,implements)
         #[arg(short, long)]
         relation: Option<String>,
+        /// Filter by layer: code, project, all (default: all)
+        #[arg(long, value_enum, default_value = "all")]
+        layer: LayerFilter,
+        /// Filter results by node_type (e.g., code, task, feature)
+        #[arg(long, name = "type")]
+        type_filter: Option<String>,
     },
 
     /// Show dependencies of a node
@@ -408,6 +428,12 @@ enum QueryCommands {
         /// Filter by edge relation(s), comma-separated (e.g., depends_on,implements)
         #[arg(long)]
         relation: Option<String>,
+        /// Filter by layer: code, project, all (default: all)
+        #[arg(long, value_enum, default_value = "all")]
+        layer: LayerFilter,
+        /// Filter results by node_type (e.g., code, task, feature)
+        #[arg(long, name = "type")]
+        type_filter: Option<String>,
     },
 
     /// Find path between two nodes
@@ -551,14 +577,53 @@ enum RitualCommands {
     Templates,
 }
 
+/// Layer filter for graph commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LayerFilter {
+    /// Code nodes only (source == "extract")
+    Code,
+    /// Project nodes only (source == "project" or None)
+    Project,
+    /// All nodes
+    All,
+}
+
+/// Apply a layer filter to a graph, returning a new graph with only the matching
+/// nodes and edges whose both endpoints are in the visible set.
+fn apply_layer_filter(graph: &Graph, layer: LayerFilter) -> Graph {
+    match layer {
+        LayerFilter::All => graph.clone(),
+        _ => {
+            let visible_ids: HashSet<String> = match layer {
+                LayerFilter::Code => graph.code_nodes().into_iter().map(|n| n.id.clone()).collect(),
+                LayerFilter::Project => graph.project_nodes().into_iter().map(|n| n.id.clone()).collect(),
+                LayerFilter::All => unreachable!(),
+            };
+            let nodes: Vec<Node> = graph.nodes.iter()
+                .filter(|n| visible_ids.contains(&n.id))
+                .cloned()
+                .collect();
+            let edges: Vec<Edge> = graph.edges.iter()
+                .filter(|e| visible_ids.contains(&e.from) && visible_ids.contains(&e.to))
+                .cloned()
+                .collect();
+            Graph {
+                project: graph.project.clone(),
+                nodes,
+                edges,
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Init { name, desc } => cmd_init(name, desc, cli.json),
-        Commands::Read => cmd_read(resolve_graph_path(cli.graph)?, cli.json),
+        Commands::Read { layer } => cmd_read(resolve_graph_path(cli.graph)?, layer, cli.json),
         Commands::Validate => cmd_validate(resolve_graph_path(cli.graph)?, cli.json),
-        Commands::Tasks { status, ready } => cmd_tasks(resolve_graph_path(cli.graph)?, status, ready, cli.json),
+        Commands::Tasks { status, ready, layer } => cmd_tasks(resolve_graph_path(cli.graph)?, status, ready, layer, cli.json),
         Commands::TaskUpdate { id, status } => cmd_task_update(resolve_graph_path(cli.graph)?, &id, &status, cli.json),
         Commands::Complete { id } => cmd_complete(resolve_graph_path(cli.graph)?, &id, cli.json),
         Commands::AddNode { id, title, desc, status, tags, node_type } => {
@@ -572,16 +637,16 @@ fn main() -> Result<()> {
             cmd_remove_edge(resolve_graph_path(cli.graph)?, &from, &to, relation.as_deref(), cli.json)
         }
         Commands::Query(qc) => match qc {
-            QueryCommands::Impact { node, relation } => cmd_query_impact(resolve_graph_path(cli.graph)?, &node, relation.as_deref(), cli.json),
-            QueryCommands::Deps { node, transitive, relation } => {
-                cmd_query_deps(resolve_graph_path(cli.graph)?, &node, transitive, relation.as_deref(), cli.json)
+            QueryCommands::Impact { node, relation, layer, type_filter } => cmd_query_impact(resolve_graph_path(cli.graph)?, &node, relation.as_deref(), layer, type_filter.as_deref(), cli.json),
+            QueryCommands::Deps { node, transitive, relation, layer, type_filter } => {
+                cmd_query_deps(resolve_graph_path(cli.graph)?, &node, transitive, relation.as_deref(), layer, type_filter.as_deref(), cli.json)
             }
             QueryCommands::Path { from, to } => cmd_query_path(resolve_graph_path(cli.graph)?, &from, &to, cli.json),
             QueryCommands::CommonCause { a, b } => cmd_query_common(resolve_graph_path(cli.graph)?, &a, &b, cli.json),
             QueryCommands::Topo => cmd_query_topo(resolve_graph_path(cli.graph)?, cli.json),
         },
         Commands::EditGraph { operations } => cmd_edit_graph(resolve_graph_path(cli.graph)?, &operations, cli.json),
-        Commands::Extract { dir, format, output, lsp, force } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp, force),
+        Commands::Extract { dir, format, output, lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp, force, no_semantify),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
         Commands::CodeFailures { changed, p2p, f2p, dir } => cmd_code_failures(&dir, &changed, p2p.as_deref(), f2p.as_deref(), cli.json),
@@ -604,7 +669,7 @@ fn main() -> Result<()> {
                 HistoryCommands::Restore { version, force } => cmd_history_restore(&graph_path, gid_dir, &version, force, cli.json),
             }
         }
-        Commands::Visual { format, output } => cmd_visual(resolve_graph_path(cli.graph)?, &format, output.as_deref(), cli.json),
+        Commands::Visual { format, output, layer } => cmd_visual(resolve_graph_path(cli.graph)?, &format, output.as_deref(), layer, cli.json),
         Commands::Advise { errors_only } => cmd_advise(resolve_graph_path(cli.graph)?, errors_only, cli.json),
         Commands::Design { requirements, parse } => cmd_design(requirements, parse, cli.graph, cli.json),
         Commands::Semantify { heuristic, parse } => cmd_semantify(resolve_graph_path(cli.graph)?, heuristic, parse, cli.json),
@@ -707,12 +772,13 @@ fn cmd_init(name: Option<String>, desc: Option<String>, json: bool) -> Result<()
     Ok(())
 }
 
-fn cmd_read(path: PathBuf, json: bool) -> Result<()> {
+fn cmd_read(path: PathBuf, layer: LayerFilter, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
+    let filtered = apply_layer_filter(&graph, layer);
     if json {
-        println!("{}", serde_json::to_string_pretty(&graph)?);
+        println!("{}", serde_json::to_string_pretty(&filtered)?);
     } else {
-        let yaml = serde_yaml::to_string(&graph)?;
+        let yaml = serde_yaml::to_string(&filtered)?;
         print!("{}", yaml);
     }
     Ok(())
@@ -744,16 +810,17 @@ fn cmd_validate(path: PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tasks(path: PathBuf, status_filter: Option<String>, ready_only: bool, json: bool) -> Result<()> {
+fn cmd_tasks(path: PathBuf, status_filter: Option<String>, ready_only: bool, layer: LayerFilter, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
+    let filtered = apply_layer_filter(&graph, layer);
 
     let tasks: Vec<&Node> = if ready_only {
-        graph.ready_tasks()
+        filtered.ready_tasks()
     } else if let Some(status_str) = &status_filter {
         let status: NodeStatus = status_str.parse()?;
-        graph.tasks_by_status(&status)
+        filtered.tasks_by_status(&status)
     } else {
-        graph.nodes.iter().collect()
+        filtered.nodes.iter().collect()
     };
 
     if json {
@@ -766,7 +833,7 @@ fn cmd_tasks(path: PathBuf, status_filter: Option<String>, ready_only: bool, jso
                 "description": t.description,
             })
         }).collect();
-        let summary = graph.summary();
+        let summary = filtered.summary();
         println!("{}", serde_json::json!({
             "tasks": tasks_json,
             "summary": {
@@ -791,7 +858,7 @@ fn cmd_tasks(path: PathBuf, status_filter: Option<String>, ready_only: bool, jso
                 println!("{} {} — {}{}", status_icon(&task.status), task.id, task.title, tags);
             }
         }
-        let summary = graph.summary();
+        let summary = filtered.summary();
         println!("\n{}", summary);
     }
 
@@ -973,30 +1040,46 @@ fn cmd_remove_edge(path: PathBuf, from: &str, to: &str, relation: Option<&str>, 
     Ok(())
 }
 
-fn cmd_query_impact(path: PathBuf, node: &str, relation: Option<&str>, json: bool) -> Result<()> {
+fn cmd_query_impact(path: PathBuf, node: &str, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
+    let filtered = apply_layer_filter(&graph, layer);
 
-    if graph.get_node(node).is_none() {
+    if filtered.get_node(node).is_none() {
+        // Try original graph in case node was filtered out
+        if graph.get_node(node).is_some() {
+            bail!("Node '{}' exists but is not in the '{}' layer", node, match layer {
+                LayerFilter::Code => "code",
+                LayerFilter::Project => "project",
+                LayerFilter::All => "all",
+            });
+        }
         bail!("Node not found: {}", node);
     }
 
-    let engine = QueryEngine::new(&graph);
+    let engine = QueryEngine::new(&filtered);
     let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
     let impacted = match &rels {
         Some(r) => engine.impact_filtered(node, Some(r)),
         None => engine.impact(node),
     };
 
+    // Apply type filter
+    let impacted: Vec<&Node> = if let Some(tf) = type_filter {
+        impacted.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+    } else {
+        impacted
+    };
+
     if json {
         let nodes: Vec<_> = impacted.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title})).collect();
-        println!("{}", serde_json::json!({"node": node, "relation_filter": relation, "impacted": nodes}));
+        println!("{}", serde_json::json!({"node": node, "relation_filter": relation, "layer": format!("{:?}", layer), "type_filter": type_filter, "impacted": nodes}));
     } else {
         if impacted.is_empty() {
             println!("No nodes would be affected by changes to '{}'", node);
         } else {
             let filter_note = relation.map(|r| format!(" (relations: {})", r)).unwrap_or_default();
             println!("Changes to '{}' would affect {} node(s){}:", node, impacted.len(), filter_note);
-            for n in impacted {
+            for n in &impacted {
                 println!("  {} — {}", n.id, n.title);
             }
         }
@@ -1004,25 +1087,40 @@ fn cmd_query_impact(path: PathBuf, node: &str, relation: Option<&str>, json: boo
     Ok(())
 }
 
-fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, relation: Option<&str>, json: bool) -> Result<()> {
+fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
+    let filtered = apply_layer_filter(&graph, layer);
 
-    if graph.get_node(node).is_none() {
+    if filtered.get_node(node).is_none() {
+        if graph.get_node(node).is_some() {
+            bail!("Node '{}' exists but is not in the '{}' layer", node, match layer {
+                LayerFilter::Code => "code",
+                LayerFilter::Project => "project",
+                LayerFilter::All => "all",
+            });
+        }
         bail!("Node not found: {}", node);
     }
 
-    let engine = QueryEngine::new(&graph);
+    let engine = QueryEngine::new(&filtered);
     let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
     let deps = match &rels {
         Some(r) => engine.deps_filtered(node, transitive, Some(r)),
         None => engine.deps(node, transitive),
     };
 
+    // Apply type filter
+    let deps: Vec<&Node> = if let Some(tf) = type_filter {
+        deps.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+    } else {
+        deps
+    };
+
     if json {
         let nodes: Vec<_> = deps.iter().map(|n| serde_json::json!({
             "id": n.id, "title": n.title, "status": n.status.to_string()
         })).collect();
-        println!("{}", serde_json::json!({"node": node, "transitive": transitive, "relation_filter": relation, "dependencies": nodes}));
+        println!("{}", serde_json::json!({"node": node, "transitive": transitive, "relation_filter": relation, "layer": format!("{:?}", layer), "type_filter": type_filter, "dependencies": nodes}));
     } else {
         let label = if transitive { "Transitive" } else { "Direct" };
         let filter_note = relation.map(|r| format!(" (relations: {})", r)).unwrap_or_default();
@@ -1030,7 +1128,7 @@ fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, relation: Option<
             println!("'{}' has no {} dependencies{}", node, label.to_lowercase(), filter_note);
         } else {
             println!("{} dependencies of '{}' ({}){}:", label, node, deps.len(), filter_note);
-            for n in deps {
+            for n in &deps {
                 println!("  {} {} — {}", status_icon(&n.status), n.id, n.title);
             }
         }
@@ -1207,7 +1305,7 @@ fn cmd_edit_graph(path: PathBuf, operations_json: &str, json: bool) -> Result<()
     Ok(())
 }
 
-fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool) -> Result<()> {
+fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool, no_semantify: bool) -> Result<()> {
     let dir = if dir.is_absolute() {
         dir.clone()
     } else {
@@ -1276,89 +1374,124 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
         }
     }
     
-    // Load existing graph if output file exists (for merge behavior)
-    let existing_graph = if let Some(out_path) = output {
-        if out_path.exists() {
-            load_graph(out_path).ok()
-        } else {
-            None
-        }
+    // Save code_graph.json (backward compat)
+    let code_graph_json = serde_json::to_string_pretty(&code_graph)?;
+    std::fs::write(&graph_path, &code_graph_json)?;
+
+    // Convert CodeGraph to graph nodes/edges
+    let (code_nodes, code_edges) = codegraph_to_graph_nodes(&code_graph, &dir);
+
+    // Load existing graph.yml (preserves project tasks)
+    let graph_yml_path = gid_dir.join("graph.yml");
+    let mut graph = if graph_yml_path.exists() {
+        load_graph(&graph_yml_path).unwrap_or_default()
     } else {
-        None
+        Graph::default()
     };
-    
-    // Convert to unified Graph format
-    let task_graph = existing_graph.unwrap_or_else(Graph::default);
-    let unified = build_unified_graph(&code_graph, &task_graph);
-    
+
+    // Merge code layer (replaces old extract nodes, preserves project nodes)
+    let code_node_count = code_nodes.len();
+    let code_edge_count = code_edges.len();
+    merge_code_layer(&mut graph, code_nodes, code_edges);
+
+    // Atomic write: tmp → rename
+    let tmp_path = graph_yml_path.with_extension("yml.tmp");
+    let yaml = serde_yaml::to_string(&graph)?;
+    std::fs::write(&tmp_path, &yaml)?;
+    std::fs::rename(&tmp_path, &graph_yml_path)?;
+
+    if !json_flag {
+        let project_count = graph.project_nodes().len();
+        eprintln!("✓ Wrote {} code nodes + {} code edges to graph.yml ({} project nodes preserved)",
+            code_node_count, code_edge_count, project_count);
+    }
+
+    // Auto-semantify: assign architectural layers to code nodes
+    if !no_semantify {
+        let assigned = apply_heuristic_layers(&mut graph);
+
+        // Generate bridge edges between project and code nodes
+        gid_core::unify::generate_bridge_edges(&mut graph);
+        let bridge_count = graph.bridge_edges().len();
+
+        // Re-write graph.yml with semantified results
+        let tmp_path2 = graph_yml_path.with_extension("yml.tmp");
+        let yaml2 = serde_yaml::to_string(&graph)?;
+        std::fs::write(&tmp_path2, &yaml2)?;
+        std::fs::rename(&tmp_path2, &graph_yml_path)?;
+
+        if !json_flag {
+            eprintln!("✓ Auto-semantify: assigned layers to {} nodes, generated {} bridge edges",
+                assigned, bridge_count);
+        }
+    }
+
+    // Build output string for display / --output
     let output_str = match format {
-        "yaml" | "yml" => serde_yaml::to_string(&unified)?,
-        "json" => serde_json::to_string_pretty(&unified)?,
+        "yaml" | "yml" => serde_yaml::to_string(&graph)?,
+        "json" => serde_json::to_string_pretty(&graph)?,
         "summary" | _ => {
             if json_flag {
-                serde_json::to_string_pretty(&unified)?
+                serde_json::to_string_pretty(&graph)?
             } else {
-                // Count nodes by node_type from unified graph
-                let file_count = unified.nodes.iter()
-                    .filter(|n| n.node_type.as_deref() == Some("file"))
+                // Count from merged graph
+                let file_count = graph.nodes.iter()
+                    .filter(|n| n.node_kind.as_deref() == Some("File") && n.source.as_deref() == Some("extract"))
                     .count();
-                let class_count = unified.nodes.iter()
-                    .filter(|n| n.node_type.as_deref() == Some("class"))
+                let class_count = graph.nodes.iter()
+                    .filter(|n| matches!(n.node_kind.as_deref(), Some("Class") | Some("Interface") | Some("Enum") | Some("TypeAlias") | Some("Trait")) && n.source.as_deref() == Some("extract"))
                     .count();
-                let func_count = unified.nodes.iter()
-                    .filter(|n| n.node_type.as_deref() == Some("function"))
+                let func_count = graph.nodes.iter()
+                    .filter(|n| matches!(n.node_kind.as_deref(), Some("Function") | Some("Constant")) && n.source.as_deref() == Some("extract"))
                     .count();
-                let task_count = unified.nodes.iter()
-                    .filter(|n| n.node_type.is_none() || 
-                            !["file", "class", "function", "module"].contains(&n.node_type.as_deref().unwrap_or("")))
-                    .count();
-                
+                let task_count = graph.project_nodes().len();
+
                 // Count edges by relation
-                let import_count = unified.edges.iter()
+                let import_count = graph.edges.iter()
                     .filter(|e| e.relation == "imports")
                     .count();
-                let call_count = unified.edges.iter()
+                let call_count = graph.edges.iter()
                     .filter(|e| e.relation == "calls")
                     .count();
-                
+
                 let mut s = format!(
                     "Code Graph Summary\n{}\n\n",
                     "=".repeat(50)
                 );
-                s.push_str(&format!("📊 {} files, {} classes/structs, {} functions\n", 
+                s.push_str(&format!("📊 {} files, {} classes/structs, {} functions\n",
                     file_count, class_count, func_count));
                 if task_count > 0 {
                     s.push_str(&format!("📋 {} task nodes (preserved from existing graph)\n", task_count));
                 }
-                s.push_str(&format!("🔗 {} edges ({} imports, {} calls)\n\n", 
-                    unified.edges.len(), import_count, call_count));
-                
-                // Count entities per file from metadata
+                s.push_str(&format!("🔗 {} edges ({} imports, {} calls)\n\n",
+                    graph.edges.len(), import_count, call_count));
+
+                // Count entities per file using file_path field
                 let mut file_entities: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                for node in &unified.nodes {
-                    if let Some(file_path) = node.metadata.get("file_path").and_then(|v| v.as_str()) {
-                        if node.node_type.as_deref() != Some("file") {
-                            *file_entities.entry(file_path.to_string()).or_default() += 1;
+                for node in &graph.nodes {
+                    if let Some(ref fp) = node.file_path {
+                        if node.node_kind.as_deref() != Some("File") && node.source.as_deref() == Some("extract") {
+                            *file_entities.entry(fp.clone()).or_default() += 1;
                         }
                     }
                 }
                 let mut files: Vec<_> = file_entities.into_iter().collect();
                 files.sort_by(|a, b| b.1.cmp(&a.1));
-                
+
                 s.push_str("Top files by entity count:\n");
                 for (file, count) in files.iter().take(10) {
                     s.push_str(&format!("  📄 {} ({} entities)\n", file, count));
                 }
-                
+
                 if files.len() > 10 {
                     s.push_str(&format!("  ... and {} more files\n", files.len() - 10));
                 }
-                
+
                 s
             }
         }
     };
-    
+
     if let Some(out_path) = output {
         std::fs::write(out_path, &output_str)?;
         if !json_flag {
@@ -1367,7 +1500,7 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
     } else {
         print!("{}", output_str);
     }
-    
+
     Ok(())
 }
 
@@ -1377,7 +1510,7 @@ fn cmd_analyze(file: &PathBuf, show_callers: bool, show_callees: bool, show_impa
     if !json_flag {
         eprintln!("Analyzing {} (project root: {})...", file.display(), project_root.display());
     }
-    let graph = CodeGraph::extract_from_dir(&project_root);
+    let graph = load_code_graph(&project_root);
     
     let abs_file = if file.is_absolute() {
         file.clone()
@@ -1467,7 +1600,12 @@ fn cmd_analyze(file: &PathBuf, show_callers: bool, show_callees: bool, show_impa
     
     if show_impact {
         println!("\n{}\n", "=".repeat(50));
-        let analysis = analyze_impact(&[rel_path.clone()], &graph);
+        // Convert CodeGraph to Graph for impact analysis
+        let (code_nodes, code_edges) = codegraph_to_graph_nodes(&graph, &project_root);
+        let mut unified = gid_core::graph::Graph::new();
+        unified.nodes = code_nodes;
+        unified.edges = code_edges;
+        let analysis = analyze_impact(&[rel_path.clone()], &unified);
         print!("{}", format_impact_for_llm(&analysis));
     }
     
@@ -1591,10 +1729,11 @@ fn cmd_history_restore(graph_path: &PathBuf, gid_dir: &std::path::Path, version:
     Ok(())
 }
 
-fn cmd_visual(path: PathBuf, format: &str, output: Option<&std::path::Path>, json: bool) -> Result<()> {
+fn cmd_visual(path: PathBuf, format: &str, output: Option<&std::path::Path>, layer: LayerFilter, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
+    let filtered = apply_layer_filter(&graph, layer);
     let fmt: VisualFormat = format.parse()?;
-    let result = render(&graph, fmt);
+    let result = render(&filtered, fmt);
     
     if let Some(out_path) = output {
         std::fs::write(out_path, &result)?;
@@ -2019,6 +2158,34 @@ fn cmd_execute(
 
 fn cmd_stats(path: PathBuf, json: bool) -> Result<()> {
     let gid_dir = path.parent().unwrap_or(std::path::Path::new("."));
+
+    // Per-layer graph breakdown
+    let graph_yml_path = gid_dir.join("graph.yml");
+    if graph_yml_path.exists() {
+        let graph = load_graph(&graph_yml_path)?;
+        let project_node_count = graph.project_nodes().len();
+        let project_edge_count = graph.project_edges().len();
+        let code_node_count = graph.code_nodes().len();
+        let code_edge_count = graph.code_edges().len();
+        let bridge_count = graph.bridge_edges().len();
+        let total_nodes = graph.nodes.len();
+        let total_edges = graph.edges.len();
+
+        if json {
+            // Graph stats will be merged into the JSON output below
+        } else {
+            println!();
+            println!("Graph Breakdown");
+            println!("══════════════════════════════════════════════════════════");
+            println!();
+            println!("Project layer:  {} nodes, {} edges", project_node_count, project_edge_count);
+            println!("Code layer:     {} nodes, {} edges", code_node_count, code_edge_count);
+            println!("Bridge edges:   {}", bridge_count);
+            println!("Total:          {} nodes, {} edges", total_nodes, total_edges);
+            println!();
+        }
+    }
+
     let log_path = gid_dir.join("execution-log.jsonl");
 
     if !log_path.exists() {
@@ -2087,7 +2254,23 @@ fn cmd_stats(path: PathBuf, json: bool) -> Result<()> {
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&stats)?);
+        let mut stats_json = serde_json::to_value(&stats)?;
+        // Merge graph breakdown if available
+        let graph_yml_path = gid_dir.join("graph.yml");
+        if graph_yml_path.exists() {
+            if let Ok(graph) = load_graph(&graph_yml_path) {
+                stats_json["graph"] = serde_json::json!({
+                    "project_nodes": graph.project_nodes().len(),
+                    "project_edges": graph.project_edges().len(),
+                    "code_nodes": graph.code_nodes().len(),
+                    "code_edges": graph.code_edges().len(),
+                    "bridge_edges": graph.bridge_edges().len(),
+                    "total_nodes": graph.nodes.len(),
+                    "total_edges": graph.edges.len(),
+                });
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&stats_json)?);
     } else {
         println!();
         println!("Execution Statistics");
@@ -2239,9 +2422,29 @@ fn resolve_dir(dir: &PathBuf) -> Result<PathBuf> {
     Ok(d)
 }
 
+/// Load a CodeGraph from graph.yml code layer if available, otherwise fall back to extraction.
+///
+/// This is the migration bridge: commands that still use CodeGraph APIs can call this
+/// instead of `CodeGraph::extract_from_dir()`. When graph.yml has code nodes, we reconstruct
+/// a CodeGraph from them (O(n) in-memory conversion, no disk parsing). When graph.yml is
+/// missing or has no code nodes, we fall back to the expensive `extract_from_dir()`.
+fn load_code_graph(dir: &std::path::Path) -> CodeGraph {
+    // Try loading from graph.yml first
+    let graph_path = dir.join(".gid/graph.yml");
+    if graph_path.exists() {
+        if let Ok(graph) = gid_core::parser::load_graph(&graph_path) {
+            if !graph.code_nodes().is_empty() {
+                return graph_to_codegraph(&graph);
+            }
+        }
+    }
+    // Fallback: extract from source
+    CodeGraph::extract_from_dir(dir)
+}
+
 fn cmd_code_search(dir: &PathBuf, keywords_str: &str, format_llm: Option<usize>, json: bool) -> Result<()> {
     let dir = resolve_dir(dir)?;
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let keywords: Vec<&str> = keywords_str.split(',').map(|s| s.trim()).collect();
 
     if let Some(max_chars) = format_llm {
@@ -2284,7 +2487,7 @@ fn cmd_code_search(dir: &PathBuf, keywords_str: &str, format_llm: Option<usize>,
 
 fn cmd_code_failures(dir: &PathBuf, changed_str: &str, p2p: Option<&str>, f2p: Option<&str>, json: bool) -> Result<()> {
     let dir = resolve_dir(dir)?;
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let changed: Vec<&str> = changed_str.split(',').map(|s| s.trim()).collect();
     let p2p_tests: Vec<String> = p2p.unwrap_or("").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     let f2p_tests: Vec<String> = f2p.unwrap_or("").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -2305,7 +2508,7 @@ fn cmd_code_failures(dir: &PathBuf, changed_str: &str, p2p: Option<&str>, f2p: O
 
 fn cmd_code_symptoms(dir: &PathBuf, problem: &str, tests: &str, json: bool) -> Result<()> {
     let dir = resolve_dir(dir)?;
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let nodes = graph.find_symptom_nodes(problem, tests);
 
     if json {
@@ -2335,7 +2538,7 @@ fn cmd_code_symptoms(dir: &PathBuf, problem: &str, tests: &str, json: bool) -> R
 
 fn cmd_code_trace(dir: &PathBuf, symptoms_str: &str, depth: usize, max_chains: usize, json: bool) -> Result<()> {
     let dir = resolve_dir(dir)?;
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let symptom_ids: Vec<&str> = symptoms_str.split(',').map(|s| s.trim()).collect();
     let chains = graph.trace_causal_chains_from_symptoms(&symptom_ids, depth, max_chains);
 
@@ -2374,7 +2577,7 @@ fn cmd_code_trace(dir: &PathBuf, symptoms_str: &str, depth: usize, max_chains: u
 
 fn cmd_code_complexity(dir: &PathBuf, nodes_str: &str, json: bool) -> Result<()> {
     let dir = resolve_dir(dir)?;
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let keywords: Vec<&str> = nodes_str.split(',').map(|s| s.trim()).collect();
     let node_ids: Vec<&str> = keywords.clone();
 
@@ -2399,18 +2602,21 @@ fn cmd_code_complexity(dir: &PathBuf, nodes_str: &str, json: bool) -> Result<()>
 }
 
 fn cmd_code_impact(dir: &PathBuf, files_str: &str, relation: Option<&str>, json: bool) -> Result<()> {
-    use gid_core::code_graph::EdgeRelation;
-
     let dir = resolve_dir(dir)?;
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let code_graph = load_code_graph(&dir);
     let files: Vec<String> = files_str.split(',').map(|s| s.trim().to_string()).collect();
 
+    // Convert CodeGraph to Graph for impact analysis
+    let (code_nodes, code_edges) = codegraph_to_graph_nodes(&code_graph, &dir);
+    let mut graph = gid_core::graph::Graph::new();
+    graph.nodes = code_nodes;
+    graph.edges = code_edges;
+
     let analysis = if let Some(rel_str) = relation {
-        let rels: Result<Vec<EdgeRelation>, _> = rel_str
+        let rels: Vec<&str> = rel_str
             .split(',')
-            .map(|s| s.trim().parse::<EdgeRelation>())
+            .map(|s| s.trim())
             .collect();
-        let rels = rels.map_err(|e| anyhow::anyhow!("{}", e))?;
         analyze_impact_filtered(&files, &graph, Some(&rels))
     } else {
         analyze_impact(&files, &graph)
@@ -2434,7 +2640,7 @@ fn cmd_code_impact(dir: &PathBuf, files_str: &str, relation: Option<&str>, json:
 
 fn cmd_code_snippets(dir: &PathBuf, keywords_str: &str, max_lines: usize, json: bool) -> Result<()> {
     let dir = resolve_dir(dir)?;
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let keywords: Vec<&str> = keywords_str.split(',').map(|s| s.trim()).collect();
     let relevant = graph.find_relevant_nodes(&keywords);
     let snippets = graph.extract_snippets(&relevant, &dir, max_lines);
@@ -2465,7 +2671,7 @@ fn cmd_schema(dir: &PathBuf, json: bool) -> Result<()> {
     if !dir.exists() {
         bail!("Directory not found: {}", dir.display());
     }
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let schema = graph.get_schema();
     if json {
         println!("{}", serde_json::json!({"schema": schema}));
@@ -2484,7 +2690,7 @@ fn cmd_file_summary(dir: &PathBuf, file: &str, json: bool) -> Result<()> {
     if !dir.exists() {
         bail!("Directory not found: {}", dir.display());
     }
-    let graph = CodeGraph::extract_from_dir(&dir);
+    let graph = load_code_graph(&dir);
     let summary = graph.get_file_summary(file);
     if json {
         println!("{}", serde_json::json!({"file": file, "summary": summary}));

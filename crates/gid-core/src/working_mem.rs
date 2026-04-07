@@ -3,7 +3,7 @@
 //! Provides GID-based context about edited files and their impact.
 //! Used by agents to understand the blast radius of their changes.
 
-use crate::code_graph::{CodeGraph, CodeNode, EdgeRelation, NodeKind};
+use crate::graph::{Graph, Node, Edge};
 use std::collections::HashSet;
 
 // ═══ Data Structures ═══
@@ -34,21 +34,28 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-    pub fn from_code_node(node: &CodeNode, callers: usize, callees: usize) -> Self {
+    pub fn from_node(node: &Node, callers: usize, callees: usize) -> Self {
+        let kind = match node.node_kind.as_deref() {
+            Some("File") => "file",
+            Some("Class") | Some("Interface") | Some("Enum") | Some("TypeAlias") | Some("Trait") => "class",
+            Some("Function") | Some("Constant") | Some("Method") => "function",
+            Some("Module") => "module",
+            _ => "unknown",
+        };
         Self {
             id: node.id.clone(),
-            name: node.name.clone(),
-            file: node.file_path.clone(),
-            kind: match node.kind {
-                NodeKind::File => "file",
-                NodeKind::Class | NodeKind::Interface | NodeKind::Enum | NodeKind::TypeAlias | NodeKind::Trait => "class",
-                NodeKind::Function | NodeKind::Constant => "function",
-                NodeKind::Module => "module",
-            }.to_string(),
+            name: node.title.clone(),
+            file: node.file_path.as_deref().unwrap_or("").to_string(),
+            kind: kind.to_string(),
             callers,
             callees,
-            line: node.line,
+            line: node.start_line,
         }
+    }
+
+    /// Backwards-compatible alias (deprecated — use from_node).
+    pub fn from_code_node(node: &Node, callers: usize, callees: usize) -> Self {
+        Self::from_node(node, callers, callees)
     }
 }
 
@@ -82,47 +89,113 @@ impl std::fmt::Display for ErrorType {
     }
 }
 
+// ═══ Helper functions for Graph-based lookups ═══
+
+/// Count callers (incoming "calls" edges) for a node in the code layer.
+fn count_callers(node_id: &str, code_edges: &[&Edge]) -> usize {
+    code_edges.iter()
+        .filter(|e| e.to == node_id && e.relation == "calls")
+        .count()
+}
+
+/// Count callees (outgoing "calls" edges) for a node in the code layer.
+fn count_callees(node_id: &str, code_edges: &[&Edge]) -> usize {
+    code_edges.iter()
+        .filter(|e| e.from == node_id && e.relation == "calls")
+        .count()
+}
+
+/// Collect nodes impacted by a change (transitive incoming dependents).
+fn collect_impacted_nodes<'a>(
+    node_id: &str,
+    code_edges: &[&Edge],
+    graph: &'a Graph,
+    visited: &mut HashSet<String>,
+    result: &mut Vec<&'a Node>,
+) {
+    if !visited.insert(node_id.to_string()) {
+        return;
+    }
+    for edge in code_edges.iter().filter(|e| e.to == node_id) {
+        if let Some(node) = graph.get_node(&edge.from) {
+            result.push(node);
+            collect_impacted_nodes(&edge.from, code_edges, graph, visited, result);
+        }
+    }
+}
+
+/// Collect impacted nodes with optional relation filter.
+fn collect_impacted_nodes_filtered<'a>(
+    node_id: &str,
+    code_edges: &[&Edge],
+    graph: &'a Graph,
+    relations: Option<&[&str]>,
+    visited: &mut HashSet<String>,
+    result: &mut Vec<&'a Node>,
+) {
+    if !visited.insert(node_id.to_string()) {
+        return;
+    }
+    for edge in code_edges.iter().filter(|e| e.to == node_id) {
+        if let Some(rels) = relations {
+            if !rels.contains(&edge.relation.as_str()) {
+                continue;
+            }
+        }
+        if let Some(node) = graph.get_node(&edge.from) {
+            result.push(node);
+            collect_impacted_nodes_filtered(&edge.from, code_edges, graph, relations, visited, result);
+        }
+    }
+}
+
 // ═══ Context Queries ═══
 
 /// Query GID context for changed files.
 /// Returns structural data about the nodes in those files.
-pub fn query_gid_context(files_changed: &[String], graph: &CodeGraph) -> GidContext {
+pub fn query_gid_context(files_changed: &[String], graph: &Graph) -> GidContext {
+    let code_nodes = graph.code_nodes();
+    let code_edges = graph.code_edges();
     let mut nodes = Vec::new();
     let mut max_callers = 0;
     let mut total_blast = 0;
-    
+
     for file in files_changed {
         // Find all function/class nodes in this file
-        let file_nodes: Vec<&CodeNode> = graph.nodes.iter()
+        let file_nodes: Vec<&&Node> = code_nodes.iter()
             .filter(|n| {
-                n.file_path == *file
-                    && !n.is_test
-                    && matches!(n.kind, NodeKind::Function | NodeKind::Class)
+                let fp = n.file_path.as_deref().unwrap_or("");
+                let is_test = n.metadata.get("is_test").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_func_or_class = matches!(
+                    n.node_kind.as_deref(),
+                    Some("Function") | Some("Method") | Some("Class")
+                );
+                fp == file.as_str() && !is_test && is_func_or_class
             })
             .collect();
-        
+
         for node in file_nodes {
-            let callers = graph.get_callers(&node.id).len();
-            let callees = graph.get_callees(&node.id).len();
-            
+            let callers = count_callers(&node.id, &code_edges);
+            let callees = count_callees(&node.id, &code_edges);
+
             max_callers = max_callers.max(callers);
             total_blast += callers;
-            
-            nodes.push(NodeInfo::from_code_node(node, callers, callees));
+
+            nodes.push(NodeInfo::from_node(node, callers, callees));
         }
     }
-    
+
     // Sort by caller count descending, keep top 10
     nodes.sort_by(|a, b| b.callers.cmp(&a.callers));
     nodes.truncate(10);
-    
+
     // Identify hub nodes (high connectivity)
     let hub_threshold = 10;
     let hub_nodes: Vec<NodeInfo> = nodes.iter()
         .filter(|n| n.callers >= hub_threshold)
         .cloned()
         .collect();
-    
+
     GidContext {
         nodes_touched: nodes,
         max_callers,
@@ -134,45 +207,50 @@ pub fn query_gid_context(files_changed: &[String], graph: &CodeGraph) -> GidCont
 /// Find low-coupling alternative nodes near the failed files.
 /// Called after high-coupling failures to suggest safer edit targets.
 pub fn find_low_risk_alternatives(
-    graph: &CodeGraph,
+    graph: &Graph,
     failed_files: &[String],
     max_callers: usize,
 ) -> Vec<NodeInfo> {
+    let code_nodes = graph.code_nodes();
+    let code_edges = graph.code_edges();
     let mut alternatives = Vec::new();
-    
+
     // Find packages containing failed files
     let packages: HashSet<String> = failed_files.iter()
         .filter_map(|f| {
             f.rsplitn(2, '/').nth(1).map(|s| s.to_string())
         })
         .collect();
-    
-    for node in &graph.nodes {
-        if node.is_test {
+
+    for node in &code_nodes {
+        let is_test = node.metadata.get("is_test").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_test {
             continue;
         }
-        if !matches!(node.kind, NodeKind::Function) {
+        if node.node_kind.as_deref() != Some("Function") {
             continue;
         }
-        
+
+        let fp = node.file_path.as_deref().unwrap_or("");
+
         // Must be in a related package
-        let in_package = packages.iter().any(|pkg| node.file_path.starts_with(pkg));
+        let in_package = packages.iter().any(|pkg| fp.starts_with(pkg));
         if !in_package {
             continue;
         }
-        
+
         // Must not be in the same files we already tried
-        if failed_files.contains(&node.file_path) {
+        if failed_files.iter().any(|f| f == fp) {
             continue;
         }
-        
-        let callers = graph.get_callers(&node.id).len();
+
+        let callers = count_callers(&node.id, &code_edges);
         if callers <= max_callers {
-            let callees = graph.get_callees(&node.id).len();
-            alternatives.push(NodeInfo::from_code_node(node, callers, callees));
+            let callees = count_callees(&node.id, &code_edges);
+            alternatives.push(NodeInfo::from_node(node, callers, callees));
         }
     }
-    
+
     // Sort by caller count ascending (safest first)
     alternatives.sort_by_key(|n| n.callers);
     alternatives.truncate(5);
@@ -190,10 +268,10 @@ pub fn classify_error(raw_output: &str) -> ErrorType {
         (ErrorType::Name, &["NameError:"]),
         (ErrorType::Timeout, &["TimeoutError", "timed out", "TIMEOUT"]),
     ];
-    
+
     let mut best = ErrorType::Unknown;
     let mut best_count = 0;
-    
+
     for (etype, patterns) in checks {
         let count: usize = patterns.iter()
             .map(|p| raw_output.matches(p).count())
@@ -203,19 +281,19 @@ pub fn classify_error(raw_output: &str) -> ErrorType {
             best = etype.clone();
         }
     }
-    
+
     // SyntaxError is usually the root cause
     if best != ErrorType::Syntax && raw_output.contains("SyntaxError:") {
         return ErrorType::Syntax;
     }
-    
+
     best
 }
 
 /// Extract the key traceback from test output.
 pub fn extract_key_traceback(raw_output: &str, max_chars: usize) -> String {
     let traceback_marker = "Traceback (most recent call last)";
-    
+
     if let Some(pos) = raw_output.find(traceback_marker) {
         let chunk = &raw_output[pos..];
         let end = chunk.find("\n\n")
@@ -224,7 +302,7 @@ pub fn extract_key_traceback(raw_output: &str, max_chars: usize) -> String {
             .unwrap_or(chunk.len());
         return chunk[..end.min(max_chars)].to_string();
     }
-    
+
     // Fallback: look for FAILED/ERROR sections
     for marker in &["FAIL:", "ERROR:", "FAILED "] {
         if let Some(pos) = raw_output.find(marker) {
@@ -233,7 +311,7 @@ pub fn extract_key_traceback(raw_output: &str, max_chars: usize) -> String {
             return raw_output[start..end].to_string();
         }
     }
-    
+
     // Last resort: tail of output
     let start = raw_output.len().saturating_sub(max_chars);
     raw_output[start..].to_string()
@@ -274,28 +352,38 @@ impl std::fmt::Display for RiskLevel {
 }
 
 /// Analyze impact of changing files.
-pub fn analyze_impact(files_changed: &[String], graph: &CodeGraph) -> ImpactAnalysis {
+pub fn analyze_impact(files_changed: &[String], graph: &Graph) -> ImpactAnalysis {
     let gid_ctx = query_gid_context(files_changed, graph);
-    
+    let code_edges = graph.code_edges();
+
     let mut affected_source = Vec::new();
     let mut affected_tests = Vec::new();
     let mut seen = HashSet::new();
-    
-    // Get all nodes in changed files
-    let changed_node_ids: Vec<String> = graph.nodes.iter()
-        .filter(|n| files_changed.contains(&n.file_path))
+
+    // Get all nodes in changed files (code layer)
+    let changed_node_ids: Vec<String> = graph.code_nodes().iter()
+        .filter(|n| {
+            let fp = n.file_path.as_deref().unwrap_or("");
+            files_changed.iter().any(|f| f == fp)
+        })
         .map(|n| n.id.clone())
         .collect();
-    
+
     // Find affected nodes (who calls/depends on changed nodes)
     for node_id in &changed_node_ids {
-        for impacted in graph.get_impact(node_id) {
-            if seen.insert(impacted.id.clone()) {
-                let callers = graph.get_callers(&impacted.id).len();
-                let callees = graph.get_callees(&impacted.id).len();
-                let info = NodeInfo::from_code_node(impacted, callers, callees);
-                
-                if impacted.is_test {
+        let mut impacted = Vec::new();
+        let mut visited = HashSet::new();
+        collect_impacted_nodes(node_id, &code_edges, graph, &mut visited, &mut impacted);
+
+        for impacted_node in impacted {
+            if seen.insert(impacted_node.id.clone()) {
+                let callers = count_callers(&impacted_node.id, &code_edges);
+                let callees = count_callees(&impacted_node.id, &code_edges);
+                let is_test = impacted_node.metadata.get("is_test")
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                let info = NodeInfo::from_node(impacted_node, callers, callees);
+
+                if is_test {
                     affected_tests.push(info);
                 } else {
                     affected_source.push(info);
@@ -303,7 +391,7 @@ pub fn analyze_impact(files_changed: &[String], graph: &CodeGraph) -> ImpactAnal
             }
         }
     }
-    
+
     // Determine risk level
     let risk_level = match gid_ctx.max_callers {
         0..=5 => RiskLevel::Low,
@@ -311,7 +399,7 @@ pub fn analyze_impact(files_changed: &[String], graph: &CodeGraph) -> ImpactAnal
         21..=50 => RiskLevel::High,
         _ => RiskLevel::Critical,
     };
-    
+
     // Build summary
     let summary = format!(
         "Changing {} file(s) affects {} source nodes and {} test nodes. Risk: {} (max {} callers, blast radius {}).",
@@ -322,7 +410,7 @@ pub fn analyze_impact(files_changed: &[String], graph: &CodeGraph) -> ImpactAnal
         gid_ctx.max_callers,
         gid_ctx.total_blast_radius,
     );
-    
+
     ImpactAnalysis {
         affected_source,
         affected_tests,
@@ -334,28 +422,38 @@ pub fn analyze_impact(files_changed: &[String], graph: &CodeGraph) -> ImpactAnal
 /// Analyze impact of changing files, with optional edge relation filter.
 pub fn analyze_impact_filtered(
     files_changed: &[String],
-    graph: &CodeGraph,
-    relations: Option<&[EdgeRelation]>,
+    graph: &Graph,
+    relations: Option<&[&str]>,
 ) -> ImpactAnalysis {
     let gid_ctx = query_gid_context(files_changed, graph);
+    let code_edges = graph.code_edges();
 
     let mut affected_source = Vec::new();
     let mut affected_tests = Vec::new();
     let mut seen = HashSet::new();
 
-    let changed_node_ids: Vec<String> = graph.nodes.iter()
-        .filter(|n| files_changed.contains(&n.file_path))
+    let changed_node_ids: Vec<String> = graph.code_nodes().iter()
+        .filter(|n| {
+            let fp = n.file_path.as_deref().unwrap_or("");
+            files_changed.iter().any(|f| f == fp)
+        })
         .map(|n| n.id.clone())
         .collect();
 
     for node_id in &changed_node_ids {
-        for impacted in graph.get_impact_filtered(node_id, relations) {
-            if seen.insert(impacted.id.clone()) {
-                let callers = graph.get_callers(&impacted.id).len();
-                let callees = graph.get_callees(&impacted.id).len();
-                let info = NodeInfo::from_code_node(impacted, callers, callees);
+        let mut impacted = Vec::new();
+        let mut visited = HashSet::new();
+        collect_impacted_nodes_filtered(node_id, &code_edges, graph, relations, &mut visited, &mut impacted);
 
-                if impacted.is_test {
+        for impacted_node in impacted {
+            if seen.insert(impacted_node.id.clone()) {
+                let callers = count_callers(&impacted_node.id, &code_edges);
+                let callees = count_callees(&impacted_node.id, &code_edges);
+                let is_test = impacted_node.metadata.get("is_test")
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                let info = NodeInfo::from_node(impacted_node, callers, callees);
+
+                if is_test {
                     affected_tests.push(info);
                 } else {
                     affected_source.push(info);
@@ -392,9 +490,9 @@ pub fn analyze_impact_filtered(
 /// Format impact analysis for LLM consumption.
 pub fn format_impact_for_llm(analysis: &ImpactAnalysis) -> String {
     let mut result = String::new();
-    
+
     result.push_str(&format!("## Impact Analysis\n\n{}\n\n", analysis.summary));
-    
+
     if !analysis.affected_source.is_empty() {
         result.push_str("**Affected source code:**\n");
         for node in analysis.affected_source.iter().take(10) {
@@ -408,7 +506,7 @@ pub fn format_impact_for_llm(analysis: &ImpactAnalysis) -> String {
         }
         result.push('\n');
     }
-    
+
     if !analysis.affected_tests.is_empty() {
         result.push_str("**Related tests:**\n");
         for node in analysis.affected_tests.iter().take(10) {
@@ -419,14 +517,14 @@ pub fn format_impact_for_llm(analysis: &ImpactAnalysis) -> String {
         }
         result.push('\n');
     }
-    
+
     if analysis.risk_level == RiskLevel::High || analysis.risk_level == RiskLevel::Critical {
         result.push_str("⚠️ **High-risk change!** Consider:\n");
         result.push_str("- Breaking the change into smaller pieces\n");
         result.push_str("- Adding backward compatibility\n");
         result.push_str("- Running full test suite before committing\n\n");
     }
-    
+
     result
 }
 
@@ -731,7 +829,7 @@ impl WorkingMemory {
             let t = last_test.test_outcome.as_ref().unwrap();
             out.push_str(&format!("## Latest Error (Round {})\n", last_test.round));
             out.push_str(&format!("Type: {}\n", t.error_type));
-            out.push_str(&format!("Primary: {}/{}, Secondary: {}/{}\n", 
+            out.push_str(&format!("Primary: {}/{}, Secondary: {}/{}\n",
                 t.primary.0, t.primary.1, t.secondary.0, t.secondary.1));
 
             if !t.key_error_trace.is_empty() {
@@ -772,63 +870,65 @@ impl WorkingMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code_graph::{CodeEdge, EdgeRelation};
-    
+    use crate::graph::{Graph, Node, Edge, NodeStatus};
+
+    /// Helper to create a code node (source=extract).
+    fn make_code_node(id: &str, title: &str, file_path: &str, kind: &str, line: Option<usize>, is_test: bool) -> Node {
+        let mut node = Node::new(id, title);
+        node.source = Some("extract".to_string());
+        node.node_type = Some("code".to_string());
+        node.status = NodeStatus::Done;
+        node.file_path = Some(file_path.to_string());
+        node.node_kind = Some(kind.to_string());
+        node.start_line = line;
+        if is_test {
+            node.metadata.insert("is_test".to_string(), serde_json::json!(true));
+        }
+        node
+    }
+
+    /// Helper to create a code edge (source=extract in metadata).
+    fn make_code_edge(from: &str, to: &str, relation: &str) -> Edge {
+        let mut edge = Edge::new(from, to, relation);
+        edge.metadata = Some(serde_json::json!({"source": "extract"}));
+        edge
+    }
+
     #[test]
     fn test_classify_error() {
         assert_eq!(classify_error("SyntaxError: invalid syntax"), ErrorType::Syntax);
         assert_eq!(classify_error("ImportError: No module named 'foo'"), ErrorType::Import);
         assert_eq!(classify_error("AssertionError: 1 != 2"), ErrorType::Assertion);
     }
-    
+
     #[test]
     fn test_classify_syntax_overrides() {
         let output = "ImportError: ...\nSyntaxError: invalid syntax\nImportError: ...";
         assert_eq!(classify_error(output), ErrorType::Syntax);
     }
-    
+
     #[test]
     fn test_risk_level() {
-        let mut graph = CodeGraph::default();
-        
+        let mut graph = Graph::new();
+
         // Create a function with many callers
-        graph.nodes.push(CodeNode {
-            id: "func:core.py:hot_func".into(),
-            kind: NodeKind::Function,
-            name: "hot_func".into(),
-            file_path: "core.py".into(),
-            line: Some(10),
-            decorators: vec![],
-            signature: None,
-            docstring: None,
-            line_count: 20,
-            is_test: false,
-        });
-        
+        graph.add_node(make_code_node(
+            "func:core.py:hot_func", "hot_func", "core.py", "Function", Some(10), false,
+        ));
+
         // Add many callers
         for i in 0..30 {
             let caller_id = format!("func:caller{}.py:caller_{}", i, i);
-            graph.nodes.push(CodeNode {
-                id: caller_id.clone(),
-                kind: NodeKind::Function,
-                name: format!("caller_{}", i),
-                file_path: format!("caller{}.py", i),
-                line: Some(1),
-                decorators: vec![],
-                signature: None,
-                docstring: None,
-                line_count: 5,
-                is_test: false,
-            });
-            graph.edges.push(CodeEdge::new(&caller_id, "func:core.py:hot_func", EdgeRelation::Calls));
+            graph.add_node(make_code_node(
+                &caller_id, &format!("caller_{}", i), &format!("caller{}.py", i), "Function", Some(1), false,
+            ));
+            graph.add_edge(make_code_edge(&caller_id, "func:core.py:hot_func", "calls"));
         }
-        
-        graph.build_indexes();
-        
+
         let analysis = analyze_impact(&["core.py".into()], &graph);
         assert_eq!(analysis.risk_level, RiskLevel::High);
     }
-    
+
     #[test]
     fn test_extract_traceback() {
         let output = r#"

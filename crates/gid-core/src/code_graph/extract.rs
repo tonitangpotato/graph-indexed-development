@@ -227,10 +227,11 @@ fn integrate_file_results(
         state.all_struct_field_types.insert(struct_name, fields);
     }
 
-    // Add file node if we found entities
-    if !result.nodes.is_empty() {
-        state.nodes.push(CodeNode::new_file(rel_path));
-    }
+    // Always create a file node for every source file — even files that contain
+    // only re-exports (pub mod / mod / use) produce no extractable entities,
+    // but they're still part of the code structure and are referenced by
+    // BelongsTo edges (file → module).
+    state.nodes.push(CodeNode::new_file(rel_path));
 
     state.nodes.extend(result.nodes);
     state.edges.extend(result.edges);
@@ -1377,9 +1378,8 @@ impl CodeGraph {
         for (rel_path, content, lang) in &file_entries {
             if let Some(result) = parse_single_file(rel_path, content, lang, &mut parser, &mut state.class_map) {
                 let mut node_ids: Vec<String> = result.nodes.iter().map(|n| n.id.clone()).collect();
-                if !result.nodes.is_empty() {
-                    node_ids.insert(0, format!("file:{}", rel_path));
-                }
+                // Always include the file node — integrate_file_results creates it unconditionally
+                node_ids.insert(0, format!("file:{}", rel_path));
                 per_file_node_ids.insert(rel_path.clone(), node_ids);
                 integrate_file_results(&mut state, rel_path, result);
             }
