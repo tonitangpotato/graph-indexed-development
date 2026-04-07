@@ -122,6 +122,10 @@ pub struct RitualState {
     /// Tokens used per phase (e.g. "design" -> 5432, "implement" -> 28000).
     #[serde(default)]
     pub phase_tokens: HashMap<String, u64>,
+    /// Current review round (1-based). Each review target gets 2 rounds:
+    /// round 1: review → apply → round 2: review → apply → next phase.
+    #[serde(default)]
+    pub review_round: u32,
     pub transitions: Vec<TransitionRecord>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -183,6 +187,7 @@ impl RitualState {
             failed_phase: None,
             error_context: None,
             review_target: None,
+            review_round: 0,
             phase_tokens: HashMap::new(),
             transitions: Vec::new(),
             started_at: now,
@@ -225,6 +230,18 @@ impl RitualState {
 
     pub fn with_review_target(mut self, target: &str) -> Self {
         self.review_target = Some(target.to_string());
+        self
+    }
+
+    /// Set review round (1-based). Used for multi-round review cycles.
+    pub fn with_review_round(mut self, round: u32) -> Self {
+        self.review_round = round;
+        self
+    }
+
+    /// Increment review round counter.
+    pub fn inc_review_round(mut self) -> Self {
+        self.review_round += 1;
         self
     }
 
@@ -608,18 +625,51 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
 
         // ─── Review cycle transitions ─────────────────────────────────────
 
-        // Review skill completed → WaitingApproval (pause for human)
-        (Reviewing, SkillCompleted { .. }) => (
-            state.clone().with_phase(WaitingApproval),
-            vec![
-                Notify { message: "📋 Review complete. Check `.gid/reviews/` for findings.\nWhich findings should I apply? (e.g., 'apply FINDING-1,3,5' or 'apply all' or 'skip')".into() },
-                SaveState,
-            ],
-        ),
+        // Review skill completed → WaitingApproval (pause for human / auto-approve after timeout)
+        (Reviewing, SkillCompleted { .. }) => {
+            let round = state.review_round + 1; // 1-based for display
+            let target = state.review_target.as_deref().unwrap_or("unknown");
+            (
+                state.clone().with_phase(WaitingApproval).inc_review_round(),
+                vec![
+                    Notify { message: format!(
+                        "📋 Review complete ({} round {}/2). Check `.gid/reviews/` for findings.\n\
+                         Auto-applying all findings in 3 minutes if no response.",
+                        target, round
+                    )},
+                    SaveState,
+                ],
+            )
+        }
 
-        // User approves findings → apply changes (fire-and-forget), then continue to next phase
+        // User approves findings → apply changes, then either loop for round 2 or proceed.
+        // Two-round review: round 1 apply → re-review same target; round 2 apply → next phase.
         (WaitingApproval, UserApproval { approved }) => {
             let review_target = state.review_target.clone().unwrap_or_default();
+
+            // Round 1: apply findings, then loop back to Reviewing (same target) for round 2
+            if state.review_round < 2 {
+                let review_skill = match review_target.as_str() {
+                    "requirements" => "review-requirements",
+                    "design" => "review-design",
+                    "tasks" => "review-tasks",
+                    _ => "review-design",
+                };
+                return (
+                    state.clone().with_phase(Reviewing),
+                    vec![
+                        ApplyReview { approved },
+                        Notify { message: format!(
+                            "🔄 Applied round 1 findings. Starting review round 2/2 for {}...",
+                            review_target
+                        )},
+                        SaveState,
+                        RunSkill { name: review_skill.into(), context: state.task.clone() },
+                    ],
+                );
+            }
+
+            // Round 2 (or higher): apply findings and proceed to next phase, reset review_round
             match review_target.as_str() {
                 "requirements" => {
                     let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
@@ -628,20 +678,20 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         "draft-design"
                     };
                     (
-                        state.clone().with_phase(Designing),
+                        state.clone().with_phase(Designing).with_review_round(0),
                         vec![
                             ApplyReview { approved },
-                            Notify { message: format!("📝 Phase 2/5: {}...", skill) },
+                            Notify { message: format!("✅ 2 review rounds complete. Phase 2/5: {}...", skill) },
                             SaveState,
                             RunSkill { name: skill.into(), context: state.task.clone() },
                         ],
                     )
                 }
                 "design" => (
-                    state.clone().with_phase(Planning),
+                    state.clone().with_phase(Planning).with_review_round(0),
                     vec![
                         ApplyReview { approved },
-                        Notify { message: "🧠 Planning implementation strategy...".into() },
+                        Notify { message: "✅ 2 review rounds complete. 🧠 Planning implementation strategy...".into() },
                         SaveState,
                         RunPlanning,
                     ],
@@ -652,17 +702,17 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         _ => RunSkill { name: "implement".into(), context: state.task.clone() },
                     };
                     (
-                        state.clone().with_phase(Implementing),
+                        state.clone().with_phase(Implementing).with_review_round(0),
                         vec![
                             ApplyReview { approved },
-                            Notify { message: "💻 Implementing...".into() },
+                            Notify { message: "✅ 2 review rounds complete. 💻 Implementing...".into() },
                             SaveState,
                             action,
                         ],
                     )
                 }
                 other => (
-                    state.clone().with_phase(Planning),
+                    state.clone().with_phase(Planning).with_review_round(0),
                     vec![
                         ApplyReview { approved },
                         Notify { message: format!("⚠️ Unknown review_target '{}', defaulting to Planning", other) },
@@ -673,7 +723,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             }
         }
 
-        // User skips review → continue to next phase without applying
+        // User skips review → continue to next phase without applying (resets review_round)
         (WaitingApproval, UserSkipPhase) => {
             let review_target = state.review_target.clone().unwrap_or_default();
             match review_target.as_str() {
@@ -684,7 +734,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         "draft-design"
                     };
                     (
-                        state.clone().with_phase(Designing),
+                        state.clone().with_phase(Designing).with_review_round(0),
                         vec![
                             Notify { message: "⏭️ Skipping review, moving to design...".into() },
                             SaveState,
@@ -693,7 +743,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     )
                 }
                 "design" => (
-                    state.clone().with_phase(Planning),
+                    state.clone().with_phase(Planning).with_review_round(0),
                     vec![
                         Notify { message: "⏭️ Skipping review, moving to planning...".into() },
                         SaveState,
@@ -706,7 +756,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         _ => RunSkill { name: "implement".into(), context: state.task.clone() },
                     };
                     (
-                        state.clone().with_phase(Implementing),
+                        state.clone().with_phase(Implementing).with_review_round(0),
                         vec![
                             Notify { message: "⏭️ Skipping review, moving to implementation...".into() },
                             SaveState,
@@ -715,7 +765,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     )
                 }
                 other => (
-                    state.clone().with_phase(Planning),
+                    state.clone().with_phase(Planning).with_review_round(0),
                     vec![
                         Notify { message: format!("⚠️ Skipping review (unknown review_target '{}'), defaulting to Planning", other) },
                         SaveState,
@@ -1309,15 +1359,28 @@ mod tests {
         assert_eq!(s.review_target, Some("design".to_string()));
         assert_invariant(&s, &a);
 
-        // Review → WaitingApproval
+        // Review round 1 → WaitingApproval
         let (s2, a2) = transition(&s, RitualEvent::SkillCompleted { phase: "review-design".into(), artifacts: vec![] });
         assert_eq!(s2.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s2.review_round, 1);
         assert_invariant(&s2, &a2);
 
-        // Approval → Planning
+        // Approval round 1 → back to Reviewing (round 2)
         let (s3, a3) = transition(&s2, RitualEvent::UserApproval { approved: "all".into() });
-        assert_eq!(s3.phase, RitualPhase::Planning);
+        assert_eq!(s3.phase, RitualPhase::Reviewing);
         assert_invariant(&s3, &a3);
+
+        // Review round 2 → WaitingApproval
+        let (s4, a4) = transition(&s3, RitualEvent::SkillCompleted { phase: "review-design".into(), artifacts: vec![] });
+        assert_eq!(s4.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s4.review_round, 2);
+        assert_invariant(&s4, &a4);
+
+        // Approval round 2 → Planning (proceed to next phase)
+        let (s5, a5) = transition(&s4, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s5.phase, RitualPhase::Planning);
+        assert_eq!(s5.review_round, 0); // reset
+        assert_invariant(&s5, &a5);
     }
 
     #[test]
@@ -1339,12 +1402,22 @@ mod tests {
         assert_eq!(s.review_target, Some("tasks".to_string()));
         assert_invariant(&s, &a);
 
-        // Review → WaitingApproval → Approval → Implementing
+        // Review round 1 → WaitingApproval → Approval → back to Reviewing
         let (s2, _) = transition(&s, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
         assert_eq!(s2.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s2.review_round, 1);
         let (s3, a3) = transition(&s2, RitualEvent::UserApproval { approved: "all".into() });
-        assert_eq!(s3.phase, RitualPhase::Implementing);
+        assert_eq!(s3.phase, RitualPhase::Reviewing); // back for round 2
         assert_invariant(&s3, &a3);
+
+        // Review round 2 → WaitingApproval → Approval → Implementing
+        let (s4, _) = transition(&s3, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
+        assert_eq!(s4.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s4.review_round, 2);
+        let (s5, a5) = transition(&s4, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s5.phase, RitualPhase::Implementing);
+        assert_eq!(s5.review_round, 0);
+        assert_invariant(&s5, &a5);
     }
 
     #[test]
@@ -1577,13 +1650,19 @@ mod tests {
         assert_eq!(s.phase, RitualPhase::Reviewing);
         assert_invariant(&s, &a);
 
-        // Review → WaitingApproval → Approve → Implementing with Harness
+        // Review round 1 → WaitingApproval → Approve → back to Reviewing
         let (s2, _) = transition(&s, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
         let (s3, a3) = transition(&s2, RitualEvent::UserApproval { approved: "all".into() });
-        assert_eq!(s3.phase, RitualPhase::Implementing);
-        let has_harness = a3.iter().any(|a| matches!(a, RitualAction::RunHarness { .. }));
-        assert!(has_harness);
+        assert_eq!(s3.phase, RitualPhase::Reviewing); // round 2
         assert_invariant(&s3, &a3);
+
+        // Review round 2 → WaitingApproval → Approve → Implementing with Harness
+        let (s4, _) = transition(&s3, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
+        let (s5, a5) = transition(&s4, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s5.phase, RitualPhase::Implementing);
+        let has_harness = a5.iter().any(|a| matches!(a, RitualAction::RunHarness { .. }));
+        assert!(has_harness);
+        assert_invariant(&s5, &a5);
     }
 
     // ── Triage ──
@@ -1741,11 +1820,8 @@ mod tests {
 
     #[test]
     fn test_full_happy_path_trace() {
-        // Idle → Start → Init → ProjectDetected → Triage → TriageCompleted(large)
-        // → Designing → SkillCompleted → Reviewing(design) → SkillCompleted → WaitingApproval
-        // → UserApproval → Planning → PlanDecided → Graphing → SkillCompleted
-        // → Reviewing(tasks) → SkillCompleted → WaitingApproval → UserApproval
-        // → Implementing → SkillCompleted → Verifying → ShellCompleted(0) → Done
+        // Full large task path with 2-round reviews per target (requirements, design, tasks).
+        // Each review target: write → review R1 → wait → approve → review R2 → wait → approve → next
         let mut state = idle_state();
 
         let (s, a) = transition(&state, RitualEvent::Start { task: "add X".into() });
@@ -1776,14 +1852,28 @@ mod tests {
         assert_invariant(&s, &a);
         state = s;
 
-        // Review → WaitingApproval → Approve → Designing
+        // Requirements review round 1 → WaitingApproval → Approve → back to Reviewing
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-requirements".into(), artifacts: vec![] });
         assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s.review_round, 1);
+        assert_invariant(&s, &a);
+        state = s;
+
+        let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s.phase, RitualPhase::Reviewing); // round 2
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Requirements review round 2 → WaitingApproval → Approve → Designing
+        let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-requirements".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s.review_round, 2);
         assert_invariant(&s, &a);
         state = s;
 
         let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
         assert_eq!(s.phase, RitualPhase::Designing);
+        assert_eq!(s.review_round, 0); // reset
         assert_invariant(&s, &a);
         state = s;
 
@@ -1793,15 +1883,28 @@ mod tests {
         assert_invariant(&s, &a);
         state = s;
 
-        // Review complete → WaitingApproval
+        // Design review round 1 → WaitingApproval → Approve → back to Reviewing
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-design".into(), artifacts: vec![] });
         assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s.review_round, 1);
         assert_invariant(&s, &a);
         state = s;
 
-        // User approves → Planning
+        let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s.phase, RitualPhase::Reviewing); // round 2
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Design review round 2 → WaitingApproval → Approve → Planning
+        let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-design".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s.review_round, 2);
+        assert_invariant(&s, &a);
+        state = s;
+
         let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
         assert_eq!(s.phase, RitualPhase::Planning);
+        assert_eq!(s.review_round, 0);
         assert_invariant(&s, &a);
         state = s;
 
@@ -1816,14 +1919,28 @@ mod tests {
         assert_invariant(&s, &a);
         state = s;
 
-        // Review → WaitingApproval → Approve → Implementing
+        // Tasks review round 1 → WaitingApproval → Approve → back to Reviewing
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
         assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s.review_round, 1);
+        assert_invariant(&s, &a);
+        state = s;
+
+        let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
+        assert_eq!(s.phase, RitualPhase::Reviewing); // round 2
+        assert_invariant(&s, &a);
+        state = s;
+
+        // Tasks review round 2 → WaitingApproval → Approve → Implementing
+        let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "review-tasks".into(), artifacts: vec![] });
+        assert_eq!(s.phase, RitualPhase::WaitingApproval);
+        assert_eq!(s.review_round, 2);
         assert_invariant(&s, &a);
         state = s;
 
         let (s, a) = transition(&state, RitualEvent::UserApproval { approved: "all".into() });
         assert_eq!(s.phase, RitualPhase::Implementing);
+        assert_eq!(s.review_round, 0);
         assert_invariant(&s, &a);
         state = s;
 
@@ -1836,8 +1953,8 @@ mod tests {
         assert_eq!(s.phase, RitualPhase::Done);
         assert_invariant(&s, &a);
 
-        // Transitions: Init→Triage→Req→Review→WaitApproval→Design→Review→WaitApproval→Planning→Graphing→Review→WaitApproval→Implement→Verify→Done = 15
-        assert_eq!(s.transitions.len(), 15);
+        // With 2-round reviews: 3 review targets × 2 extra transitions each = 6 extra = 21 total
+        assert_eq!(s.transitions.len(), 21);
     }
 
     #[test]

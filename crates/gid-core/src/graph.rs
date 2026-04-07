@@ -77,6 +77,7 @@ pub struct Node {
     pub assigned_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Priority 0–255. SQLite stores as INTEGER; values outside 0–255 are clamped on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
     /// Node type: task, file, component, feature, layer, etc.
@@ -88,6 +89,80 @@ pub struct Node {
     /// Additional metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, serde_json::Value>,
+
+    // ── Code-graph fields (populated by `gid extract`, None for task nodes) ──
+
+    /// File path relative to the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// Programming language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// Start line number in the source file.
+    /// Note: stored as INTEGER in SQLite; clamped to usize range on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    /// End line number in the source file.
+    /// Note: stored as INTEGER in SQLite; clamped to usize range on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    /// Function/method signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Visibility: public, private, crate, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Documentation comment extracted from source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_comment: Option<String>,
+    /// Hash of the body content (for change detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
+    /// Code-level kind: Function, Struct, Impl, Trait, Enum, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
+
+    // ── Provenance fields ──
+
+    /// Owner of this node (person or team).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Source of this node (e.g., "extract", "manual", "import").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Repository this node belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+
+    // ── Hierarchy & structure fields ──
+
+    /// Parent node ID (for hierarchical relationships).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Depth in the node hierarchy (0 = root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+
+    // ── Analysis fields ──
+
+    /// Complexity score (e.g., cyclomatic complexity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<f64>,
+    /// Whether this node represents a public API surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_public: Option<bool>,
+    /// Full body/content of the node (source code, description text, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+
+    // ── Timestamps ──
+
+    /// ISO-8601 creation timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// ISO-8601 last-updated timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 impl Node {
@@ -103,6 +178,25 @@ impl Node {
             node_type: None,
             knowledge: KnowledgeNode::default(),
             metadata: HashMap::new(),
+            file_path: None,
+            lang: None,
+            start_line: None,
+            end_line: None,
+            signature: None,
+            visibility: None,
+            doc_comment: None,
+            body_hash: None,
+            node_kind: None,
+            owner: None,
+            source: None,
+            repo: None,
+            parent_id: None,
+            depth: None,
+            complexity: None,
+            is_public: None,
+            body: None,
+            created_at: None,
+            updated_at: None,
         }
     }
 
@@ -191,6 +285,9 @@ pub struct Edge {
     pub weight: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
+    /// Additional edge metadata, serialized as JSON in SQLite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 fn default_relation() -> String {
@@ -205,6 +302,7 @@ impl Edge {
             relation: relation.to_string(),
             weight: None,
             confidence: None,
+            metadata: None,
         }
     }
 

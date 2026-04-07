@@ -60,6 +60,25 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             node_type: Some(node_type.to_string()),
             knowledge: Default::default(),
             metadata,
+            file_path: Some(code_node.file_path.clone()),
+            lang: None,
+            start_line: code_node.line.map(|l| l as usize),
+            end_line: None,
+            signature: code_node.signature.clone(),
+            visibility: None,
+            doc_comment: None,
+            body_hash: None,
+            node_kind: Some(format!("{:?}", code_node.kind)),
+            owner: None,
+            source: Some("extract".to_string()),
+            repo: None,
+            parent_id: None,
+            depth: None,
+            complexity: None,
+            is_public: None,
+            body: None,
+            created_at: None,
+            updated_at: None,
         });
     }
     
@@ -103,6 +122,7 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             } else {
                 None
             },
+            metadata: None,
         });
     }
     
@@ -173,6 +193,25 @@ pub fn merge_relevant_code(
             node_type: Some(node_type.to_string()),
             knowledge: Default::default(),
             metadata,
+            file_path: Some(code_node.file_path.clone()),
+            lang: None,
+            start_line: code_node.line.map(|l| l as usize),
+            end_line: None,
+            signature: code_node.signature.clone(),
+            visibility: None,
+            doc_comment: None,
+            body_hash: None,
+            node_kind: Some(format!("{:?}", code_node.kind)),
+            owner: None,
+            source: Some("extract".to_string()),
+            repo: None,
+            parent_id: None,
+            depth: None,
+            complexity: None,
+            is_public: None,
+            body: None,
+            created_at: None,
+            updated_at: None,
         });
         
         added += 1;
@@ -213,6 +252,7 @@ pub fn link_tasks_to_code(code_graph: &CodeGraph, task_graph: &mut Graph) {
                         relation: "relates_to".to_string(),
                         weight: None,
                         confidence: None,
+                        metadata: None,
                     });
                 }
             }

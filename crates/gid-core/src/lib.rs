@@ -17,6 +17,7 @@ pub mod complexity;
 pub mod lsp_client;
 pub mod lsp_daemon;
 pub mod harness;
+pub mod storage;
 
 // Ritual module (requires "ritual" feature)
 #[cfg(feature = "ritual")]

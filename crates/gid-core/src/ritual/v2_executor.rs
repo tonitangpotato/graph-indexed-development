@@ -22,6 +22,8 @@ use super::state_machine::{
     RitualAction, RitualEvent, RitualState, ImplementStrategy,
     ProjectState as V2ProjectState,
 };
+use crate::graph::{Graph, NodeStatus};
+use crate::harness::assemble_task_context;
 
 /// Callback for sending notifications (fire-and-forget).
 pub type NotifyFn = Arc<dyn Fn(String) + Send + Sync>;
@@ -99,11 +101,11 @@ impl V2Executor {
             RitualAction::DetectProject => Some(self.detect_project().await),
             RitualAction::RunTriage { task } => Some(self.run_triage(task, state).await),
             RitualAction::RunSkill { name, context } => {
-                Some(self.run_skill(name, context).await)
+                Some(self.run_skill(name, context, state).await)
             }
             RitualAction::RunShell { command } => Some(self.run_shell(command).await),
             RitualAction::RunPlanning => Some(self.run_planning(state).await),
-            RitualAction::RunHarness { tasks } => Some(self.run_harness(tasks).await),
+            RitualAction::RunHarness { tasks } => Some(self.run_harness(tasks, state).await),
             RitualAction::Notify { message } => {
                 self.notify(message);
                 None
@@ -256,7 +258,7 @@ impl V2Executor {
         }
     }
 
-    async fn run_skill(&self, name: &str, context: &str) -> RitualEvent {
+    async fn run_skill(&self, name: &str, context: &str, state: &RitualState) -> RitualEvent {
         info!(skill = name, "Running skill phase");
 
         let llm = match &self.config.llm_client {
@@ -281,11 +283,25 @@ impl V2Executor {
             }
         };
 
+        // Enrich context for implement phases
+        let effective_context = if name == "implement" {
+            self.enrich_implement_context(context, state)
+        } else {
+            context.to_string()
+        };
+
         // Compose full prompt with context injection (§4)
-        let full_prompt = if context.is_empty() {
+        let full_prompt = if effective_context.is_empty() {
             base_prompt
         } else {
-            format!("## USER TASK\n{}\n\n## INSTRUCTIONS\n{}", context, base_prompt)
+            format!("## USER TASK\n{}\n\n## INSTRUCTIONS\n{}", effective_context, base_prompt)
+        };
+
+        // Select model and adjust iterations for review phases based on triage size
+        let (model, _max_iterations) = if name == "review" {
+            self.review_config_for_triage_size(state)
+        } else {
+            (self.config.skill_model.clone(), 100)
         };
 
         // Get tool scope for this phase
@@ -296,7 +312,7 @@ impl V2Executor {
             .run_skill(
                 &full_prompt,
                 tools,
-                &self.config.skill_model,
+                &model,
                 &self.config.project_root,
             )
             .await
@@ -380,7 +396,7 @@ impl V2Executor {
 
         // Truncate if too long (save tokens)
         let design_truncated = if design_content.len() > 15000 {
-            format!("{}...\n[TRUNCATED — {} bytes total]", &design_content[..15000], design_content.len())
+            format!("{}...\n[TRUNCATED — {} bytes total]", Self::safe_truncate(&design_content, 15000), design_content.len())
         } else {
             design_content
         };
@@ -426,7 +442,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         }
     }
 
-    async fn run_harness(&self, tasks: &[String]) -> RitualEvent {
+    async fn run_harness(&self, tasks: &[String], state: &RitualState) -> RitualEvent {
         // Harness execution is complex — for now, treat as a single skill call
         // with all tasks concatenated. Real harness support comes later.
         info!(task_count = tasks.len(), "Running harness (simplified)");
@@ -438,7 +454,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
             .collect::<Vec<_>>()
             .join("\n");
 
-        self.run_skill("implement", &context).await
+        self.run_skill("implement", &context, state).await
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -544,6 +560,22 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
 
     // ═══════════════════════════════════════════════════════════════════════
     // Helpers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Select model and iteration count for review phase based on triage size (§9).
+    fn review_config_for_triage_size(&self, state: &RitualState) -> (String, usize) {
+        let size = state.triage_size.as_deref().unwrap_or("medium");
+        
+        match size {
+            "small" => ("sonnet".to_string(), 30),
+            "medium" => (self.config.skill_model.clone(), 50),
+            "large" => (self.config.skill_model.clone(), 100),
+            _ => (self.config.skill_model.clone(), 50),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Private helpers (existing)
     // ═══════════════════════════════════════════════════════════════════════
 
     fn load_skill_prompt(&self, skill_name: &str) -> Result<String> {
@@ -742,6 +774,80 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         }
     }
 
+    /// Safe UTF-8 truncation — finds nearest char boundary.
+    fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+        if s.len() <= max_bytes {
+            return s;
+        }
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    /// Resolve the .gid/ root directory from state or config.
+    fn resolve_gid_root(&self, state: &RitualState) -> PathBuf {
+        if let Some(ref target_root) = state.target_root {
+            PathBuf::from(target_root).join(".gid")
+        } else {
+            self.config.project_root.join(".gid")
+        }
+    }
+
+    /// Load graph and assemble context for all pending task nodes.
+    /// Returns None if graph doesn't exist or has no task nodes.
+    fn build_graph_context(&self, state: &RitualState) -> Option<String> {
+        let gid_root = self.resolve_gid_root(state);
+        let graph_path = gid_root.join("graph.yml");
+
+        let content = std::fs::read_to_string(&graph_path)
+            .map_err(|e| tracing::debug!("No graph.yml found: {}", e))
+            .ok()?;
+        let graph: Graph = serde_yaml::from_str(&content)
+            .map_err(|e| tracing::warn!("Failed to parse graph: {}", e))
+            .ok()?;
+
+        let task_ids: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.node_type.as_deref() == Some("task"))
+            .filter(|n| !matches!(n.status, NodeStatus::Done))
+            .map(|n| n.id.as_str())
+            .collect();
+
+        if task_ids.is_empty() {
+            return None;
+        }
+
+        let contexts: Vec<String> = task_ids
+            .iter()
+            .filter_map(|id| {
+                assemble_task_context(&graph, id, &gid_root)
+                    .map_err(|e| tracing::warn!("Failed to assemble context for {}: {}", id, e))
+                    .ok()
+            })
+            .map(|ctx| ctx.render_prompt())
+            .collect();
+
+        if contexts.is_empty() {
+            None
+        } else {
+            Some(contexts.join("\n\n---\n\n"))
+        }
+    }
+
+    /// Enrich the task context for implementation phases.
+    /// Falls back gracefully to raw_context if graph is unavailable.
+    fn enrich_implement_context(&self, raw_context: &str, state: &RitualState) -> String {
+        let graph_context = self.build_graph_context(state);
+
+        match graph_context {
+            Some(ctx) => format!("{}\n\n## Original Task\n{}", ctx, raw_context),
+            None => raw_context.to_string(),
+        }
+    }
+
     fn scope_to_tool_definitions(&self, scope: &super::scope::ToolScope) -> Vec<ToolDefinition> {
         scope
             .allowed_tools
@@ -911,5 +1017,78 @@ mod tests {
         let event = executor.parse_planning_result(r#"{"strategy": "multi_agent", "tasks": []}"#);
         // Empty tasks should fall back to SingleLlm
         assert!(matches!(event, RitualEvent::PlanDecided(ImplementStrategy::SingleLlm)));
+    }
+
+    #[test]
+    fn test_safe_truncate_ascii() {
+        assert_eq!(V2Executor::safe_truncate("hello world", 5), "hello");
+        assert_eq!(V2Executor::safe_truncate("hello", 100), "hello");
+    }
+
+    #[test]
+    fn test_safe_truncate_utf8() {
+        let s = "你好世界"; // 4 chars, 12 bytes
+        assert_eq!(V2Executor::safe_truncate(s, 6), "你好"); // 6 bytes = 2 chars
+        assert_eq!(V2Executor::safe_truncate(s, 7), "你好"); // 7 is mid-char, round down
+        assert_eq!(V2Executor::safe_truncate(s, 12), s); // exact fit
+        assert_eq!(V2Executor::safe_truncate(s, 100), s); // larger than string
+    }
+
+    #[test]
+    fn test_render_prompt_full() {
+        use crate::harness::types::{TaskContext, TaskInfo};
+        let ctx = TaskContext {
+            task_info: TaskInfo {
+                id: "task-1".into(),
+                title: "Add auth".into(),
+                description: "Implement JWT auth middleware".into(),
+                goals: vec!["GOAL-1".into()],
+                verify: None,
+                estimated_turns: 15,
+                depends_on: vec![],
+                design_ref: None,
+                satisfies: vec!["GOAL-1".into()],
+            },
+            goals_text: vec!["GOAL-1: All endpoints require valid JWT".into()],
+            design_excerpt: Some("§3.1 Auth uses RS256 tokens...".into()),
+            dependency_interfaces: vec![],
+            guards: vec!["GUARD-1: No plaintext passwords".into()],
+        };
+        let rendered = ctx.render_prompt();
+        assert!(rendered.contains("## Task: Add auth"));
+        assert!(rendered.contains("JWT auth middleware"));
+        assert!(rendered.contains("## Design Reference"));
+        assert!(rendered.contains("RS256"));
+        assert!(rendered.contains("## Requirements"));
+        assert!(rendered.contains("GOAL-1"));
+        assert!(rendered.contains("## Guards"));
+        assert!(rendered.contains("GUARD-1"));
+    }
+
+    #[test]
+    fn test_render_prompt_partial() {
+        use crate::harness::types::{TaskContext, TaskInfo};
+        let ctx = TaskContext {
+            task_info: TaskInfo {
+                id: "task-2".into(),
+                title: "Fix bug".into(),
+                description: String::new(),
+                goals: vec![],
+                verify: None,
+                estimated_turns: 5,
+                depends_on: vec![],
+                design_ref: None,
+                satisfies: vec![],
+            },
+            goals_text: vec![],
+            design_excerpt: None,
+            dependency_interfaces: vec![],
+            guards: vec![],
+        };
+        let rendered = ctx.render_prompt();
+        assert!(rendered.contains("## Task: Fix bug"));
+        assert!(!rendered.contains("## Design Reference"));
+        assert!(!rendered.contains("## Requirements"));
+        assert!(!rendered.contains("## Guards"));
     }
 }

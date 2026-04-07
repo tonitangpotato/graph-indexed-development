@@ -69,6 +69,45 @@ pub struct TaskContext {
     pub guards: Vec<String>,
 }
 
+impl TaskContext {
+    /// Render the assembled context into a prompt-friendly string.
+    pub fn render_prompt(&self) -> String {
+        let mut parts = Vec::new();
+
+        // Task description
+        if !self.task_info.description.is_empty() {
+            parts.push(format!("## Task: {}\n{}", self.task_info.title, self.task_info.description));
+        } else {
+            parts.push(format!("## Task: {}", self.task_info.title));
+        }
+
+        // Design excerpt
+        if let Some(ref excerpt) = self.design_excerpt {
+            parts.push(format!("## Design Reference\n{}", excerpt));
+        }
+
+        // Goals
+        if !self.goals_text.is_empty() {
+            let goals = self.goals_text.join("\n");
+            parts.push(format!("## Requirements (GOALs to satisfy)\n{}", goals));
+        }
+
+        // Guards
+        if !self.guards.is_empty() {
+            let guards = self.guards.join("\n");
+            parts.push(format!("## Guards (invariants to preserve)\n{}", guards));
+        }
+
+        // Dependencies
+        if !self.dependency_interfaces.is_empty() {
+            let deps = self.dependency_interfaces.join("\n");
+            parts.push(format!("## Completed Dependencies\n{}", deps));
+        }
+
+        parts.join("\n\n")
+    }
+}
+
 /// Result of a single task execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {

@@ -131,368 +131,368 @@ nodes:
 - id: history
   title: 'History: snapshots, diff, restore'
   status: done
+  description: 'Graph history: snapshots, diff, restore'
   tags:
   - p2
   - core
-  description: 'Graph history: snapshots, diff, restore'
 - id: refactor
   title: 'Refactor: rename, merge, split, extract'
   status: done
+  description: Graph refactoring operations
   tags:
   - p2
   - core
-  description: Graph refactoring operations
 - id: semantify
   title: 'Semantify: upgrade file-level to semantic graph'
   status: done
+  description: LLM prompt generation to add semantic meaning to graph nodes
   tags:
   - p2
   - ai
-  description: LLM prompt generation to add semantic meaning to graph nodes
 - id: ignore-list
   title: 'Ignore-list: .gidignore support'
   status: done
+  description: '.gidignore: file exclusion patterns for code graph extraction'
   tags:
   - p2
   - core
-  description: '.gidignore: file exclusion patterns for code graph extraction'
 - id: json-output
   title: JSON global output flag for CLI
   status: done
+  description: JSON output format support for all CLI commands
   tags:
   - p2
   - cli
-  description: JSON output format support for all CLI commands
 - id: ritual-skill-executor
   title: 'SkillExecutor: LLM-backed skill phase execution'
   status: done
+  description: 'SkillExecutor: runs LLM-backed skill phases with tools'
   tags:
   - p0
   - ritual
-  description: 'SkillExecutor: runs LLM-backed skill phases with tools'
 - id: ritual-harness-executor
   title: 'HarnessExecutor: task harness phase execution'
   status: done
+  description: 'HarnessExecutor: runs multi-agent task harness'
   tags:
   - p0
   - ritual
-  description: 'HarnessExecutor: runs multi-agent task harness'
 - id: ritual-gid-executor
   title: 'GidCommandExecutor: wire to gid CLI commands'
   status: done
+  description: 'GidCommandExecutor: runs gid CLI commands in-process'
   tags:
   - p1
   - ritual
-  description: 'GidCommandExecutor: runs gid CLI commands in-process'
 - id: ritual-shell-executor
   title: 'ShellExecutor: validated shell command execution'
   status: done
+  description: 'ShellExecutor: validated shell command execution with policy'
   tags:
   - p1
   - ritual
-  description: 'ShellExecutor: validated shell command execution with policy'
 - id: ritual-cli-run
   title: 'gid ritual run: CLI command to execute ritual end-to-end'
   status: done
+  description: 'gid ritual run: CLI command for standalone ritual execution'
   tags:
   - p0
   - ritual
-  description: 'gid ritual run: CLI command for standalone ritual execution'
 - id: ritual-toolscope
   title: 'ToolScope: per-phase capability boundaries'
   status: done
+  description: 'ToolScope: per-phase capability boundaries (tools, paths, bash policy)'
   tags:
   - p0
   - ritual
-  description: 'ToolScope: per-phase capability boundaries (tools, paths, bash policy)'
 - id: ritual-rustclaw-integration
   title: 'RustClaw ritual integration: scope filtering in agent loop'
   status: done
+  description: 'V1 RustClaw ritual integration: scope filtering in agent loop'
   tags:
   - p0
   - ritual
-  description: 'V1 RustClaw ritual integration: scope filtering in agent loop'
 - id: ritual-notifier
   title: 'Ritual notifier: Telegram/channel updates on phase transitions'
   status: done
+  description: 'Ritual notification system: progress callbacks to external channels'
   tags:
   - p1
   - ritual
-  description: 'Ritual notification system: progress callbacks to external channels'
 - id: ritual-engine
   title: 'RitualEngine: state machine with run/approve/skip/cancel'
   status: done
+  description: 'V1 ritual engine: while-loop based phase progression'
   tags:
   - p0
   - ritual
-  description: 'V1 ritual engine: while-loop based phase progression'
 - id: ritual-definition
   title: 'RitualDefinition: YAML schema with phases, approval, skip_if'
   status: done
+  description: 'Ritual YAML definition: phases, skills, conditions, failure strategies'
   tags:
   - p0
   - ritual
-  description: 'Ritual YAML definition: phases, skills, conditions, failure strategies'
 - id: ritual-template
   title: 'Ritual templates: predefined workflows (feature, bugfix, research)'
   status: done
+  description: 'Ritual templates: full-dev-cycle, quick-impl, bugfix'
   tags:
   - p1
   - ritual
-  description: 'Ritual templates: full-dev-cycle, quick-impl, bugfix'
 - id: ritual-approval
   title: 'Approval system: required/auto/mixed per-phase gates'
   status: done
+  description: 'Phase approval gates: required/optional/auto modes'
   tags:
   - p0
   - ritual
-  description: 'Phase approval gates: required/optional/auto modes'
 - id: ritual-artifact
   title: 'Artifact checking: glob-based output verification'
   status: done
+  description: 'Artifact tracking: record and verify phase outputs'
   tags:
   - p0
   - ritual
-  description: 'Artifact tracking: record and verify phase outputs'
 - id: ritual-cli-basic
   title: gid ritual init/status/approve/skip/cancel CLI commands
   status: done
+  description: 'Ritual CLI basics: init, list, status commands'
   tags:
   - p0
   - ritual
   - cli
-  description: 'Ritual CLI basics: init, list, status commands'
 - id: harness-scheduler
   title: 'Task harness scheduler: topological ordering + parallelism'
   status: done
+  description: 'Task scheduling: dependency-aware parallel execution'
   tags:
   - p0
   - harness
-  description: 'Task scheduling: dependency-aware parallel execution'
 - id: harness-executor
   title: 'Task harness executor: run tasks with agent delegation'
   status: done
+  description: 'Harness executor: run individual tasks via LLM agent'
   tags:
   - p0
   - harness
-  description: 'Harness executor: run individual tasks via LLM agent'
 - id: harness-replanner
   title: 'Task harness replanner: dynamic re-planning on failure'
   status: done
+  description: Dynamic replanning when tasks fail
   tags:
   - p1
   - harness
-  description: Dynamic replanning when tasks fail
 - id: harness-verifier
   title: 'Task harness verifier: test execution + quality checks'
   status: done
+  description: 'Post-task verification: build/test checks'
   tags:
   - p0
   - harness
-  description: 'Post-task verification: build/test checks'
 - id: harness-context
   title: 'Task harness context: working memory + file tracking'
   status: done
+  description: Shared context management across harness tasks
   tags:
   - p0
   - harness
-  description: Shared context management across harness tasks
 - id: harness-telemetry
   title: 'Task harness telemetry: execution logging + metrics'
   status: done
+  description: 'Execution telemetry: timing, tokens, success rates'
   tags:
   - p1
   - harness
-  description: 'Execution telemetry: timing, tokens, success rates'
 - id: harness-notifier
   title: 'Task harness notifier: channel notifications on events'
   status: done
+  description: Harness notification callbacks
   tags:
   - p1
   - harness
-  description: Harness notification callbacks
 - id: harness-log-reader
   title: 'Task harness log reader: execution-log.jsonl parsing'
   status: done
+  description: Execution log reader for gidterm integration
   tags:
   - p0
   - harness
-  description: Execution log reader for gidterm integration
 - id: harness-worktree
   title: 'Task harness worktree: git branch isolation per task'
   status: done
+  description: Git worktree management for parallel task isolation
   tags:
   - p1
   - harness
-  description: Git worktree management for parallel task isolation
 - id: harness-topology
   title: 'Task harness topology: dependency DAG analysis'
   status: done
+  description: Task dependency graph topology analysis
   tags:
   - p0
   - harness
-  description: Task dependency graph topology analysis
 - id: harness-planner
   title: 'Task harness planner: initial task ordering from graph'
   status: done
+  description: Initial task planning from graph analysis
   tags:
   - p0
   - harness
-  description: Initial task planning from graph analysis
 - id: harness-config
   title: 'Task harness config: YAML configuration schema'
   status: done
+  description: 'Harness configuration: concurrency, timeouts, retry policies'
   tags:
   - p0
   - harness
-  description: 'Harness configuration: concurrency, timeouts, retry policies'
 - id: harness-execution-state
   title: 'Task harness execution state: persistence + recovery'
   status: done
+  description: 'Execution state machine: file-based harness↔gidterm protocol'
   tags:
   - p0
   - harness
-  description: 'Execution state machine: file-based harness↔gidterm protocol'
 - id: complexity
   title: Code complexity analysis (cyclomatic, cognitive)
   status: done
+  description: Code complexity assessment for change impact estimation
   tags:
   - p2
   - code-intel
-  description: Code complexity assessment for change impact estimation
 - id: parser
   title: 'Source code parser: Rust/TS/Python entity extraction'
   status: done
+  description: 'Source code parser: Rust, TypeScript, Python, Go'
   tags:
   - p1
   - code-intel
-  description: 'Source code parser: Rust, TypeScript, Python, Go'
 - id: validator
   title: 'Graph validator: consistency checks + suggestions'
   status: done
+  description: 'Graph validation: cycles, orphans, missing references'
   tags:
   - p2
   - core
-  description: 'Graph validation: cycles, orphans, missing references'
 - id: task-graph-knowledge
   title: 'Task-level knowledge cache: findings + file associations'
   status: done
+  description: Task graph knowledge extraction from code analysis
   tags:
   - p1
   - harness
-  description: Task graph knowledge extraction from code analysis
 - id: harness-types
   title: 'Harness shared types: TaskStatus, ExecutionPlan, etc.'
   status: done
+  description: Shared types for harness subsystem
   tags:
   - p0
   - harness
-  description: Shared types for harness subsystem
 - id: mcp-package
   title: MCP server TypeScript package (packages/mcp/)
   status: done
+  description: MCP server npm package configuration
   tags:
   - p2
   - integration
-  description: MCP server npm package configuration
 - id: ritual-executors-req
   title: ritual-executors requirements.md
   status: done
+  description: Requirements doc for ritual executors subsystem
   tags:
   - ritual
   - doc
   - requirements
   type: doc
-  description: Requirements doc for ritual executors subsystem
 - id: ritual-executors-design
   title: ritual-executors design.md
   status: done
+  description: Design doc for ritual executors subsystem
   tags:
   - ritual
   - doc
   - design
   type: doc
-  description: Design doc for ritual executors subsystem
 - id: ritual-cli-run-req
   title: ritual-cli-run requirements.md
   status: done
+  description: Requirements doc for ritual CLI run command
   tags:
   - ritual
   - doc
   - requirements
   type: doc
-  description: Requirements doc for ritual CLI run command
 - id: ritual-notifier-req
   title: ritual-notifier requirements.md
   status: done
+  description: Requirements doc for ritual notifier
   tags:
   - ritual
   - doc
   - requirements
   type: doc
-  description: Requirements doc for ritual notifier
 - id: mcp-server-req
   title: mcp-server requirements.md
   status: done
+  description: Requirements doc for MCP server
   tags:
   - integration
   - doc
   - requirements
   type: doc
-  description: Requirements doc for MCP server
 - id: gidterm-integration-req
   title: gidterm-integration requirements.md
   status: done
+  description: Requirements doc for gidterm integration
   tags:
   - integration
   - doc
   - requirements
   type: doc
-  description: Requirements doc for gidterm integration
 - id: core-req
   title: core requirements.md
   status: done
+  description: Requirements doc for core graph subsystem
   tags:
   - core
   - doc
   - requirements
   type: doc
-  description: Requirements doc for core graph subsystem
 - id: code-intel-req
   title: code-intel requirements.md
   status: done
+  description: Requirements doc for code intelligence subsystem
   tags:
   - code-intel
   - doc
   - requirements
   type: doc
-  description: Requirements doc for code intelligence subsystem
 - id: harness-req
   title: harness requirements.md
   status: done
+  description: Requirements doc for task harness subsystem
   tags:
   - harness
   - doc
   - requirements
   type: doc
-  description: Requirements doc for task harness subsystem
 - id: ritual-engine-req
   title: ritual-engine requirements.md
   status: done
+  description: Requirements doc for ritual engine subsystem
   tags:
   - ritual
   - doc
   - requirements
   type: doc
-  description: Requirements doc for ritual engine subsystem
 - id: gid-readme
   title: .gid/README.md
   status: done
+  description: '.gid/README.md: graph directory documentation'
   tags:
   - meta
   - doc
   type: doc
-  description: '.gid/README.md: graph directory documentation'
 - id: ritual-v2-design
   title: 'DESIGN-ritual-v2.md: pure function state machine design document'
   status: done
@@ -559,6 +559,195 @@ nodes:
   tags:
   - p0
   - ritual-v2
+- id: sqlite-schema
+  title: Create SQLite schema (nodes, edges, node_metadata, node_tags, knowledge, config, change_log tables + FTS5)
+  status: done
+  tags:
+  - storage
+  - sqlite
+  - P0
+- id: sqlite-storage-struct
+  title: Implement SqliteStorage struct (open/init DB, connection pool, WAL mode, busy timeout)
+  status: todo
+  tags:
+  - storage
+  - sqlite
+  - P0
+- id: graphstorage-trait
+  title: Define GraphStorage trait with all method signatures from design-storage.md §3
+  status: done
+  tags:
+  - storage
+  - trait
+  - P0
+- id: node-struct-extend
+  title: Extend Node struct with 14 new fields (file_path, lang, signature, etc.) per design-storage.md §12
+  status: done
+  tags:
+  - storage
+  - types
+  - P0
+- id: edge-struct-extend
+  title: Add metadata field to Edge struct per design-storage.md §12
+  status: done
+  tags:
+  - storage
+  - types
+  - P0
+- id: storage-crud
+  title: 'Implement GraphStorage CRUD: put_node, get_node, delete_node, put_edge, get_edge, delete_edge, list_nodes, list_edges'
+  status: todo
+  tags:
+  - storage
+  - crud
+  - P0
+- id: storage-metadata
+  title: 'Implement metadata/tags/knowledge ops: set_metadata, get_metadata, set_tags, get_tags, set_knowledge, get_knowledge'
+  status: todo
+  tags:
+  - storage
+  - crud
+  - P0
+- id: storage-fts
+  title: 'Implement FTS5 search: triggers for sync, search() method with rank ordering'
+  status: todo
+  tags:
+  - storage
+  - fts
+  - P1
+- id: storage-neighbors
+  title: Implement neighbors() BFS via recursive CTE (inherent method on SqliteStorage)
+  status: todo
+  tags:
+  - storage
+  - query
+  - P1
+- id: storage-error
+  title: Define StorageError enum and StorageOp variants per design-storage.md §4
+  status: done
+  tags:
+  - storage
+  - error
+  - P0
+- id: storage-tests
+  title: 'Unit tests for storage layer: CRUD round-trips, FTS sync, error paths, concurrent access'
+  status: todo
+  tags:
+  - storage
+  - test
+  - P0
+- id: migration-rawparse
+  title: Implement RawYamlNode/RawYamlEdge parsing from graph.yml with full field extraction
+  status: todo
+  tags:
+  - migration
+  - P0
+- id: migration-pipeline
+  title: 'Implement 5-phase migration pipeline: validate, init DB, migrate nodes, migrate edges, verify'
+  status: todo
+  tags:
+  - migration
+  - P0
+- id: migration-metadata
+  title: Implement metadata promotion (PROMOTED_KEYS), tags migration, knowledge migration
+  status: todo
+  tags:
+  - migration
+  - P1
+- id: migration-verify
+  title: 'Implement migration verification: round-trip count check, FTS spot-check, edge FK check'
+  status: todo
+  tags:
+  - migration
+  - P1
+- id: migration-tests
+  title: 'Migration tests: fixture YAML files, happy path, malformed YAML, duplicate IDs, empty graph'
+  status: todo
+  tags:
+  - migration
+  - test
+  - P0
+- id: history-snapshot
+  title: Implement create_snapshot() via SQLite Backup API
+  status: todo
+  tags:
+  - history
+  - P0
+- id: history-list
+  title: Implement list_snapshots() scanning snapshots/ dir with metadata extraction
+  status: todo
+  tags:
+  - history
+  - P1
+- id: history-diff
+  title: Implement snapshot_diff() with ATTACH DATABASE and column-level comparison
+  status: todo
+  tags:
+  - history
+  - P1
+- id: history-restore
+  title: Implement restore_snapshot() with auto-backup-before-restore safety
+  status: todo
+  tags:
+  - history
+  - P1
+- id: history-tests
+  title: 'History tests: snapshot create/list, diff accuracy, restore round-trip'
+  status: todo
+  tags:
+  - history
+  - test
+  - P1
+- id: context-assembly
+  title: 'Implement assemble_task_context(): multi-target, categorized output, edge-relation ranking'
+  status: todo
+  tags:
+  - context
+  - P0
+- id: context-scoring
+  title: Implement 5-tier relevance scoring based on edge relation types and BFS depth
+  status: todo
+  tags:
+  - context
+  - P1
+- id: context-truncation
+  title: 'Implement category-based truncation with priority: targets > deps > callers > tests'
+  status: todo
+  tags:
+  - context
+  - P1
+- id: context-source
+  title: Implement source code reading from disk with line-range extraction
+  status: todo
+  tags:
+  - context
+  - P1
+- id: context-tests
+  title: 'Context tests: multi-target, truncation, UTF-8 safety, empty graph, missing nodes'
+  status: todo
+  tags:
+  - context
+  - test
+  - P1
+- id: cli-wiring
+  title: Wire SqliteStorage into existing CLI commands (gid tasks, gid query, gid visual, etc.)
+  status: todo
+  tags:
+  - integration
+  - P0
+- id: backend-detect
+  title: 'Implement backend auto-detection: graph.db exists -> SQLite, only graph.yml -> migrate prompt'
+  status: todo
+  tags:
+  - integration
+  - P1
+- id: integration-tests
+  title: 'End-to-end tests: CLI with SQLite backend, migration from real YAML, full workflow'
+  status: todo
+  tags:
+  - integration
+  - test
+  - P1
 edges:
 - from: graph-types
   to: workspace-setup
@@ -842,3 +1031,132 @@ edges:
 - from: code-intel-req
   to: code-graph
   relation: documents
+- from: sqlite-storage-struct
+  to: sqlite-schema
+  relation: depends_on
+- from: storage-crud
+  to: sqlite-storage-struct
+  relation: depends_on
+- from: storage-crud
+  to: graphstorage-trait
+  relation: depends_on
+- from: storage-crud
+  to: node-struct-extend
+  relation: depends_on
+- from: storage-crud
+  to: edge-struct-extend
+  relation: depends_on
+- from: storage-crud
+  to: storage-error
+  relation: depends_on
+- from: storage-metadata
+  to: sqlite-storage-struct
+  relation: depends_on
+- from: storage-metadata
+  to: storage-error
+  relation: depends_on
+- from: storage-fts
+  to: storage-crud
+  relation: depends_on
+- from: storage-neighbors
+  to: storage-crud
+  relation: depends_on
+- from: storage-tests
+  to: storage-crud
+  relation: depends_on
+- from: storage-tests
+  to: storage-metadata
+  relation: depends_on
+- from: storage-tests
+  to: storage-fts
+  relation: depends_on
+- from: migration-rawparse
+  to: node-struct-extend
+  relation: depends_on
+- from: migration-pipeline
+  to: migration-rawparse
+  relation: depends_on
+- from: migration-pipeline
+  to: storage-crud
+  relation: depends_on
+- from: migration-metadata
+  to: migration-pipeline
+  relation: depends_on
+- from: migration-metadata
+  to: storage-metadata
+  relation: depends_on
+- from: migration-verify
+  to: migration-pipeline
+  relation: depends_on
+- from: migration-tests
+  to: migration-pipeline
+  relation: depends_on
+- from: migration-tests
+  to: migration-verify
+  relation: depends_on
+- from: history-snapshot
+  to: sqlite-storage-struct
+  relation: depends_on
+- from: history-list
+  to: history-snapshot
+  relation: depends_on
+- from: history-diff
+  to: history-snapshot
+  relation: depends_on
+- from: history-restore
+  to: history-snapshot
+  relation: depends_on
+- from: history-restore
+  to: history-diff
+  relation: depends_on
+- from: history-tests
+  to: history-snapshot
+  relation: depends_on
+- from: history-tests
+  to: history-diff
+  relation: depends_on
+- from: history-tests
+  to: history-restore
+  relation: depends_on
+- from: context-assembly
+  to: storage-crud
+  relation: depends_on
+- from: context-assembly
+  to: storage-neighbors
+  relation: depends_on
+- from: context-scoring
+  to: context-assembly
+  relation: depends_on
+- from: context-truncation
+  to: context-scoring
+  relation: depends_on
+- from: context-source
+  to: context-assembly
+  relation: depends_on
+- from: context-tests
+  to: context-assembly
+  relation: depends_on
+- from: context-tests
+  to: context-truncation
+  relation: depends_on
+- from: cli-wiring
+  to: storage-crud
+  relation: depends_on
+- from: cli-wiring
+  to: storage-fts
+  relation: depends_on
+- from: backend-detect
+  to: sqlite-storage-struct
+  relation: depends_on
+- from: backend-detect
+  to: migration-pipeline
+  relation: depends_on
+- from: integration-tests
+  to: cli-wiring
+  relation: depends_on
+- from: integration-tests
+  to: backend-detect
+  relation: depends_on
+- from: integration-tests
+  to: context-assembly
+  relation: depends_on
