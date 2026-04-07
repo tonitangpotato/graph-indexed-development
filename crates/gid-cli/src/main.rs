@@ -1316,9 +1316,8 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
         bail!("Directory not found: {}", dir.display());
     }
 
-    // Determine graph and metadata paths
+    // Determine metadata path
     let gid_dir = dir.join(".gid");
-    let graph_path = gid_dir.join("code-graph.json");
     let meta_path = gid_dir.join("extract-meta.json");
 
     if !json_flag {
@@ -1329,7 +1328,7 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
         }
     }
 
-    let (mut code_graph, report) = CodeGraph::extract_incremental(&dir, &graph_path, &meta_path, force)?;
+    let (mut code_graph, report) = CodeGraph::extract_incremental(&dir, &gid_dir, &meta_path, force)?;
 
     if !json_flag {
         eprintln!("{}", report);
@@ -1374,10 +1373,6 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
         }
     }
     
-    // Save code_graph.json (backward compat)
-    let code_graph_json = serde_json::to_string_pretty(&code_graph)?;
-    std::fs::write(&graph_path, &code_graph_json)?;
-
     // Convert CodeGraph to graph nodes/edges
     let (code_nodes, code_edges) = codegraph_to_graph_nodes(&code_graph, &dir);
 

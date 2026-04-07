@@ -9,6 +9,8 @@ use xxhash_rust::xxh64::xxh64;
 
 use super::lang::{python::*, rust_lang::*, typescript::*};
 use super::types::*;
+use crate::graph::Graph;
+use crate::unify::graph_to_codegraph;
 
 // ═══ Current metadata version. Bump on struct changes → triggers full rebuild. ═══
 const EXTRACT_META_VERSION: u32 = 2;
@@ -1008,7 +1010,7 @@ impl CodeGraph {
     /// Returns the updated CodeGraph and an ExtractReport describing what changed.
     pub fn extract_incremental(
         dir: &Path,
-        graph_path: &Path,
+        gid_dir: &Path,
         meta_path: &Path,
         force: bool,
     ) -> anyhow::Result<(Self, ExtractReport)> {
@@ -1017,7 +1019,7 @@ impl CodeGraph {
         // If force, do a full rebuild
         if force {
             tracing::info!("Force flag set, performing full rebuild");
-            return Self::do_full_rebuild(dir, graph_path, meta_path, start);
+            return Self::do_full_rebuild(dir, gid_dir, meta_path, start);
         }
 
         // Try to load existing metadata
@@ -1028,23 +1030,31 @@ impl CodeGraph {
                         "Metadata version mismatch (got {}, expected {}), performing full rebuild",
                         meta.version, EXTRACT_META_VERSION
                     );
-                    return Self::do_full_rebuild(dir, graph_path, meta_path, start);
+                    return Self::do_full_rebuild(dir, gid_dir, meta_path, start);
                 }
                 meta
             }
             None => {
                 tracing::info!("No prior metadata found, performing full rebuild");
-                return Self::do_full_rebuild(dir, graph_path, meta_path, start);
+                return Self::do_full_rebuild(dir, gid_dir, meta_path, start);
             }
         };
 
-        // Try to load existing graph
-        let existing_graph = match Self::load_graph_json(graph_path) {
+        // Try to load existing graph: first graph.yml, then code-graph.json (migration)
+        let graph_yml_path = gid_dir.join("graph.yml");
+        let json_path = gid_dir.join("code-graph.json");
+        let existing_graph = match Self::load_from_graph_yml(&graph_yml_path) {
             Some(g) => g,
-            None => {
-                tracing::info!("No prior graph found, performing full rebuild");
-                return Self::do_full_rebuild(dir, graph_path, meta_path, start);
-            }
+            None => match Self::load_graph_json(&json_path) {
+                Some(g) => {
+                    tracing::info!("Loaded graph from code-graph.json (migration fallback)");
+                    g
+                }
+                None => {
+                    tracing::info!("No prior graph found, performing full rebuild");
+                    return Self::do_full_rebuild(dir, gid_dir, meta_path, start);
+                }
+            },
         };
 
         // Collect current files
@@ -1304,8 +1314,7 @@ impl CodeGraph {
         graph.node_index.clear();
         graph.build_indexes();
 
-        // Phase 5: Save graph + update metadata
-        Self::save_graph_json(graph_path, &graph);
+        // Phase 5: Update metadata (caller writes graph.yml)
 
         // Build updated metadata
         let mut new_metadata = ExtractMetadata {
@@ -1346,7 +1355,7 @@ impl CodeGraph {
     /// Full rebuild with metadata generation.
     fn do_full_rebuild(
         dir: &Path,
-        graph_path: &Path,
+        _gid_dir: &Path,
         meta_path: &Path,
         start: Instant,
     ) -> anyhow::Result<(Self, ExtractReport)> {
@@ -1426,10 +1435,7 @@ impl CodeGraph {
         };
         graph.build_indexes();
 
-        // Save graph
-        Self::save_graph_json(graph_path, &graph);
-
-        // Build and save metadata
+        // Build and save metadata (caller writes graph.yml)
         let mut metadata = ExtractMetadata {
             version: EXTRACT_META_VERSION,
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1489,7 +1495,18 @@ impl CodeGraph {
         }
     }
 
-    /// Load a graph from JSON format.
+    /// Load a CodeGraph from graph.yml by converting code-layer nodes.
+    fn load_from_graph_yml(graph_yml_path: &Path) -> Option<Self> {
+        let data = std::fs::read_to_string(graph_yml_path).ok()?;
+        let graph: Graph = serde_yaml::from_str(&data).ok()?;
+        let cg = graph_to_codegraph(&graph);
+        if cg.nodes.is_empty() {
+            return None;
+        }
+        Some(cg)
+    }
+
+    /// Load a graph from JSON format (migration fallback for old projects).
     fn load_graph_json(graph_path: &Path) -> Option<Self> {
         let data = std::fs::read_to_string(graph_path).ok()?;
         let mut graph: Self = serde_json::from_str(&data).ok()?;
