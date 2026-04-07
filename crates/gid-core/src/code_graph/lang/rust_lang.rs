@@ -891,9 +891,10 @@ pub(crate) fn build_scope_map_rust(
     rel_path: &str,
     scope_map: &mut Vec<(usize, usize, String, Option<String>)>,
 ) {
-    let mut stack: Vec<(tree_sitter::Node, Option<String>)> = vec![(node, None)];
+    // Stack: (node, impl_ctx, module_prefix, in_function)
+    let mut stack: Vec<(tree_sitter::Node, Option<String>, String, bool)> = vec![(node, None, String::new(), false)];
 
-    while let Some((current, impl_ctx)) = stack.pop() {
+    while let Some((current, impl_ctx, module_prefix, in_function)) = stack.pop() {
         match current.kind() {
             "impl_item" => {
                 // Extract impl target type
@@ -903,7 +904,7 @@ pub(crate) fn build_scope_map_rust(
                 let child_count = current.child_count();
                 for i in (0..child_count).rev() {
                     if let Some(child) = current.child(i) {
-                        stack.push((child, impl_id.clone()));
+                        stack.push((child, impl_id.clone(), module_prefix.clone(), false));
                     }
                 }
             }
@@ -913,7 +914,9 @@ pub(crate) fn build_scope_map_rust(
                     .and_then(|n| n.utf8_text(source).ok())
                     .unwrap_or("");
 
-                if !func_name.is_empty() {
+                if !func_name.is_empty() && !in_function {
+                    // Only create scope entries for top-level and impl-level functions,
+                    // not for nested functions (which have no corresponding nodes).
                     let start_line = current.start_position().row + 1;
                     let end_line = current.end_position().row + 1;
 
@@ -924,18 +927,20 @@ pub(crate) fn build_scope_map_rust(
                         } else {
                             format!("method:{}:{}.{}", rel_path, type_name, func_name)
                         }
-                    } else {
+                    } else if module_prefix.is_empty() {
                         format!("func:{}:{}", rel_path, func_name)
+                    } else {
+                        format!("func:{}:{}::{}", rel_path, module_prefix, func_name)
                     };
 
                     scope_map.push((start_line, end_line, func_id, impl_ctx.clone()));
                 }
 
-                // Recurse into nested functions/closures
+                // Recurse into children with in_function = true
                 let child_count = current.child_count();
                 for i in (0..child_count).rev() {
                     if let Some(child) = current.child(i) {
-                        stack.push((child, impl_ctx.clone()));
+                        stack.push((child, impl_ctx.clone(), module_prefix.clone(), true));
                     }
                 }
             }
@@ -945,21 +950,37 @@ pub(crate) fn build_scope_map_rust(
                 let child_count = current.child_count();
                 for i in (0..child_count).rev() {
                     if let Some(child) = current.child(i) {
-                        stack.push((child, impl_ctx.clone()));
+                        stack.push((child, impl_ctx.clone(), module_prefix.clone(), in_function));
                     }
                 }
             }
             "mod_item" => {
-                // Recurse into inline modules
+                // Recurse into inline modules with updated module prefix
+                let mod_name = current.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let new_prefix = if mod_name.is_empty() {
+                    module_prefix.clone()
+                } else if module_prefix.is_empty() {
+                    mod_name.to_string()
+                } else {
+                    format!("{}::{}", module_prefix, mod_name)
+                };
                 if let Some(body) = current.child_by_field_name("body") {
-                    stack.push((body, impl_ctx.clone()));
+                    let child_count = body.child_count();
+                    for i in (0..child_count).rev() {
+                        if let Some(child) = body.child(i) {
+                            // Reset in_function to false: functions inside a mod are top-level
+                            stack.push((child, impl_ctx.clone(), new_prefix.clone(), false));
+                        }
+                    }
                 }
             }
             _ => {
                 let child_count = current.child_count();
                 for i in (0..child_count).rev() {
                     if let Some(child) = current.child(i) {
-                        stack.push((child, impl_ctx.clone()));
+                        stack.push((child, impl_ctx.clone(), module_prefix.clone(), in_function));
                     }
                 }
             }

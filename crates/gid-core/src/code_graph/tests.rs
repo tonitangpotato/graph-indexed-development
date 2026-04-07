@@ -814,4 +814,218 @@ class Helper {
         assert_eq!(EdgeRelation::from_str("CALLS").unwrap(), EdgeRelation::Calls);
         assert!(EdgeRelation::from_str("nonexistent").is_err());
     }
+
+    #[test]
+    fn test_scope_map_preserves_module_prefix_for_test_functions() {
+        // Bug 1: build_scope_map_rust must include module prefix (e.g. "tests::") 
+        // so that scope IDs match the node IDs created by extract_rust_node.
+        let content = r#"
+fn bar() {}
+
+mod tests {
+    use super::*;
+
+    fn test_foo() {
+        bar();
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+
+        let mut class_map = HashMap::new();
+        let (nodes, mut edges, _, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
+
+        // Node extraction should create "func:test.rs:tests::test_foo"
+        assert!(
+            nodes.iter().any(|n| n.id == "func:test.rs:tests::test_foo"),
+            "Should have node with tests:: prefix, got: {:?}",
+            nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        // Now extract calls — the scope map should also use "tests::" prefix
+        let func_map: HashMap<String, Vec<String>> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .fold(HashMap::new(), |mut acc, n| {
+                acc.entry(n.name.clone()).or_default().push(n.id.clone());
+                acc
+            });
+
+        let method_to_class: HashMap<String, String> = edges
+            .iter()
+            .filter(|e| e.relation == EdgeRelation::DefinedIn && e.to.starts_with("class:"))
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+
+        let file_func_ids: HashSet<String> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.id.clone())
+            .collect();
+
+        let node_pkg_map: HashMap<String, String> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), "".to_string()))
+            .collect();
+
+        let tree = parser.parse(content, None).unwrap();
+        let root = tree.root_node();
+
+        let file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
+        let struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        extract_calls_rust(
+            root,
+            content.as_bytes(),
+            "test.rs",
+            &func_map,
+            &method_to_class,
+            &file_func_ids,
+            &node_pkg_map,
+            &file_imported_names,
+            &struct_field_types,
+            &mut edges,
+        );
+
+        let call_edges: Vec<_> = edges.iter()
+            .filter(|e| e.relation == EdgeRelation::Calls)
+            .collect();
+
+        // The call edge from test_foo → bar should have from = "func:test.rs:tests::test_foo"
+        assert!(
+            call_edges.iter().any(|e| e.from == "func:test.rs:tests::test_foo" && e.to.contains("bar")),
+            "Call edge from tests::test_foo to bar should use tests:: prefix. Edges: {:?}",
+            call_edges.iter().map(|e| (&e.from, &e.to)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_nested_functions_do_not_create_dangling_scope_entries() {
+        // Bug 2: inner/nested functions should not get their own scope entries,
+        // since extract_rust_node doesn't create nodes for them.
+        // Calls inside nested functions should be attributed to the enclosing function.
+        let content = r#"
+fn bar() {}
+
+fn main() {
+    fn inner() {
+        bar();
+    }
+    inner();
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+
+        let mut class_map = HashMap::new();
+        let (nodes, mut edges, _, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
+
+        // extract_rust_node should NOT create a node for "inner" (it's nested)
+        assert!(
+            !nodes.iter().any(|n| n.name == "inner"),
+            "Should NOT create node for nested function 'inner'"
+        );
+
+        // Build call edges
+        let func_map: HashMap<String, Vec<String>> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .fold(HashMap::new(), |mut acc, n| {
+                acc.entry(n.name.clone()).or_default().push(n.id.clone());
+                acc
+            });
+
+        let method_to_class: HashMap<String, String> = edges
+            .iter()
+            .filter(|e| e.relation == EdgeRelation::DefinedIn && e.to.starts_with("class:"))
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+
+        let file_func_ids: HashSet<String> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.id.clone())
+            .collect();
+
+        let node_pkg_map: HashMap<String, String> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), "".to_string()))
+            .collect();
+
+        let tree = parser.parse(content, None).unwrap();
+        let root = tree.root_node();
+
+        let file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
+        let struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        extract_calls_rust(
+            root,
+            content.as_bytes(),
+            "test.rs",
+            &func_map,
+            &method_to_class,
+            &file_func_ids,
+            &node_pkg_map,
+            &file_imported_names,
+            &struct_field_types,
+            &mut edges,
+        );
+
+        let call_edges: Vec<_> = edges.iter()
+            .filter(|e| e.relation == EdgeRelation::Calls)
+            .collect();
+
+        // All call edges should have 'from' IDs that correspond to existing nodes
+        let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        for edge in &call_edges {
+            assert!(
+                node_ids.contains(edge.from.as_str()),
+                "Call edge 'from' should match an existing node. Dangling from: {}, to: {}",
+                edge.from, edge.to
+            );
+        }
+
+        // The call to bar() from inside inner() should be attributed to main
+        assert!(
+            call_edges.iter().any(|e| e.from == "func:test.rs:main" && e.to.contains("bar")),
+            "Call to bar() from nested inner() should be attributed to main. Edges: {:?}",
+            call_edges.iter().map(|e| (&e.from, &e.to)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_scope_map_with_cfg_test_attribute() {
+        // Real-world pattern: #[cfg(test)] mod tests { ... }
+        // Verifies that #[cfg(test)] attribute doesn't break module prefix tracking
+        let content = r#"
+fn bar() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitizer_detect_system_injection() {
+        bar();
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+        
+        use crate::code_graph::lang::rust_lang::build_scope_map_rust;
+        let tree = parser.parse(content, None).unwrap();
+        let root = tree.root_node();
+        
+        let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
+        build_scope_map_rust(root, content.as_bytes(), "safety.rs", &mut scope_map);
+        
+        // The test function should have tests:: prefix
+        assert!(
+            scope_map.iter().any(|(_, _, id, _)| id == "func:safety.rs:tests::test_sanitizer_detect_system_injection"),
+            "Should have scope entry with tests:: prefix, got: {:?}",
+            scope_map.iter().map(|(_, _, id, _)| id).collect::<Vec<_>>()
+        );
+    }
 }
