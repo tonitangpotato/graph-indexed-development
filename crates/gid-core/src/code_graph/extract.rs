@@ -11,7 +11,7 @@ use super::lang::{python::*, rust_lang::*, typescript::*};
 use super::types::*;
 
 // ═══ Current metadata version. Bump on struct changes → triggers full rebuild. ═══
-const EXTRACT_META_VERSION: u32 = 1;
+const EXTRACT_META_VERSION: u32 = 2;
 
 // ═══ Shared Helper Types ═══
 
@@ -596,6 +596,188 @@ fn get_file_mtime(dir: &Path, rel_path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+// ═══ Module Node & Cross-Layer Edge Generation ═══
+
+/// Generate module nodes from directory structure.
+/// Each directory containing at least one source file becomes a Module node.
+/// Returns (module_nodes, edges) where edges are module→parent belongs_to.
+fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> (Vec<CodeNode>, Vec<CodeEdge>) {
+    let mut dir_set: HashSet<String> = HashSet::new();
+
+    // Collect all directories that contain source files
+    for (rel_path, _, _) in file_entries {
+        if let Some(dir) = rel_path.rsplitn(2, '/').nth(1) {
+            if !dir.is_empty() {
+                // Add this directory and all ancestors
+                let mut current = dir.to_string();
+                loop {
+                    dir_set.insert(current.clone());
+                    match current.rsplitn(2, '/').nth(1) {
+                        Some(parent) if !parent.is_empty() => current = parent.to_string(),
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+
+    for dir in &dir_set {
+        nodes.push(CodeNode::new_module(dir));
+
+        // Module → parent module (belongs_to)
+        if let Some(parent) = dir.rsplitn(2, '/').nth(1) {
+            if !parent.is_empty() && dir_set.contains(parent) {
+                edges.push(CodeEdge::new(
+                    &format!("module:{}", dir),
+                    &format!("module:{}", parent),
+                    EdgeRelation::BelongsTo,
+                ));
+            }
+        }
+    }
+
+    (nodes, edges)
+}
+
+/// Generate file → module belongs_to edges.
+fn generate_file_to_module_edges(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    let mut edges = Vec::new();
+    for (rel_path, _, _) in file_entries {
+        if let Some(dir) = rel_path.rsplitn(2, '/').nth(1) {
+            if !dir.is_empty() {
+                edges.push(CodeEdge::new(
+                    &format!("file:{}", rel_path),
+                    &format!("module:{}", dir),
+                    EdgeRelation::BelongsTo,
+                ));
+            }
+        }
+    }
+    edges
+}
+
+/// Generate TestsFor edges for Rust test files using naming conventions.
+/// Matches: tests/auth.rs → src/auth.rs, tests/test_auth.rs → src/auth.rs, tests/auth.rs → src/auth/mod.rs
+fn generate_rust_tests_for_edges(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    let mut edges = Vec::new();
+
+    // Collect source files (non-test) with their stems
+    let mut source_stems: HashMap<String, String> = HashMap::new();
+    for (path, _, lang) in file_entries {
+        if *lang != Language::Rust {
+            continue;
+        }
+        if path.starts_with("tests/") || path.contains("/tests/") {
+            continue;
+        }
+        // stem: "src/auth/middleware.rs" → "auth/middleware"
+        // also: "src/auth/mod.rs" → "auth"
+        let without_prefix = path.strip_prefix("src/").unwrap_or(path);
+        let stem = without_prefix.trim_end_matches(".rs");
+        let stem = if stem.ends_with("/mod") {
+            &stem[..stem.len() - 4]
+        } else {
+            stem
+        };
+        source_stems.insert(stem.to_string(), format!("file:{}", path));
+    }
+
+    // Find test files and match to source
+    for (path, _, lang) in file_entries {
+        if *lang != Language::Rust {
+            continue;
+        }
+        if !path.starts_with("tests/") && !path.contains("/tests/") {
+            continue;
+        }
+
+        let test_file_id = format!("file:{}", path);
+
+        // Extract test stem: "tests/test_auth.rs" → "auth", "tests/auth.rs" → "auth"
+        let raw = path.strip_prefix("tests/")
+            .or_else(|| {
+                // Handle nested: "crates/foo/tests/bar.rs" → "bar"
+                path.rsplit_once("/tests/").map(|(_, rest)| rest)
+            })
+            .unwrap_or(path)
+            .trim_end_matches(".rs");
+        let test_stem = raw.strip_prefix("test_").unwrap_or(raw);
+
+        // Try matching: exact stem, or module name
+        if let Some(source_id) = source_stems.get(test_stem) {
+            edges.push(CodeEdge::new_heuristic(
+                &test_file_id,
+                source_id,
+                EdgeRelation::TestsFor,
+                0.8, // naming convention match, not import analysis
+            ));
+        }
+    }
+
+    edges
+}
+
+/// Generate TestsFor edges for TypeScript/JavaScript test files using naming conventions.
+/// Matches: auth.test.ts → auth.ts, auth.spec.ts → auth.ts, __tests__/auth.test.ts → auth.ts
+fn generate_ts_tests_for_edges(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    let mut edges = Vec::new();
+
+    // Collect source files (non-test)
+    let mut source_stems: HashMap<String, String> = HashMap::new();
+    for (path, _, lang) in file_entries {
+        if *lang != Language::TypeScript {
+            continue;
+        }
+        if path.contains(".test.") || path.contains(".spec.") || path.contains("__tests__/") {
+            continue;
+        }
+        let stem = path
+            .trim_end_matches(".ts")
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".js")
+            .trim_end_matches(".jsx");
+        source_stems.insert(stem.to_string(), format!("file:{}", path));
+    }
+
+    for (path, _, lang) in file_entries {
+        if *lang != Language::TypeScript {
+            continue;
+        }
+        let is_test = path.contains(".test.") || path.contains(".spec.") || path.contains("__tests__/");
+        if !is_test {
+            continue;
+        }
+
+        let test_file_id = format!("file:{}", path);
+
+        // "src/auth.test.ts" → "src/auth", "src/auth.spec.ts" → "src/auth"
+        // "__tests__/auth.test.ts" → "auth"
+        let source_stem = path
+            .replace(".test.", ".")
+            .replace(".spec.", ".")
+            .replace("__tests__/", "")
+            .trim_end_matches(".ts")
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".js")
+            .trim_end_matches(".jsx")
+            .to_string();
+
+        if let Some(source_id) = source_stems.get(&source_stem) {
+            edges.push(CodeEdge::new_heuristic(
+                &test_file_id,
+                source_id,
+                EdgeRelation::TestsFor,
+                0.8, // naming convention match
+            ));
+        }
+    }
+
+    edges
+}
+
 impl CodeGraph {
     /// Extract with per-repo cache. Cache key = repo_name + base_commit.
     /// If a cached graph exists on disk, returns it instantly.
@@ -651,6 +833,20 @@ impl CodeGraph {
         // First pass: collect files and build module map
         let file_entries = collect_source_files(dir, &mut state.module_map);
 
+        // Generate module nodes from directory structure (ISS-009)
+        let (module_nodes, module_edges) = generate_module_nodes(&file_entries);
+        state.nodes.extend(module_nodes);
+        state.edges.extend(module_edges);
+
+        // Generate file → module belongs_to edges (ISS-009)
+        // These reference file:X nodes which are created in integrate_file_results below,
+        // but edges can reference forward — they're resolved at index build time.
+        let file_module_edges = generate_file_to_module_edges(&file_entries);
+
+        // Generate TestsFor edges from naming conventions (ISS-009)
+        let rust_test_edges = generate_rust_tests_for_edges(&file_entries);
+        let ts_test_edges = generate_ts_tests_for_edges(&file_entries);
+
         // Second pass: parse each file
         let mut parser = Parser::new();
         let python_language = tree_sitter_python::LANGUAGE;
@@ -674,6 +870,10 @@ impl CodeGraph {
                 &class_init_map, &node_pkg_map, &state.module_map, &mut edges,
             );
         }
+        // Add cross-layer edges (ISS-009)
+        edges.extend(file_module_edges);
+        edges.extend(rust_test_edges);
+        edges.extend(ts_test_edges);
         state.edges = edges;
 
         // Resolve placeholder references
@@ -1056,6 +1256,18 @@ impl CodeGraph {
         let file_entries = collect_source_files(dir, &mut state.module_map);
         let total_files = file_entries.len();
 
+        // Generate module nodes from directory structure (ISS-009)
+        let (module_nodes, module_edges) = generate_module_nodes(&file_entries);
+        state.nodes.extend(module_nodes);
+        state.edges.extend(module_edges);
+
+        // Generate file → module belongs_to edges (ISS-009)
+        let file_module_edges = generate_file_to_module_edges(&file_entries);
+
+        // Generate TestsFor edges from naming conventions (ISS-009)
+        let rust_test_edges = generate_rust_tests_for_edges(&file_entries);
+        let ts_test_edges = generate_ts_tests_for_edges(&file_entries);
+
         // Second pass: parse each file
         let mut parser = Parser::new();
         parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok();
@@ -1085,6 +1297,10 @@ impl CodeGraph {
                 &class_init_map, &node_pkg_map, &state.module_map, &mut edges,
             );
         }
+        // Add cross-layer edges (ISS-009)
+        edges.extend(file_module_edges);
+        edges.extend(rust_test_edges);
+        edges.extend(ts_test_edges);
         state.edges = edges;
 
         // Resolve, dedup, finalize

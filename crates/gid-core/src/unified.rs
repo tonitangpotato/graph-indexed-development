@@ -105,6 +105,7 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             EdgeRelation::TestsFor => "tests",
             EdgeRelation::Overrides => "overrides",
             EdgeRelation::Implements => "implements",
+            EdgeRelation::BelongsTo => "belongs_to",
         };
         
         let edge_key = (from.clone(), to.clone(), relation.to_string());

@@ -68,7 +68,9 @@ gid extract [--force]
     │
     ├─ Phase 1: Remove stale data
     │   ├─ For deleted files: remove their nodes + edges from graph
-    │   └─ For modified files: remove their nodes + edges (will re-add)
+    │   ├─ For modified files: remove their nodes + edges (will re-add)
+    │   └─ Scan ALL edges; remove any where source or target
+    │       node_id no longer exists (dangling edge cleanup)
     │
     ├─ Phase 2: Parse changed files only
     │   ├─ Tree-sitter parse added + modified files

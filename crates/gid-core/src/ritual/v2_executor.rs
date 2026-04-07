@@ -51,7 +51,7 @@ Guidelines:
 - "small": bug fix, add a simple command, change a config value, rename something
 - "medium": add a feature that touches 2-3 files, refactor a module
 - "large": new subsystem, architectural change, multi-file feature
-- skip_design=true if the task is small enough that a DESIGN.md update adds no value
+- skip_design=true if has_design=true (design already exists — don't redo it) OR if the task is small enough that a design adds no value
 - skip_graph=true ONLY if the task modifies existing code without adding new modules, files, or components
 - skip_graph=false if the task adds ANY new files, modules, subsystems, or architectural components — even if a graph already exists, it needs to be UPDATED with new nodes
 - "ambiguous" if the task description is vague, could mean multiple things, or lacks critical info
@@ -223,7 +223,17 @@ impl V2Executor {
                 // Parse JSON from response
                 let json_str = extract_json(&response);
                 match serde_json::from_str::<super::state_machine::TriageResult>(json_str) {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        // Deterministic override: if design already exists, skip design phase
+                        // regardless of what Haiku says. LLM triage is advisory, not authoritative
+                        // for facts we can verify deterministically.
+                        if let Some(ps) = &state.project {
+                            if ps.has_design && !result.skip_design {
+                                info!("Override: skip_design=true (design already exists)");
+                                result.skip_design = true;
+                            }
+                        }
+
                         info!(
                             clarity = result.clarity,
                             size = result.size,

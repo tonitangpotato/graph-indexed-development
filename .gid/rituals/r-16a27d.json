@@ -1,0 +1,132 @@
+{
+  "id": "r-16a27d",
+  "phase": "Done",
+  "task": "Implement ISS-006 Incremental Extract for gid-core. Design doc at .gid/features/incremental-extract/DESIGN.md. Task graph already created (iss006-* tasks). Implement the incremental extract pipeline: ExtractMetadata/FileState/FileDelta types, file delta computation, extract_incremental() with 5-phase flow, LSP incremental refinement, --force CLI flag, and tests.\nProject location: /Users/potato/clawd/projects/gid-rs",
+  "target_root": "/Users/potato/clawd/projects/gid-rs",
+  "project": {
+    "has_requirements": true,
+    "has_design": true,
+    "has_graph": true,
+    "has_source": true,
+    "has_tests": false,
+    "language": "rust",
+    "source_file_count": 69,
+    "verify_command": "cargo build && cargo test"
+  },
+  "strategy": "SingleLlm",
+  "verify_retries": 0,
+  "phase_retries": {},
+  "failed_phase": null,
+  "error_context": "triage: size=large, skip_design=false, skip_graph=false",
+  "review_target": "tasks",
+  "triage_size": "large",
+  "phase_tokens": {
+    "implement": 12066,
+    "graph": 3416,
+    "design": 14044,
+    "reviewing": 8910,
+    "triage": 553,
+    "planning": 589
+  },
+  "review_round": 0,
+  "transitions": [
+    {
+      "from": "Idle",
+      "to": "Initializing",
+      "event": "Idle → Initializing",
+      "timestamp": "2026-04-07T13:16:47.102105Z"
+    },
+    {
+      "from": "Initializing",
+      "to": "Triaging",
+      "event": "Initializing → Triaging",
+      "timestamp": "2026-04-07T13:16:47.110185Z"
+    },
+    {
+      "from": "Triaging",
+      "to": "Designing",
+      "event": "Triaging → Designing",
+      "timestamp": "2026-04-07T13:16:48.095768Z"
+    },
+    {
+      "from": "Designing",
+      "to": "Reviewing",
+      "event": "Designing → Reviewing",
+      "timestamp": "2026-04-07T13:22:05.786401Z"
+    },
+    {
+      "from": "Reviewing",
+      "to": "WaitingApproval",
+      "event": "Reviewing → WaitingApproval",
+      "timestamp": "2026-04-07T13:23:13.638786Z"
+    },
+    {
+      "from": "WaitingApproval",
+      "to": "Reviewing",
+      "event": "WaitingApproval → Reviewing",
+      "timestamp": "2026-04-07T13:26:14.129120Z"
+    },
+    {
+      "from": "Reviewing",
+      "to": "WaitingApproval",
+      "event": "Reviewing → WaitingApproval",
+      "timestamp": "2026-04-07T13:27:25.926861Z"
+    },
+    {
+      "from": "WaitingApproval",
+      "to": "Planning",
+      "event": "WaitingApproval → Planning",
+      "timestamp": "2026-04-07T13:30:26.145280Z"
+    },
+    {
+      "from": "Planning",
+      "to": "Graphing",
+      "event": "Planning → Graphing",
+      "timestamp": "2026-04-07T13:30:35.251989Z"
+    },
+    {
+      "from": "Graphing",
+      "to": "Reviewing",
+      "event": "Graphing → Reviewing",
+      "timestamp": "2026-04-07T13:31:47.951891Z"
+    },
+    {
+      "from": "Reviewing",
+      "to": "WaitingApproval",
+      "event": "Reviewing → WaitingApproval",
+      "timestamp": "2026-04-07T13:32:56.813631Z"
+    },
+    {
+      "from": "WaitingApproval",
+      "to": "Reviewing",
+      "event": "WaitingApproval → Reviewing",
+      "timestamp": "2026-04-07T13:35:57.351783Z"
+    },
+    {
+      "from": "Reviewing",
+      "to": "WaitingApproval",
+      "event": "Reviewing → WaitingApproval",
+      "timestamp": "2026-04-07T13:36:56.114778Z"
+    },
+    {
+      "from": "WaitingApproval",
+      "to": "Implementing",
+      "event": "WaitingApproval → Implementing",
+      "timestamp": "2026-04-07T13:39:56.333227Z"
+    },
+    {
+      "from": "Implementing",
+      "to": "Verifying",
+      "event": "Implementing → Verifying",
+      "timestamp": "2026-04-07T13:44:04.182543Z"
+    },
+    {
+      "from": "Verifying",
+      "to": "Done",
+      "event": "Verifying → Done",
+      "timestamp": "2026-04-07T13:44:07.912265Z"
+    }
+  ],
+  "started_at": "2026-04-07T13:16:47.101328Z",
+  "updated_at": "2026-04-07T13:44:07.912266Z"
+}

@@ -22,7 +22,7 @@ This means: change a source file → can't find which tests break. Change a func
 - GOAL-4: Test files generate `TestsFor` edges to source files (Rust and TypeScript — Python already partial)
 - GOAL-5: `impact()` traverses configurable edge relations (not just `depends_on`)
 - GOAL-6: `deps()` traverses configurable edge relations
-- GOAL-7: Incremental extract handles Module nodes correctly (add/remove on file changes)
+- GOAL-7: Incremental extract handles Module nodes correctly (add/remove on file changes) *(depends on ISS-006 — incremental extract not yet implemented)*
 
 ### Non-Goals
 - Cross-layer edges between task and code nodes (Phase 2: unified.rs + design.rs)
@@ -59,6 +59,8 @@ module:src/auth ──belongs_to──→ module:src
 
 **CodeNode for Module**:
 
+> **Note (FINDING-9):** The `file_path` field is overloaded — for file nodes it stores a file path, for module nodes it stores a directory path. This is a known semantic mismatch accepted for Phase 1. A future refactor may rename the field to `path` to be more generic.
+
 ```rust
 impl CodeNode {
     pub fn new_module(dir_path: &str) -> Self {
@@ -67,7 +69,7 @@ impl CodeNode {
             id: format!("module:{}", dir_path),
             kind: NodeKind::Module,
             name: name.to_string(),
-            file_path: dir_path.to_string(),
+            file_path: dir_path.to_string(), // NOTE: stores directory path, not file path
             line: None,
             decorators: Vec::new(),
             signature: None,
@@ -81,7 +83,9 @@ impl CodeNode {
 
 ### 3.2 Module Generation in extract_from_dir
 
-After collecting all source files and before the parsing phase, scan the file entries to identify unique directories:
+After collecting all source files and before the parsing phase, scan the file entries to identify unique directories.
+
+> **Note (FINDING-10):** `.gidignore` filtering must run **before** `generate_module_nodes()`. The walkdir filtering (which already respects `.gidignore`) produces the `file_entries` list — so excluded directories will not appear in `file_entries` and will not get module nodes. Ensure `generate_module_nodes()` is only called with the already-filtered file list.
 
 ```rust
 fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> Vec<(CodeNode, Vec<CodeEdge>)> {
@@ -161,6 +165,15 @@ pub enum EdgeRelation {
 
 Semantics: `file:X belongs_to module:Y` means file X is inside directory Y. `module:X belongs_to module:Y` means directory X is a subdirectory of Y.
 
+**Confidence semantics (FINDING-2, FINDING-11):**
+- `BelongsTo` edges use `CodeEdge::new()` → `confidence: 1.0` (deterministic — directory structure is factual)
+- `TestsFor` edges use struct literal → `confidence: 0.8` (heuristic — naming convention match, not import analysis)
+- Note: `CodeEdge::new()` sets `call_site_line: None` and `call_site_column: None`, which is correct for structural edges like `BelongsTo` (they have no call site). These fields are semantically designed for call-like edges; their presence on structural edges is a known code smell, accepted as non-blocking.
+
+Consider adding a `CodeEdge::new_heuristic(from, to, relation, confidence)` constructor during implementation to make the pattern explicit and avoid raw struct literals for heuristic edges.
+
+**Serde/FromStr (FINDING-8):** Verify that the `EdgeRelation` serde derive (or manual `FromStr`/`Deserialize` impl) handles `"belongs_to" → BelongsTo` correctly. If `EdgeRelation` uses `#[serde(rename_all = "snake_case")]` it should work automatically. Add a roundtrip test (see §5.1) to confirm.
+
 ### 3.4 TestsFor Edge Generation (Rust)
 
 Currently Python has partial TestsFor in `extract_calls_for_file()`. Rust and TypeScript have none.
@@ -213,12 +226,9 @@ fn generate_rust_tests_for_edges(
         let test_file_id = format!("file:{}", path);
 
         // Extract test stem: "tests/test_auth.rs" → "auth", "tests/auth.rs" → "auth"
-        let test_stem = path
-            .strip_prefix("tests/").unwrap_or(path)
-            .trim_end_matches(".rs")
-            .strip_prefix("test_").unwrap_or(
-                path.strip_prefix("tests/").unwrap_or(path).trim_end_matches(".rs")
-            );
+        // (FINDING-5: simplified — avoid redundant re-stripping in fallback)
+        let raw = path.strip_prefix("tests/").unwrap_or(path).trim_end_matches(".rs");
+        let test_stem = raw.strip_prefix("test_").unwrap_or(raw);
 
         // Try matching: exact stem, or module name
         if let Some(source_id) = source_files.get(test_stem) {
@@ -315,41 +325,72 @@ The existing Python TestsFor logic in `extract_calls_for_file()` only matches `f
 
 ### 3.6 Query Enhancement: Multi-Relation Traversal
 
-Current `impact()` in `graph.rs` (the task graph, not CodeGraph):
+> **Note (FINDING-1):** There are two distinct query systems that need enhancement:
+> 1. **`CodeGraph::impact_analysis()`** in `code_graph/analysis.rs` — operates on `CodeGraph` with `CodeEdge` / `EdgeRelation`
+> 2. **`QueryEngine::impact()`** and `QueryEngine::deps()` in `query.rs` — operates on the task `Graph` with `Node` / `depends_on: Vec<String>`
+>
+> These are **different types with different traversal mechanisms**. This section addresses both.
+
+#### 3.6.1 CodeGraph Analysis Enhancement
+
+`CodeGraph::impact_analysis()` in `code_graph/analysis.rs` currently traverses all edge relations. Enhance it to accept an optional relation filter:
 
 ```rust
-// Only follows depends_on
-pub fn impact(&self, node_id: &str) -> Vec<&Node> { ... }
+/// In code_graph/analysis.rs
+impl CodeGraph {
+    /// Compute impact — what code nodes are affected if `node_id` changes.
+    ///
+    /// `relations`: which edge relations to traverse. If None, traverses all.
+    pub fn impact_analysis(
+        &self,
+        node_id: &str,
+        relations: Option<&[EdgeRelation]>,
+    ) -> Vec<&CodeNode>
+}
 ```
 
-**New signature**:
+Default relation set for code graph impact analysis (reverse traversal — who depends on me):
+- `Calls` — function B calls A → changing A impacts B
+- `Imports` — file B imports file A → changing A impacts B
+- `DefinedIn` — function A defined_in file F → changing F impacts A
+- `BelongsTo` — file belongs_to module → changing module config impacts files
+- `Implements` — class implements trait → changing trait impacts class
+- `TestsFor` — test file tests source → changing source impacts test
 
 ```rust
-/// Compute impact — what nodes are affected if `node_id` changes.
-///
-/// `relations`: which edge relations to traverse. If None, uses default set:
-/// depends_on, calls, defined_in, belongs_to, implements, imports.
-pub fn impact(&self, node_id: &str, relations: Option<&[&str]>) -> Vec<&Node>
-```
-
-Default relation set for impact analysis (reverse traversal — who depends on me):
-- `depends_on` — task B depends on task A → changing A impacts B
-- `calls` — function B calls A → changing A impacts B
-- `imports` — file B imports file A → changing A impacts B
-- `defined_in` — function A defined_in file F → changing F impacts A
-- `belongs_to` — file belongs_to module → changing module config impacts files
-- `implements` — task implements feature → changing feature impacts task
-
-```rust
-const DEFAULT_IMPACT_RELATIONS: &[&str] = &[
-    "depends_on", "calls", "imports", "defined_in", "belongs_to", "implements",
+const DEFAULT_CODE_IMPACT_RELATIONS: &[EdgeRelation] = &[
+    EdgeRelation::Calls,
+    EdgeRelation::Imports,
+    EdgeRelation::DefinedIn,
+    EdgeRelation::BelongsTo,
+    EdgeRelation::Implements,
+    EdgeRelation::TestsFor,
 ];
 ```
 
-Same for `deps()`:
+#### 3.6.2 QueryEngine Enhancement (Task Graph)
+
+`QueryEngine::impact()` and `QueryEngine::deps()` in `query.rs` (line 16, 40) currently only follow `depends_on` edges on the task `Graph`. Enhance to accept an optional relation filter for the task graph's `depends_on` traversal:
+
 ```rust
-pub fn deps(&self, node_id: &str, relations: Option<&[&str]>) -> Vec<&Node>
+/// In query.rs
+impl<'a> QueryEngine<'a> {
+    /// Compute impact — what task nodes are affected if `node_id` changes.
+    ///
+    /// `relations`: which edge types to traverse. If None, uses default set.
+    /// For task graph, the primary relation is `depends_on`.
+    pub fn impact(&self, node_id: &str, relations: Option<&[&str]>) -> Vec<&Node>
+
+    pub fn deps(&self, node_id: &str, relations: Option<&[&str]>) -> Vec<&Node>
+}
 ```
+
+Default relation set for task graph:
+```rust
+const DEFAULT_TASK_IMPACT_RELATIONS: &[&str] = &["depends_on"];
+```
+
+> **Future (Phase 2):** When `unified.rs` merges task and code graphs, the QueryEngine may need to traverse both task `depends_on` edges and code `EdgeRelation` edges in a single query.
 
 **Backward compatibility**: The CLI commands (`gid query impact`, `gid query deps`) default to the full relation set. Add `--relation` flag to filter.
 
@@ -360,6 +401,8 @@ When files are added/removed, module nodes need updating:
 1. **File deleted** → check if its directory has any remaining source files. If not, remove the module node.
 2. **File added to new directory** → create module node + belongs_to edges.
 3. **File moved** → handled by delete + add.
+
+> **Note (FINDING-7):** `extract_incremental()` does not exist yet — it depends on ISS-006 (incremental extract). The logic below documents the intended behavior for when ISS-006 is implemented. GOAL-7 is blocked on ISS-006 completion.
 
 In `extract_incremental()`, after processing file delta:
 
@@ -406,10 +449,15 @@ for (rel_path, _, _) in &file_entries {
 
 | File | Change |
 |---|---|
-| `code_graph/types.rs` | Add `BelongsTo` to `EdgeRelation`, add `CodeNode::new_module()` |
-| `code_graph/extract.rs` | Add `generate_module_nodes()`, file→module edges, TestsFor for Rust/TS, integrate into both `extract_from_dir()` and `extract_incremental()` |
-| `graph.rs` | Update `impact()` and `deps()` signatures to accept optional relation filter |
+| `code_graph/types.rs` | Add `BelongsTo` to `EdgeRelation`, add `CodeNode::new_module()`, verify serde roundtrip for both |
+| `code_graph/extract.rs` | Add `generate_module_nodes()`, file→module edges, TestsFor for Rust/TS, integrate into `extract_from_dir()` |
+| `code_graph/analysis.rs` | Update `impact_analysis()` to accept optional `EdgeRelation` filter |
+| `query.rs` | Update `QueryEngine::impact()` and `QueryEngine::deps()` signatures to accept optional relation filter |
 | CLI command handlers | Update `impact`/`deps` commands to pass relation filter (or None for default) |
+
+> **Note (FINDING-1):** `graph.rs` is NOT modified — the query functions live in `query.rs` on `QueryEngine`, and code graph analysis lives in `code_graph/analysis.rs`. The original §4 incorrectly listed `graph.rs`.
+>
+> **Note (FINDING-7):** Integration into `extract_incremental()` is deferred until ISS-006 is implemented.
 
 ## 5 Testing
 
@@ -418,32 +466,37 @@ for (rel_path, _, _) in &file_entries {
 1. `test_module_generation_flat` — flat directory → one module node per dir
 2. `test_module_generation_nested` — nested dirs → hierarchical belongs_to edges
 3. `test_module_generation_empty_dir` — directory with no source files → no module node
-4. `test_file_belongs_to_module` — each file has belongs_to edge to its directory's module
+4. `test_file_belongs_to_module` — each non-root file has belongs_to edge to its directory's module
+5. `test_root_file_no_belongs_to` — `main.rs` at project root → no belongs_to edge (no module node for root)
+6. `test_nodekind_module_serde_roundtrip` — create a Module node, serialize to YAML, deserialize, verify roundtrip (FINDING-3)
+7. `test_edge_relation_belongs_to_roundtrip` — serialize `EdgeRelation::BelongsTo`, deserialize, verify `FromStr`/serde handles `"belongs_to"` correctly (FINDING-8)
 
 ### 5.2 TestsFor Tests
 
-5. `test_rust_tests_for_matching` — `tests/auth.rs` → `file:src/auth.rs`
-6. `test_rust_tests_for_mod` — `tests/auth.rs` → `file:src/auth/mod.rs`
-7. `test_ts_test_file_matching` — `auth.test.ts` → `file:auth.ts`
-8. `test_ts_spec_file_matching` — `auth.spec.ts` → `file:auth.ts`
-9. `test_python_tests_for_naming` — `test_auth.py` → `file:auth.py`
+8. `test_rust_tests_for_matching` — `tests/auth.rs` → `file:src/auth.rs`
+9. `test_rust_tests_for_mod` — `tests/auth.rs` → `file:src/auth/mod.rs`
+10. `test_ts_test_file_matching` — `auth.test.ts` → `file:auth.ts`
+11. `test_ts_spec_file_matching` — `auth.spec.ts` → `file:auth.ts`
+12. `test_ts_nested_tests_dir` — `src/components/__tests__/Button.test.tsx` → should match `src/components/Button.tsx` (FINDING-6)
+13. `test_python_tests_for_naming` — `test_auth.py` → `file:auth.py`
 
 ### 5.3 Query Enhancement Tests
 
-10. `test_impact_multi_relation` — node with `calls` + `depends_on` edges, verify both traversed
-11. `test_impact_relation_filter` — explicit filter only traverses specified relations
-12. `test_deps_multi_relation` — forward traversal through multiple edge types
-13. `test_impact_backward_compat` — `impact(id, None)` uses default set, same behavior as multi-relation
+14. `test_code_graph_impact_multi_relation` — code node with `Calls` + `Imports` edges, verify both traversed in `impact_analysis()`
+15. `test_code_graph_impact_relation_filter` — explicit `EdgeRelation` filter only traverses specified relations
+16. `test_query_engine_impact_multi_relation` — task node with `depends_on`, verify `QueryEngine::impact()` traversal
+17. `test_deps_multi_relation` — forward traversal through multiple edge types
+18. `test_impact_backward_compat` — `impact(id, None)` uses default set, same behavior as multi-relation
 
-### 5.4 Incremental Tests
+### 5.4 Incremental Tests *(blocked on ISS-006)*
 
-14. `test_incremental_module_add` — new file in new dir → module node created
-15. `test_incremental_module_remove` — last file deleted from dir → module node removed
-16. `test_incremental_module_stable` — file modified in existing dir → module node unchanged
+19. `test_incremental_module_add` — new file in new dir → module node created
+20. `test_incremental_module_remove` — last file deleted from dir → module node removed
+21. `test_incremental_module_stable` — file modified in existing dir → module node unchanged
 
 ## 6 Edge Cases
 
-- **Root directory files** (e.g., `main.rs` directly in the extract dir) → no module node, no belongs_to edge
+- **Root directory files** (e.g., `main.rs` directly in the extract dir) → no module node, no belongs_to edge *(verified by `test_root_file_no_belongs_to` — see FINDING-4)*
 - **Single-file projects** → one file node, no module nodes
 - **Hidden directories** (`.git/`) → already filtered by walkdir
 - **Symlinks** → already `follow_links: false` in walkdir

@@ -277,6 +277,24 @@ impl CodeNode {
             is_test: false,
         }
     }
+
+    /// Create a module node from a directory path.
+    /// Module nodes represent directory-level grouping of source files.
+    pub fn new_module(dir_path: &str) -> Self {
+        let name = dir_path.rsplit('/').next().unwrap_or(dir_path);
+        Self {
+            id: format!("module:{}", dir_path),
+            kind: NodeKind::Module,
+            name: name.to_string(),
+            file_path: dir_path.to_string(), // NOTE: stores directory path, not file path
+            line: None,
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 0,
+            is_test: dir_path.contains("/test") || dir_path.contains("/tests"),
+        }
+    }
 }
 
 /// Kind of code node.
@@ -347,6 +365,21 @@ impl CodeEdge {
         Self::new(from, to, EdgeRelation::DefinedIn)
     }
 
+    /// Create a heuristic edge with explicit confidence (e.g., naming-convention TestsFor).
+    pub fn new_heuristic(from: &str, to: &str, relation: EdgeRelation, confidence: f32) -> Self {
+        Self {
+            from: from.to_string(),
+            to: to.to_string(),
+            relation,
+            weight: 0.5,
+            call_count: 1,
+            in_error_path: false,
+            confidence,
+            call_site_line: None,
+            call_site_column: None,
+        }
+    }
+
     /// Compute composite weight from call_count, in_error_path, and confidence.
     pub fn compute_weight(&mut self) {
         if self.relation == EdgeRelation::Calls {
@@ -377,6 +410,8 @@ pub enum EdgeRelation {
     Overrides,
     /// Concrete method implements a trait/interface method
     Implements,
+    /// Entity belongs to a container (file→module, module→parent module)
+    BelongsTo,
 }
 
 impl std::fmt::Display for EdgeRelation {
@@ -389,6 +424,7 @@ impl std::fmt::Display for EdgeRelation {
             EdgeRelation::TestsFor => write!(f, "tests_for"),
             EdgeRelation::Overrides => write!(f, "overrides"),
             EdgeRelation::Implements => write!(f, "implements"),
+            EdgeRelation::BelongsTo => write!(f, "belongs_to"),
         }
     }
 }

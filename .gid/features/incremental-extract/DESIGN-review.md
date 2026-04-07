@@ -12,19 +12,23 @@
 
 ## 🟡 Important (should fix before implementation)
 
-### FINDING-1: Race condition on mtime check
+### FINDING-1: Race condition on mtime check ✅ Applied
 **[Concurrency]** Mtime-first check has a TOCTOU window: file could be written between mtime read (during scan) and content hash computation. In practice this is low-risk for a CLI tool (user runs `gid extract` manually), but worth documenting as a known limitation.
 
 **Suggested fix:** Add a note in Edge Cases: "File modified during extract → may miss the change; next extract will catch it."
 
-### FINDING-2: Dangling edge cleanup is under-specified
+**Resolution:** Edge Cases table includes this row. Already documented.
+
+### FINDING-2: Dangling edge cleanup is under-specified ✅ Applied
 **[Completeness]** Design says "Edges to deleted nodes become dangling → removed in cleanup" but doesn't specify:
 - When does cleanup run? After Phase 1 (remove stale) or after Phase 3 (resolve refs)?
 - Does it also handle edges FROM unchanged files TO deleted nodes? (e.g., file A calls function in deleted file B — file A is unchanged, so its edges aren't re-resolved)
 
 **Suggested fix:** Add to Phase 1 or between Phase 3 and 4: "Scan ALL edges; remove any edge where source or target node_id no longer exists in the graph."
 
-### FINDING-3: `edge_count` in FileState is lossy
+**Resolution:** Added dangling edge cleanup step to Phase 1 in flow diagram. Edge Cases table also documents this for the "Deleted file was imported by others" scenario.
+
+### FINDING-3: `edge_count` in FileState is lossy ✅ Applied
 **[Data Model]** `FileState` stores `edge_count: usize` but Phase 1 needs to remove specific edges from a file. With only a count, you can't identify which edges to remove. You'd need either:
 - Store edge source/target pairs, or
 - Store edge indices into the graph's edge list, or
@@ -34,10 +38,14 @@ The third option works (edges whose source is in `file.node_ids` belong to that 
 
 **Suggested fix:** Either (a) document that edge removal uses `node_ids` to find edges, making `edge_count` a reporting-only field, or (b) replace `edge_count` with `edge_keys: Vec<(String, String)>` for direct removal.
 
-### FINDING-4: No versioning on extract-meta.json
+**Resolution:** Option (a) applied. `edge_count` field comments clarify it is reporting-only; edge removal uses `node_ids` to find edges where source ∈ node_ids.
+
+### FINDING-4: No versioning on extract-meta.json ✅ Applied
 **[Robustness]** If the struct changes between gid versions (add fields, rename fields), old metadata files will fail to deserialize. Design should include a schema version.
 
 **Suggested fix:** Add `pub version: u32` to `ExtractMetadata`. On version mismatch → full rebuild (same as corrupted).
+
+**Resolution:** `ExtractMetadata` includes `version: u32` field with doc comment. Edge Cases table includes "Version mismatch in metadata → full rebuild" row.
 
 ## 🟢 Minor (can fix during implementation)
 

@@ -73,10 +73,17 @@ impl CodeGraph {
     }
 
     /// Get nodes that depend on this node (impact analysis).
+    /// Traverses all incoming edge relations.
     pub fn get_impact(&self, node_id: &str) -> Vec<&CodeNode> {
+        self.get_impact_filtered(node_id, None)
+    }
+
+    /// Get nodes that depend on this node, optionally filtering by edge relation.
+    /// If `relations` is None, traverses all edge types.
+    pub fn get_impact_filtered(&self, node_id: &str, relations: Option<&[EdgeRelation]>) -> Vec<&CodeNode> {
         let mut impacted = Vec::new();
         let mut visited = HashSet::new();
-        self.collect_dependents(node_id, &mut impacted, &mut visited);
+        self.collect_dependents_filtered(node_id, relations, &mut impacted, &mut visited);
         impacted
     }
 
@@ -86,14 +93,30 @@ impl CodeGraph {
         result: &mut Vec<&'a CodeNode>,
         visited: &mut HashSet<String>,
     ) {
+        self.collect_dependents_filtered(node_id, None, result, visited);
+    }
+
+    fn collect_dependents_filtered<'a>(
+        &'a self,
+        node_id: &str,
+        relations: Option<&[EdgeRelation]>,
+        result: &mut Vec<&'a CodeNode>,
+        visited: &mut HashSet<String>,
+    ) {
         if !visited.insert(node_id.to_string()) {
             return;
         }
 
         for edge in self.incoming_edges(node_id) {
+            // Skip if relation filter is set and this edge doesn't match
+            if let Some(rels) = relations {
+                if !rels.contains(&edge.relation) {
+                    continue;
+                }
+            }
             if let Some(node) = self.node_by_id(&edge.from) {
                 result.push(node);
-                self.collect_dependents(&edge.from, result, visited);
+                self.collect_dependents_filtered(&edge.from, relations, result, visited);
             }
         }
     }

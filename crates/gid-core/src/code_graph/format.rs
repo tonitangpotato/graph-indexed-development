@@ -544,6 +544,7 @@ impl CodeGraph {
             EdgeRelation::TestsFor => "tests_for",
             EdgeRelation::Overrides => "overrides",
             EdgeRelation::Implements => "implements",
+            EdgeRelation::BelongsTo => "belongs_to",
         }).collect();
 
         format!(

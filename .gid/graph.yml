@@ -748,6 +748,71 @@ nodes:
   - integration
   - test
   - P1
+- id: iss006-types
+  title: 'Add ExtractMetadata, FileState, FileDelta structs to code_graph/types.rs'
+  status: todo
+  description: 'Define ExtractMetadata (version, updated_at, files HashMap<String, FileState>),
+    FileState (mtime, content_hash, node_ids, edge_count), FileDelta (added, modified,
+    deleted, unchanged). Add Serialize/Deserialize derives. Storage at .gid/extract-meta.json.'
+  tags:
+  - iss006
+  - core
+  - P0
+- id: iss006-delta
+  title: Implement file delta computation (mtime + content hash comparison)
+  status: todo
+  description: 'Scan directory and compare against stored ExtractMetadata. Quick path:
+    check mtime only. If mtime changed, compute xxHash64 content hash to confirm real
+    change. Return FileDelta with added/modified/deleted/unchanged file lists.'
+  tags:
+  - iss006
+  - core
+  - P0
+- id: iss006-incremental
+  title: 'Implement extract_incremental() in extract.rs (Phase 1-3: remove stale,
+    parse changed, re-resolve refs)'
+  status: todo
+  description: 'New CodeGraph::extract_incremental(dir, meta_path, force) method. Phase
+    1: remove nodes+edges for deleted/modified files. Phase 2: tree-sitter parse added+modified
+    files, merge into graph. Phase 3: rebuild name maps from ALL nodes, resolve placeholder
+    refs only for new/modified edges. Falls back to full rebuild if no prior metadata.
+    Returns (CodeGraph, ExtractReport).'
+  tags:
+  - iss006
+  - core
+  - P0
+- id: iss006-lsp-incremental
+  title: Implement LSP incremental refinement in build.rs (Phase 4)
+  status: todo
+  description: 'Add refine_with_lsp_incremental(changed_files) variant in build.rs.
+    Only open changed files in LSP server. Query definition only for edges from changed
+    files. Keep existing LSP-refined edges for unchanged files. Leverages warm daemon
+    for fast queries.'
+  tags:
+  - iss006
+  - core
+  - P1
+- id: iss006-cli
+  title: Add --force flag to CLI extract command
+  status: todo
+  description: 'Add --force flag to gid extract CLI. When not set, call extract_incremental
+    by default. When set, ignore metadata and do full rebuild. Report: "Updated N files
+    (M modified, A added), U unchanged".'
+  tags:
+  - iss006
+  - cli
+  - P1
+- id: iss006-tests
+  title: Unit + integration tests for incremental extract
+  status: todo
+  description: 'Unit tests: FileDelta computation (added/modified/deleted/unchanged
+    detection, mtime-only vs hash-confirmed changes). Integration tests: full extract
+    then incremental with file changes, --force flag, corrupted metadata fallback,
+    deleted file edge cleanup, version mismatch triggers rebuild.'
+  tags:
+  - iss006
+  - test
+  - P0
 edges:
 - from: graph-types
   to: workspace-setup
@@ -1159,4 +1224,19 @@ edges:
   relation: depends_on
 - from: integration-tests
   to: context-assembly
+  relation: depends_on
+- from: iss006-delta
+  to: iss006-types
+  relation: depends_on
+- from: iss006-incremental
+  to: iss006-delta
+  relation: depends_on
+- from: iss006-lsp-incremental
+  to: iss006-incremental
+  relation: depends_on
+- from: iss006-cli
+  to: iss006-incremental
+  relation: depends_on
+- from: iss006-tests
+  to: iss006-incremental
   relation: depends_on
