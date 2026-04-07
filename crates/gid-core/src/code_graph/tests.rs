@@ -1028,4 +1028,81 @@ mod tests {
             scope_map.iter().map(|(_, _, id, _)| id).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn test_remap_cross_file_impl_defined_in_edges() {
+        use crate::code_graph::extract::remap_cross_file_impl_edges;
+        use crate::code_graph::types::*;
+
+        // Simulate: struct CodeGraph defined in extract.rs, impl CodeGraph in format.rs
+        let nodes = vec![
+            CodeNode {
+                id: "class:code_graph/extract.rs:CodeGraph".to_string(),
+                name: "CodeGraph".to_string(),
+                kind: NodeKind::Class,
+                file_path: "code_graph/extract.rs".to_string(),
+                line: None,
+                decorators: vec![],
+                signature: None,
+                docstring: None,
+                line_count: 0,
+                is_test: false,
+            },
+            CodeNode {
+                id: "method:code_graph/format.rs:CodeGraph.format_for_llm".to_string(),
+                name: "format_for_llm".to_string(),
+                kind: NodeKind::Function,
+                file_path: "code_graph/format.rs".to_string(),
+                line: None,
+                decorators: vec![],
+                signature: None,
+                docstring: None,
+                line_count: 0,
+                is_test: false,
+            },
+        ];
+
+        let mut edges = vec![
+            // This edge is dangling: class:code_graph/format.rs:CodeGraph doesn't exist
+            CodeEdge {
+                from: "method:code_graph/format.rs:CodeGraph.format_for_llm".to_string(),
+                to: "class:code_graph/format.rs:CodeGraph".to_string(),
+                relation: EdgeRelation::DefinedIn,
+                weight: 1.0,
+                call_count: 0,
+                in_error_path: false,
+                confidence: 1.0,
+                call_site_line: None,
+                call_site_column: None,
+            },
+            // This edge is fine: target node exists
+            CodeEdge {
+                from: "func:code_graph/extract.rs:some_func".to_string(),
+                to: "class:code_graph/extract.rs:CodeGraph".to_string(),
+                relation: EdgeRelation::Calls,
+                weight: 1.0,
+                call_count: 1,
+                in_error_path: false,
+                confidence: 1.0,
+                call_site_line: None,
+                call_site_column: None,
+            },
+        ];
+
+        remap_cross_file_impl_edges(&mut edges, &nodes);
+
+        // The dangling DefinedIn edge should now point to the actual class node
+        assert_eq!(
+            edges[0].to,
+            "class:code_graph/extract.rs:CodeGraph",
+            "DefinedIn edge should be remapped to actual class node"
+        );
+
+        // The Calls edge should be unchanged
+        assert_eq!(
+            edges[1].to,
+            "class:code_graph/extract.rs:CodeGraph",
+            "Non-dangling edge should be unchanged"
+        );
+    }
 }

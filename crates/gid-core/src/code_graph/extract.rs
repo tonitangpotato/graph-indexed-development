@@ -498,7 +498,53 @@ fn remove_phantom_nodes(
 }
 
 /// Deduplicate call edges, compute call_count, and compute weights.
+/// Remap DefinedIn edges from cross-file impl blocks to their actual class nodes.
+///
+/// When `impl FooBar { fn method() {} }` appears in file X but `struct FooBar` is
+/// defined in file Y, the method gets a DefinedIn edge like:
+///   method:X:FooBar.method → class:X:FooBar
+/// But the actual class node is `class:Y:FooBar`. This function remaps these
+/// dangling edges to point to the correct node.
+pub(crate) fn remap_cross_file_impl_edges(edges: &mut Vec<CodeEdge>, nodes: &[CodeNode]) {
+    // Build set of valid node IDs and a map from type_name → actual class node ID
+    let valid_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut type_to_class_id: HashMap<&str, &str> = HashMap::new();
+
+    for node in nodes {
+        if node.kind == NodeKind::Class {
+            // class:path/to/file.rs:TypeName → extract "TypeName"
+            if let Some(type_name) = node.id.rsplit(':').next() {
+                // If multiple classes have the same name, first one wins
+                // (could be improved with module-aware resolution)
+                type_to_class_id.entry(type_name).or_insert(&node.id);
+            }
+        }
+    }
+
+    for edge in edges.iter_mut() {
+        if edge.relation == EdgeRelation::DefinedIn
+            && edge.to.starts_with("class:")
+            && !valid_ids.contains(edge.to.as_str())
+        {
+            // Extract type name from the dangling class ref
+            if let Some(type_name) = edge.to.rsplit(':').next() {
+                if let Some(&actual_id) = type_to_class_id.get(type_name) {
+                    tracing::trace!(
+                        "Remapped cross-file impl edge: {} → {} (was {})",
+                        edge.from, actual_id, edge.to
+                    );
+                    edge.to = actual_id.to_string();
+                }
+            }
+        }
+    }
+}
+
 fn dedup_and_finalize_edges(edges: Vec<CodeEdge>, nodes: &[CodeNode]) -> Vec<CodeEdge> {
+    // Remap cross-file impl DefinedIn edges before deduplication
+    let mut edges = edges;
+    remap_cross_file_impl_edges(&mut edges, nodes);
+
     let mut edge_map: HashMap<(String, String), CodeEdge> = HashMap::new();
     let mut other_edges: Vec<CodeEdge> = Vec::new();
 
