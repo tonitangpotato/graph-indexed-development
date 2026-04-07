@@ -34,6 +34,7 @@ pub use code_graph::{
     UnifiedGraphResult, UnifiedNode, UnifiedEdge,
     ExtractMetadata, FileState, FileDelta, ExtractReport,
 };
+#[allow(deprecated)]
 pub use unified::{build_unified_graph, merge_relevant_code, link_tasks_to_code, UnifiedStats};
 pub use working_mem::{
     GidContext, NodeInfo, ErrorType, RiskLevel, ImpactAnalysis,

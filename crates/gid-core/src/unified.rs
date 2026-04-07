@@ -12,6 +12,7 @@ use std::collections::HashMap;
 /// 
 /// Code nodes become task nodes with status "active" and type based on their kind.
 /// Code edges become task edges with appropriate relation strings.
+#[deprecated(since = "0.3.1", note = "Use unify::codegraph_to_graph_nodes() + unify::merge_code_layer() instead")]
 pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph {
     let mut nodes = Vec::new();
     let mut seen_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -147,6 +148,7 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
 /// 
 /// This is useful for adding code context to a task graph without including
 /// the entire codebase.
+#[deprecated(since = "0.3.1", note = "Use unify::codegraph_to_graph_nodes() + unify::merge_code_layer() with pre-filtered nodes instead")]
 pub fn merge_relevant_code(
     code_graph: &CodeGraph,
     task_graph: &mut Graph,
@@ -223,6 +225,7 @@ pub fn merge_relevant_code(
 /// 
 /// Scans task descriptions and titles for file paths, then creates
 /// "relates_to" edges to the corresponding code nodes.
+#[deprecated(since = "0.3.1", note = "Use unify::merge_code_layer() which auto-creates bridge edges via auto_bridge_edges()")]
 pub fn link_tasks_to_code(code_graph: &CodeGraph, task_graph: &mut Graph) {
     let code_files: std::collections::HashSet<String> = code_graph.nodes.iter()
         .filter(|n| n.kind == NodeKind::File)
