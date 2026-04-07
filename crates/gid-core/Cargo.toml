@@ -11,9 +11,10 @@ categories = ["development-tools", "data-structures"]
 [features]
 default = ["graph"]
 graph = []
+sqlite = ["graph", "dep:rusqlite"]
 harness = ["graph", "dep:tokio", "dep:futures", "dep:async-trait", "dep:agentctl-auth", "dep:dirs", "dep:reqwest"]
 ritual = ["harness", "dep:glob", "dep:which"]
-full = ["ritual"]
+full = ["ritual", "sqlite"]
 
 [dependencies]
 serde = { workspace = true }
@@ -30,6 +31,9 @@ tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-javascript = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Optional: SQLite storage backend
+rusqlite = { version = "0.32", features = ["bundled", "backup"], optional = true }
 
 # Optional dependencies for harness feature
 tokio = { version = "1", features = ["full"], optional = true }
