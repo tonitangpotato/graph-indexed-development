@@ -309,6 +309,13 @@ impl Edge {
     pub fn depends_on(from: &str, to: &str) -> Self {
         Self::new(from, to, "depends_on")
     }
+
+    /// Extract the source from edge metadata (e.g. "extract", "auto-bridge", "project")
+    pub fn source(&self) -> Option<&str> {
+        self.metadata.as_ref()
+            .and_then(|m| m.get("source"))
+            .and_then(|v| v.as_str())
+    }
 }
 
 // ─── Graph operations ────────────────────────────────────────
@@ -379,10 +386,44 @@ impl Graph {
 
     // ── Query helpers ──
 
+    // ── Layer filtering helpers ──
+
+    /// Get all code nodes (source == "extract")
+    pub fn code_nodes(&self) -> Vec<&Node> {
+        self.nodes.iter().filter(|n| n.source.as_deref() == Some("extract")).collect()
+    }
+
+    /// Get all project nodes (source == "project" or legacy None)
+    pub fn project_nodes(&self) -> Vec<&Node> {
+        // TODO: after T4.1 migration backfills source on all nodes, remove the None branch
+        self.nodes.iter().filter(|n| {
+            n.source.as_deref().map_or(true, |s| s == "project")
+        }).collect()
+    }
+
+    /// Get all code edges (source == "extract")
+    pub fn code_edges(&self) -> Vec<&Edge> {
+        self.edges.iter().filter(|e| e.source() == Some("extract")).collect()
+    }
+
+    /// Get all project edges (not code, not bridge)
+    pub fn project_edges(&self) -> Vec<&Edge> {
+        self.edges.iter().filter(|e| {
+            let src = e.source();
+            src != Some("extract") && src != Some("auto-bridge")
+        }).collect()
+    }
+
+    /// Get all bridge edges (source == "auto-bridge")
+    pub fn bridge_edges(&self) -> Vec<&Edge> {
+        self.edges.iter().filter(|e| e.source() == Some("auto-bridge")).collect()
+    }
+
     /// Get tasks that are ready (todo + all depends_on are done).
+    /// Only considers project nodes; code nodes are excluded.
     pub fn ready_tasks(&self) -> Vec<&Node> {
-        self.nodes
-            .iter()
+        self.project_nodes()
+            .into_iter()
             .filter(|n| n.status == NodeStatus::Todo)
             .filter(|n| {
                 let deps: Vec<&Edge> = self.edges_from(&n.id)
@@ -402,14 +443,15 @@ impl Graph {
         self.nodes.iter().filter(|n| &n.status == status).collect()
     }
 
-    /// Summary statistics.
+    /// Summary statistics (counts only project nodes, not code nodes).
     pub fn summary(&self) -> GraphSummary {
+        let project_nodes = self.project_nodes();
         let mut s = GraphSummary {
-            total_nodes: self.nodes.len(),
+            total_nodes: project_nodes.len(),
             total_edges: self.edges.len(),
             ..Default::default()
         };
-        for n in &self.nodes {
+        for n in &project_nodes {
             match n.status {
                 NodeStatus::Todo => s.todo += 1,
                 NodeStatus::InProgress => s.in_progress += 1,
@@ -570,5 +612,116 @@ impl std::fmt::Display for GraphSummary {
             self.todo, self.in_progress, self.done, self.blocked, self.failed, self.cancelled,
             self.ready,
         )
+    }
+}
+
+#[cfg(test)]
+mod layer_filter_tests {
+    use super::*;
+
+    fn mixed_graph() -> Graph {
+        let mut g = Graph::new();
+        // Project nodes
+        let mut task = Node::new("task-1", "My Task");
+        task.source = Some("project".to_string());
+        g.add_node(task);
+
+        let legacy = Node::new("legacy-1", "Legacy Task");
+        // No source (legacy)
+        g.add_node(legacy);
+
+        // Code nodes
+        let mut code = Node::new("fn:main", "main function");
+        code.source = Some("extract".to_string());
+        code.node_type = Some("code".to_string());
+        code.status = NodeStatus::Done;
+        g.add_node(code);
+
+        let mut code2 = Node::new("struct:Config", "Config struct");
+        code2.source = Some("extract".to_string());
+        code2.node_type = Some("code".to_string());
+        code2.status = NodeStatus::Done;
+        g.add_node(code2);
+
+        // Edges
+        g.add_edge(Edge::new("task-1", "legacy-1", "depends_on"));
+
+        let mut code_edge = Edge::new("fn:main", "struct:Config", "calls");
+        code_edge.metadata = Some(serde_json::json!({"source": "extract"}));
+        g.add_edge(code_edge);
+
+        let mut bridge = Edge::new("task-1", "fn:main", "maps_to");
+        bridge.metadata = Some(serde_json::json!({"source": "auto-bridge"}));
+        g.add_edge(bridge);
+
+        g
+    }
+
+    #[test]
+    fn test_edge_source() {
+        let g = mixed_graph();
+        // Regular edge has no source
+        let proj_edge = g.edges.iter().find(|e| e.relation == "depends_on").unwrap();
+        assert_eq!(proj_edge.source(), None);
+
+        let code_edge = g.edges.iter().find(|e| e.relation == "calls").unwrap();
+        assert_eq!(code_edge.source(), Some("extract"));
+
+        let bridge_edge = g.edges.iter().find(|e| e.relation == "maps_to").unwrap();
+        assert_eq!(bridge_edge.source(), Some("auto-bridge"));
+    }
+
+    #[test]
+    fn test_code_nodes() {
+        let g = mixed_graph();
+        let cn = g.code_nodes();
+        assert_eq!(cn.len(), 2);
+        assert!(cn.iter().all(|n| n.source.as_deref() == Some("extract")));
+    }
+
+    #[test]
+    fn test_project_nodes() {
+        let g = mixed_graph();
+        let pn = g.project_nodes();
+        assert_eq!(pn.len(), 2); // task-1 + legacy-1
+        assert!(pn.iter().any(|n| n.id == "task-1"));
+        assert!(pn.iter().any(|n| n.id == "legacy-1"));
+    }
+
+    #[test]
+    fn test_code_edges() {
+        let g = mixed_graph();
+        assert_eq!(g.code_edges().len(), 1);
+    }
+
+    #[test]
+    fn test_project_edges() {
+        let g = mixed_graph();
+        assert_eq!(g.project_edges().len(), 1); // only depends_on
+    }
+
+    #[test]
+    fn test_bridge_edges() {
+        let g = mixed_graph();
+        assert_eq!(g.bridge_edges().len(), 1);
+    }
+
+    #[test]
+    fn test_summary_excludes_code_nodes() {
+        let g = mixed_graph();
+        let s = g.summary();
+        // Summary should count only project nodes (2), not code nodes (2)
+        assert_eq!(s.total_nodes, 2);
+    }
+
+    #[test]
+    fn test_ready_tasks_excludes_code_nodes() {
+        let mut g = mixed_graph();
+        // Make legacy-1 done so task-1 becomes ready
+        g.update_status("legacy-1", NodeStatus::Done);
+        let ready = g.ready_tasks();
+        // task-1 should be ready, code nodes should NOT appear
+        assert!(ready.iter().any(|n| n.id == "task-1"));
+        assert!(!ready.iter().any(|n| n.source.as_deref() == Some("extract")));
     }
 }

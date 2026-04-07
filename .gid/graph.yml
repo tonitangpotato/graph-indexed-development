@@ -813,6 +813,206 @@ nodes:
   - iss006
   - test
   - P0
+# ── Unified Graph Feature ──
+- id: feat-unified-graph
+  title: 'Feature: Unified Graph — merge code_graph.json into graph.yml'
+  status: todo
+  type: feature
+  description: 'Unify code_graph.json and graph.yml into a single persistent graph. Extract writes code nodes directly to graph.yml with layer isolation, bridge edges, and cross-layer queries.'
+  tags:
+  - unified-graph
+  - feature
+  metadata:
+    design_doc: '.gid/features/unified-graph/design.md'
+    requirements_doc: '.gid/features/unified-graph/requirements.md'
+    code_paths:
+    - crates/gid-core/src/graph.rs
+    - crates/gid-core/src/unify.rs
+    - crates/gid-core/src/unified.rs
+    - crates/gid-core/src/working_mem.rs
+    - crates/gid-core/src/code_graph
+    - crates/gid-cli/src/main.rs
+
+# Layer 0: Foundation
+- id: ug-t0.1-edge-source-helper
+  title: 'Edge.source() helper method'
+  status: todo
+  type: task
+  description: 'Add pub fn source(&self) -> Option<&str> on Edge. Extracts metadata.source from Option<serde_json::Value>. Covers ADR-2 convention.'
+  tags: [unified-graph, layer-0, p0]
+  metadata:
+    covers: 'ADR-2'
+    files: 'crates/gid-core/src/graph.rs'
+- id: ug-t0.2-layer-filter-helpers
+  title: 'Layer filtering helpers on Graph (code_nodes, project_nodes, etc.)'
+  status: todo
+  type: task
+  description: 'Add code_nodes(), project_nodes(), code_edges(), project_edges(), bridge_edges() on Graph. Update summary() and ready_tasks() to exclude code nodes.'
+  tags: [unified-graph, layer-0, p0]
+  metadata:
+    covers: 'GOAL-6.1, GOAL-6.8'
+    files: 'crates/gid-core/src/graph.rs'
+
+# Layer 1: Extract Core
+- id: ug-t1.1-codegraph-conversion
+  title: 'CodeGraph → Graph node/edge conversion (unify.rs)'
+  status: todo
+  type: task
+  description: 'Create codegraph_to_graph_nodes() in new unify.rs. Maps CodeNode→Node (source=extract, node_type=code, node_kind=raw). Maps CodeEdge→Edge with snake_case relations.'
+  tags: [unified-graph, layer-1, p0]
+  metadata:
+    covers: 'GOAL-1.1, GOAL-1.2, GUARD-3'
+    files: 'crates/gid-core/src/unify.rs'
+- id: ug-t1.2-extract-writes-graphyml
+  title: 'Extract writes code nodes to graph.yml (core change)'
+  status: todo
+  type: task
+  description: 'Modify extract flow: parse→CodeGraph→convert→load graph.yml→remove old code nodes→append new→atomic write. --force clears all code nodes. No more code_graph.json output.'
+  tags: [unified-graph, layer-1, p0]
+  metadata:
+    covers: 'GOAL-1.3, GOAL-1.5, GOAL-1.6, GUARD-1, GUARD-2'
+    files: 'crates/gid-cli/src/main.rs, crates/gid-core/src/unify.rs'
+- id: ug-t1.3-extract-meta-semantics
+  title: 'Update extract-meta.json to reference graph.yml node IDs'
+  status: todo
+  type: task
+  description: 'FileState.node_ids now refers to graph.yml nodes. Incremental extract removes changed files nodes from graph.yml. Update extract-meta.json after extract.'
+  tags: [unified-graph, layer-1, p1]
+  metadata:
+    covers: 'GOAL-1.4'
+    files: 'crates/gid-core/src/code_graph/extract.rs, crates/gid-core/src/unify.rs'
+
+# Layer 2: Auto-features
+- id: ug-t2.1-auto-semantify
+  title: 'Auto-semantify after extract + --no-semantify flag'
+  status: todo
+  type: task
+  description: 'After code nodes written to graph.yml, auto-run semantify on code nodes. Add --no-semantify flag to skip.'
+  tags: [unified-graph, layer-2, p0]
+  metadata:
+    covers: 'GOAL-2.1, GOAL-2.2'
+    files: 'crates/gid-cli/src/main.rs, crates/gid-core/src/semantify.rs'
+- id: ug-t2.2-bridge-edges
+  title: 'Bridge edge generation (code_paths + fallback matching)'
+  status: todo
+  type: task
+  description: 'Generate maps_to bridge edges. Priority: code_paths metadata > ID prefix matching. Delete all auto-bridge edges first, then regenerate. Confidence: 1.0/0.8.'
+  tags: [unified-graph, layer-2, p1]
+  metadata:
+    covers: 'GOAL-3.1, GOAL-3.2, GOAL-3.3, GOAL-3.4'
+    files: 'crates/gid-core/src/unify.rs'
+- id: ug-t2.3-layer-cli
+  title: '--layer and --type CLI filters for all commands'
+  status: todo
+  type: task
+  description: 'Add --layer <code|project|all> to tasks/visual/read/query. Per-command defaults. Add --type filter for query. Layer→node filter→edge filter (both endpoints visible).'
+  tags: [unified-graph, layer-2, p0]
+  metadata:
+    covers: 'GOAL-6.2, GOAL-6.3, GOAL-6.4, GOAL-4.3, GOAL-6.7'
+    files: 'crates/gid-cli/src/main.rs, crates/gid-core/src/query.rs'
+- id: ug-t2.4-stats-layer
+  title: 'gid stats per-layer breakdown'
+  status: todo
+  type: task
+  description: 'Update gid stats to show project/code/bridge counts.'
+  tags: [unified-graph, layer-2, p2]
+  metadata:
+    covers: 'GOAL-6.6'
+    files: 'crates/gid-cli/src/main.rs'
+
+# Layer 3: Migration & Deprecation
+- id: ug-t3.1-working-mem-migration
+  title: 'working_mem.rs: CodeGraph → Graph parameter migration'
+  status: todo
+  type: task
+  description: 'Change query_gid_context, analyze_impact params from &CodeGraph to &Graph. Use graph.code_nodes() internally. Update FunctionInfo to accept &Node.'
+  tags: [unified-graph, layer-3, p0]
+  metadata:
+    covers: 'GOAL-8.1'
+    files: 'crates/gid-core/src/working_mem.rs'
+- id: ug-t3.2-cli-extract-migration
+  title: 'CLI cmd_extract: remove build_unified_graph() call'
+  status: todo
+  type: task
+  description: 'cmd_extract stops calling build_unified_graph(). Extract writes to graph.yml (T1.2), then reloads.'
+  tags: [unified-graph, layer-3, p0]
+  metadata:
+    covers: 'GOAL-8.2'
+    files: 'crates/gid-cli/src/main.rs'
+- id: ug-t3.3-scheduler-migration
+  title: 'harness scheduler: remove build_unified_graph() call'
+  status: todo
+  type: task
+  description: 'post_layer_extract loads graph from graph.yml directly.'
+  tags: [unified-graph, layer-3, p0]
+  metadata:
+    covers: 'GOAL-8.3'
+    files: 'crates/gid-core/src/harness/scheduler.rs'
+- id: ug-t3.4-ritual-executor-migration
+  title: 'ritual executor: remove build_unified_graph() call'
+  status: todo
+  type: task
+  description: 'Extract phase in ritual uses graph.yml directly.'
+  tags: [unified-graph, layer-3, p0]
+  metadata:
+    covers: 'GOAL-8.4'
+    files: 'crates/gid-core/src/ritual/executor.rs'
+- id: ug-t3.5-deprecate-unified
+  title: 'Deprecate build_unified_graph(), mark CodeGraph pub API'
+  status: todo
+  type: task
+  description: 'Add #[deprecated] to build_unified_graph(), merge_relevant_code(), link_tasks_to_code(). Remove re-exports from lib.rs.'
+  tags: [unified-graph, layer-3, p1]
+  metadata:
+    covers: 'GOAL-5.2, GOAL-5.3'
+    files: 'crates/gid-core/src/unified.rs, crates/gid-core/src/lib.rs'
+- id: ug-t3.6-schema-migration
+  title: 'gid schema: read from graph.yml code nodes first'
+  status: todo
+  type: task
+  description: 'gid schema reads code nodes from graph.yml. If found → generate schema. If not → fallback to running extract.'
+  tags: [unified-graph, layer-3, p1]
+  metadata:
+    covers: 'GOAL-5.4'
+    files: 'crates/gid-cli/src/main.rs'
+
+# Layer 4: Cleanup
+- id: ug-t4.1-code-graph-migration
+  title: 'One-time code_graph.json → graph.yml migration'
+  status: todo
+  type: task
+  description: 'On first extract, if code_graph.json exists AND graph.yml has no code nodes → auto-migrate. Old graph.yml backward compat via serde(default).'
+  tags: [unified-graph, layer-4, p1]
+  metadata:
+    covers: 'GOAL-7.1, GOAL-7.2'
+    files: 'crates/gid-core/src/unify.rs, crates/gid-cli/src/main.rs'
+- id: ug-t4.2-rustclaw-tools
+  title: 'RustClaw tools migration (Extract/Schema/Complexity/WorkingMem)'
+  status: todo
+  type: task
+  description: 'Update GidExtractTool, GidSchemaTool, GidComplexityTool, GidWorkingMemoryTool to use unified graph.'
+  tags: [unified-graph, layer-4, p1]
+  metadata:
+    covers: 'GOAL-8.5'
+    files: 'rustclaw/src/tools.rs'
+- id: ug-t4.3-cross-layer-test
+  title: 'ADR-5 verification: cross-layer query integration test'
+  status: todo
+  type: task
+  description: 'Test task→feature→code traversal via bridge edges. Verify impact() and deps() cross layers. No query engine changes needed.'
+  tags: [unified-graph, layer-4, p0]
+  metadata:
+    covers: 'GOAL-4.1'
+    files: 'crates/gid-core/src/query.rs'
+- id: ug-t4.4-perf-benchmark
+  title: 'Performance benchmark: extract + tasks latency'
+  status: todo
+  type: task
+  description: 'Benchmark gid tasks with 0 vs 2000 code nodes (<2x). Benchmark extract time (<1.2x). 500 files, 2000 nodes.'
+  tags: [unified-graph, layer-4, p1]
+  metadata:
+    covers: 'GOAL-6.7, GUARD-4'
+
 edges:
 - from: graph-types
   to: workspace-setup
@@ -1239,4 +1439,149 @@ edges:
   relation: depends_on
 - from: iss006-tests
   to: iss006-incremental
+  relation: depends_on
+
+# ── Unified Graph Feature Edges ──
+# subtask_of
+- from: ug-t0.1-edge-source-helper
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t0.2-layer-filter-helpers
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t1.1-codegraph-conversion
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t1.2-extract-writes-graphyml
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t1.3-extract-meta-semantics
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t2.1-auto-semantify
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t2.2-bridge-edges
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t2.3-layer-cli
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t2.4-stats-layer
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t3.1-working-mem-migration
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t3.2-cli-extract-migration
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t3.3-scheduler-migration
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t3.4-ritual-executor-migration
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t3.5-deprecate-unified
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t3.6-schema-migration
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t4.1-code-graph-migration
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t4.2-rustclaw-tools
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t4.3-cross-layer-test
+  to: feat-unified-graph
+  relation: subtask_of
+- from: ug-t4.4-perf-benchmark
+  to: feat-unified-graph
+  relation: subtask_of
+# Layer 0 → Layer 1
+- from: ug-t1.1-codegraph-conversion
+  to: ug-t0.1-edge-source-helper
+  relation: depends_on
+- from: ug-t1.2-extract-writes-graphyml
+  to: ug-t0.1-edge-source-helper
+  relation: depends_on
+- from: ug-t1.2-extract-writes-graphyml
+  to: ug-t0.2-layer-filter-helpers
+  relation: depends_on
+- from: ug-t1.2-extract-writes-graphyml
+  to: ug-t1.1-codegraph-conversion
+  relation: depends_on
+- from: ug-t1.3-extract-meta-semantics
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+# Layer 1 → Layer 2
+- from: ug-t2.1-auto-semantify
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t2.2-bridge-edges
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t2.3-layer-cli
+  to: ug-t0.2-layer-filter-helpers
+  relation: depends_on
+- from: ug-t2.3-layer-cli
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t2.4-stats-layer
+  to: ug-t0.2-layer-filter-helpers
+  relation: depends_on
+# Layer 1 → Layer 3
+- from: ug-t3.1-working-mem-migration
+  to: ug-t0.2-layer-filter-helpers
+  relation: depends_on
+- from: ug-t3.1-working-mem-migration
+  to: ug-t1.1-codegraph-conversion
+  relation: depends_on
+- from: ug-t3.2-cli-extract-migration
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t3.3-scheduler-migration
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t3.4-ritual-executor-migration
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t3.5-deprecate-unified
+  to: ug-t3.1-working-mem-migration
+  relation: depends_on
+- from: ug-t3.5-deprecate-unified
+  to: ug-t3.2-cli-extract-migration
+  relation: depends_on
+- from: ug-t3.5-deprecate-unified
+  to: ug-t3.3-scheduler-migration
+  relation: depends_on
+- from: ug-t3.5-deprecate-unified
+  to: ug-t3.4-ritual-executor-migration
+  relation: depends_on
+- from: ug-t3.6-schema-migration
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+# Layer 2+3 → Layer 4
+- from: ug-t4.1-code-graph-migration
+  to: ug-t1.1-codegraph-conversion
+  relation: depends_on
+- from: ug-t4.2-rustclaw-tools
+  to: ug-t3.1-working-mem-migration
+  relation: depends_on
+- from: ug-t4.2-rustclaw-tools
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t4.3-cross-layer-test
+  to: ug-t2.2-bridge-edges
+  relation: depends_on
+- from: ug-t4.3-cross-layer-test
+  to: ug-t2.3-layer-cli
+  relation: depends_on
+- from: ug-t4.4-perf-benchmark
+  to: ug-t1.2-extract-writes-graphyml
+  relation: depends_on
+- from: ug-t4.4-perf-benchmark
+  to: ug-t2.3-layer-cli
   relation: depends_on

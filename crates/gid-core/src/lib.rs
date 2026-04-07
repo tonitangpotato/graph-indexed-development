@@ -4,6 +4,7 @@ pub mod parser;
 pub mod validator;
 pub mod code_graph;
 pub mod unified;
+pub mod unify;
 pub mod working_mem;
 pub mod history;
 pub mod visual;
