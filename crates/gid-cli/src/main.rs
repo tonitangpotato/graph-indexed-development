@@ -444,6 +444,28 @@ enum Commands {
     /// Stop execution gracefully (marks cancel_requested)
     Stop,
 
+    /// Assemble context for target nodes (code, deps, callers, tests)
+    Context {
+        /// Target node IDs (comma-separated)
+        #[arg(short, long, required = true, value_delimiter = ',')]
+        targets: Vec<String>,
+        /// Maximum token budget (default: 8000)
+        #[arg(long, default_value = "8000")]
+        max_tokens: usize,
+        /// Maximum traversal depth (default: 2)
+        #[arg(short, long, default_value = "2")]
+        depth: u32,
+        /// Include filter patterns (repeatable). Use "*.rs" for file globs, "type:function" for node types.
+        #[arg(short, long)]
+        include: Vec<String>,
+        /// Output format: markdown, json, yaml (default: markdown)
+        #[arg(short, long, default_value = "markdown")]
+        format: String,
+        /// Project root for source code loading (default: auto-detect)
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════════════
     // Migration Commands (requires "sqlite" feature)
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -869,6 +891,12 @@ fn main() -> Result<()> {
         Commands::Stats => cmd_stats(resolve_graph_path(cli.graph)?, cli.json),
         Commands::Approve => cmd_approve(resolve_graph_path(cli.graph)?, cli.json),
         Commands::Stop => cmd_stop(resolve_graph_path(cli.graph)?, cli.json),
+
+        // Context command
+        Commands::Context { targets, max_tokens, depth, include, format, project_root } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_context_ctx(&ctx, targets, max_tokens, depth, include, &format, project_root, cli.json)
+        }
 
         // Migration command
         Commands::Migrate { source, target, force, no_validate, verbose } => {
@@ -1589,6 +1617,71 @@ fn cmd_refactor_extract_ctx(ctx: &GraphContext, nodes: &[String], parent: &str, 
 
 fn cmd_plan_ctx(ctx: &GraphContext, format: &str, json: bool) -> Result<()> {
     cmd_plan(ctx.graph_yml.clone(), format, json)
+}
+
+/// Handle `gid context` — assemble context for target nodes. **[GOAL-4.9, 4.12]**
+fn cmd_context_ctx(
+    ctx: &GraphContext,
+    targets: Vec<String>,
+    max_tokens: usize,
+    depth: u32,
+    include: Vec<String>,
+    format: &str,
+    project_root: Option<PathBuf>,
+    json_flag: bool,
+) -> Result<()> {
+    use gid_core::harness::{
+        ContextQuery, ContextFilters, OutputFormat, assemble_context, format_context,
+    };
+
+    let graph = ctx.load()?;
+
+    // Parse output format — --json flag overrides --format.
+    let output_format = if json_flag {
+        OutputFormat::Json
+    } else {
+        format.parse::<OutputFormat>()
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+    };
+
+    // Resolve project root: explicit flag > walk-up from .gid dir > cwd.
+    let resolved_root = project_root
+        .or_else(|| {
+            // .gid is usually inside the project root.
+            ctx.gid_dir.parent().map(|p| p.to_path_buf())
+        })
+        .or_else(|| std::env::current_dir().ok());
+
+    let query = ContextQuery {
+        targets,
+        token_budget: max_tokens,
+        depth,
+        filters: ContextFilters {
+            include_patterns: include,
+            ..Default::default()
+        },
+        format: output_format,
+        project_root: resolved_root,
+    };
+
+    let assembled = assemble_context(&graph, &query)?;
+
+    // Output the result.
+    let output = format_context(&assembled, output_format);
+    println!("{}", output);
+
+    // Log stats to stderr (GOAL-4.13) — in addition to the tracing::info inside assemble_context.
+    eprintln!(
+        "context: {} visited, {} included, {} filtered, {}/{} tokens, {}ms",
+        assembled.stats.nodes_visited,
+        assembled.stats.nodes_included,
+        assembled.stats.nodes_excluded_by_filter,
+        assembled.stats.budget_used,
+        assembled.stats.budget_total,
+        assembled.stats.elapsed_ms,
+    );
+
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

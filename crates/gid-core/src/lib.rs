@@ -20,6 +20,7 @@ pub mod lsp_client;
 pub mod lsp_daemon;
 pub mod harness;
 pub mod storage;
+pub mod identity;
 
 // Ritual module (requires "ritual" feature)
 #[cfg(feature = "ritual")]
@@ -84,6 +85,9 @@ pub use complexity::{
 };
 pub use lsp_client::{
     LspClient, LspEnrichmentStats, LspLocation, LspRefinementStats, LspServerConfig,
+};
+pub use identity::{
+    Identity, Organization, Group, Email, SigningKey, IdentityError, IdentityBuilder,
 };
 // Ritual re-exports (requires "ritual" feature)
 #[cfg(feature = "ritual")]

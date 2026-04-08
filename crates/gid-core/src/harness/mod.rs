@@ -26,6 +26,10 @@ pub use types::{
 pub use topology::{detect_cycles, compute_layers, critical_path, orphan_tasks};
 pub use planner::create_plan;
 pub use context::assemble_task_context;
+pub use context::{
+    ContextQuery, ContextFilters, OutputFormat, ContextStats,
+    AssembledContext, assemble_context, format_context,
+};
 pub use config::load_config;
 
 // ═══════════════════════════════════════════════════════════════════════════════

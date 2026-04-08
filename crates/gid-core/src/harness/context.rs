@@ -4,6 +4,7 @@
 //! sections, requirements goals, and project guards.
 
 use std::path::Path;
+use std::collections::{HashSet, VecDeque};
 use anyhow::Result;
 use crate::graph::Graph;
 use super::types::{TaskContext, TaskInfo};
@@ -879,6 +880,620 @@ pub fn load_source_from_disk(
                 end_line: None,
                 line_count,
             })
+        }
+    }
+}
+
+// =============================================================================
+// §9 Context Query & Assembly Pipeline (GOAL-4.1–4.13)
+// =============================================================================
+
+/// Filters that narrow which candidate nodes are eligible. **[GOAL-4.8]**
+#[derive(Debug, Clone, Default)]
+pub struct ContextFilters {
+    /// GOAL-4.8: --include patterns. Supports file path globs (e.g., "*.rs")
+    /// and node type filters (e.g., "type:function").
+    /// Semantics: if non-empty, a candidate must match at least one pattern.
+    pub include_patterns: Vec<String>,
+    /// Exclude nodes whose IDs match any of these patterns.
+    pub exclude_ids: Vec<String>,
+    /// Only include nodes modified after this timestamp (epoch secs).
+    pub modified_after: Option<i64>,
+}
+
+/// GOAL-4.9: Output format selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable markdown sections (default).
+    Markdown,
+    /// Machine-parseable JSON.
+    Json,
+    /// Same structure as JSON but in YAML syntax.
+    Yaml,
+}
+
+impl Default for OutputFormat {
+    fn default() -> Self { Self::Markdown }
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "markdown" | "md" => Ok(Self::Markdown),
+            "json" => Ok(Self::Json),
+            "yaml" | "yml" => Ok(Self::Yaml),
+            other => Err(format!("unknown format '{}': expected markdown, json, or yaml", other)),
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Markdown => write!(f, "markdown"),
+            Self::Json => write!(f, "json"),
+            Self::Yaml => write!(f, "yaml"),
+        }
+    }
+}
+
+/// A request for assembled context. **[GOAL-4.1, 4.6]**
+#[derive(Debug, Clone)]
+pub struct ContextQuery {
+    /// GOAL-4.6: One or more target node IDs whose context we are assembling.
+    /// At least one target must be specified.
+    pub targets: Vec<String>,
+    /// Maximum token budget for the assembled output. **[GOAL-4.2]**
+    pub token_budget: usize,
+    /// Maximum traversal depth (hops from any target). **[GOAL-4.7]**
+    /// Default: 2.
+    pub depth: u32,
+    /// Optional filters to narrow candidates. **[GOAL-4.8]**
+    pub filters: ContextFilters,
+    /// Output format. **[GOAL-4.9]**
+    pub format: OutputFormat,
+    /// Project root for source code loading. **[GOAL-4.1b]**
+    pub project_root: Option<std::path::PathBuf>,
+}
+
+impl Default for ContextQuery {
+    fn default() -> Self {
+        Self {
+            targets: Vec::new(),
+            token_budget: 8000,
+            depth: 2,
+            filters: ContextFilters::default(),
+            format: OutputFormat::default(),
+            project_root: None,
+        }
+    }
+}
+
+/// Traversal statistics for observability. **[GOAL-4.13]**
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ContextStats {
+    /// Total nodes visited during traversal.
+    pub nodes_visited: usize,
+    /// Nodes included in the final output.
+    pub nodes_included: usize,
+    /// Nodes excluded by --include filter.
+    pub nodes_excluded_by_filter: usize,
+    /// Tokens used in the assembled context.
+    pub budget_used: usize,
+    /// Total token budget available.
+    pub budget_total: usize,
+    /// Elapsed time in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+/// Extended context result with statistics. **[GOAL-4.1, 4.13]**
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AssembledContext {
+    /// The categorized context result.
+    #[serde(flatten)]
+    pub result: ContextResult,
+    /// Traversal statistics (GOAL-4.13).
+    pub stats: ContextStats,
+}
+
+/// Top-level entry point for context assembly. **[GOAL-4.2, 4.3, 4.12]**
+///
+/// This is the library function that CLI/MCP/LSP all call.
+/// Takes a `Graph` (already loaded) and a `ContextQuery`, returns
+/// a structured `AssembledContext` with stats.
+pub fn assemble_context(
+    graph: &Graph,
+    query: &ContextQuery,
+) -> Result<AssembledContext> {
+    let start = std::time::Instant::now();
+
+    // Validate: at least one target (GOAL-4.6).
+    if query.targets.is_empty() {
+        return Err(anyhow::anyhow!("--targets: at least one target node ID required"));
+    }
+
+    let mut stats = ContextStats {
+        budget_total: query.token_budget,
+        ..Default::default()
+    };
+    let mut filter_excluded = 0usize;
+
+    // Stage 1: Gather target node details + source code from disk.
+    let targets = gather_targets(graph, &query.targets, query.project_root.as_deref())?;
+    stats.nodes_visited += targets.len();
+
+    // Stage 2: Multi-source BFS — gather dependency candidates.
+    let (dep_candidates, dep_filtered) = gather_dependencies(
+        graph, &query.targets, query.depth, &query.filters, query.project_root.as_deref(),
+    );
+    stats.nodes_visited += dep_candidates.len() + dep_filtered;
+    filter_excluded += dep_filtered;
+
+    // Stage 3: Reverse-edge traversal — gather callers and tests.
+    let (caller_candidates, test_candidates) = gather_callers_and_tests(
+        graph, &query.targets, query.project_root.as_deref(),
+    );
+    stats.nodes_visited += caller_candidates.len() + test_candidates.len();
+
+    // Stage 4: Score all candidates by edge-relation relevance (GOAL-4.4).
+    let scored_deps = score_candidates(&dep_candidates);
+    let scored_callers = score_candidates(&caller_candidates);
+    let scored_tests = score_candidates(&test_candidates);
+
+    // Stage 5: Category-based budget allocation (GOAL-4.3).
+    let context_result = budget_fit_by_category(
+        &targets,
+        scored_deps,
+        scored_callers,
+        scored_tests,
+        query.token_budget,
+    );
+
+    // Stage 6: Record stats (GOAL-4.13).
+    stats.nodes_included = context_result.total_included();
+    stats.nodes_excluded_by_filter = filter_excluded;
+    stats.budget_used = context_result.estimated_tokens;
+    stats.elapsed_ms = start.elapsed().as_millis() as u64;
+
+    // Log traversal stats to stderr (GOAL-4.13).
+    tracing::info!(
+        visited = stats.nodes_visited,
+        included = stats.nodes_included,
+        excluded_filter = stats.nodes_excluded_by_filter,
+        budget = %format!("{}/{}", stats.budget_used, stats.budget_total),
+        elapsed_ms = stats.elapsed_ms,
+        "context assembly complete"
+    );
+
+    Ok(AssembledContext {
+        result: context_result,
+        stats,
+    })
+}
+
+/// Stage 1: Gather full details for each target node. **[GOAL-4.1, 4.1b]**
+fn gather_targets(
+    graph: &Graph,
+    target_ids: &[String],
+    project_root: Option<&Path>,
+) -> Result<Vec<TargetContext>> {
+    let mut targets = Vec::new();
+
+    for id in target_ids {
+        let node = graph.get_node(id)
+            .ok_or_else(|| anyhow::anyhow!("target node not found: {}", id))?;
+
+        // GOAL-4.1b: Read source code from disk if file_path + line range available.
+        let source_code = if let Some(root) = project_root {
+            load_source_from_disk(
+                node.file_path.as_deref(),
+                node.start_line,
+                node.end_line,
+                root,
+            ).map(|r| r.source)
+        } else {
+            None
+        };
+
+        targets.push(TargetContext::new(
+            node.id.clone(),
+            Some(node.title.clone()),
+            node.file_path.clone(),
+            node.signature.clone(),
+            node.doc_comment.clone(),
+            node.description.clone(),
+            source_code,
+        ));
+    }
+
+    Ok(targets)
+}
+
+/// Stage 2: Multi-source BFS with depth limit for dependencies. **[GOAL-4.7, 4.8]**
+///
+/// Returns (candidates, filtered_count) — filtered_count is nodes excluded by filters.
+fn gather_dependencies(
+    graph: &Graph,
+    root_ids: &[String],
+    max_depth: u32,
+    filters: &ContextFilters,
+    project_root: Option<&Path>,
+) -> (Vec<Candidate>, usize) {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, u32, String)> = VecDeque::new();
+    let mut results: Vec<Candidate> = Vec::new();
+    let mut filtered_count = 0usize;
+
+    // Initialize: mark roots as visited, enqueue their outgoing neighbors at hop 1.
+    for root_id in root_ids {
+        visited.insert(root_id.clone());
+    }
+
+    for root_id in root_ids {
+        for edge in &graph.edges {
+            if edge.from == *root_id {
+                if !visited.contains(&edge.to) {
+                    visited.insert(edge.to.clone());
+                    queue.push_back((edge.to.clone(), 1, edge.relation.clone()));
+                }
+            }
+        }
+    }
+
+    while let Some((current_id, hop, relation)) = queue.pop_front() {
+        if hop > max_depth { continue; }
+
+        let node = match graph.get_node(&current_id) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let source_code = if let Some(root) = project_root {
+            load_source_from_disk(
+                node.file_path.as_deref(),
+                node.start_line,
+                node.end_line,
+                root,
+            ).map(|r| r.source)
+        } else {
+            None
+        };
+
+        let candidate = Candidate {
+            node_id: current_id.clone(),
+            node_type: node.node_type.clone().unwrap_or_default(),
+            file_path: node.file_path.clone(),
+            signature: node.signature.clone(),
+            doc_comment: node.doc_comment.clone(),
+            description: node.description.clone(),
+            source_code,
+            hop_distance: hop,
+            modified_at: None,
+            connecting_relation: relation,
+            token_estimate: 0, // computed in scoring
+        };
+
+        // GOAL-4.8: Apply --include filters.
+        if passes_filters(&candidate, filters) {
+            results.push(candidate);
+        } else {
+            filtered_count += 1;
+        }
+
+        // Expand forward for next hop.
+        if hop < max_depth {
+            for edge in &graph.edges {
+                if edge.from == current_id && !visited.contains(&edge.to) {
+                    visited.insert(edge.to.clone());
+                    queue.push_back((edge.to.clone(), hop + 1, edge.relation.clone()));
+                }
+            }
+        }
+    }
+
+    (results, filtered_count)
+}
+
+/// Stage 3: Reverse-edge traversal for callers and tests. **[GOAL-4.1e, 4.1f]**
+fn gather_callers_and_tests(
+    graph: &Graph,
+    target_ids: &[String],
+    project_root: Option<&Path>,
+) -> (Vec<Candidate>, Vec<Candidate>) {
+    let mut callers = Vec::new();
+    let mut tests = Vec::new();
+    let target_set: HashSet<&str> = target_ids.iter().map(|s| s.as_str()).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for target_id in target_ids {
+        // Find edges where to == target_id (incoming edges).
+        for edge in &graph.edges {
+            if edge.to != *target_id { continue; }
+            if target_set.contains(edge.from.as_str()) { continue; }
+            if seen.contains(&edge.from) { continue; }
+            seen.insert(edge.from.clone());
+
+            let node = match graph.get_node(&edge.from) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let source_code = if let Some(root) = project_root {
+                load_source_from_disk(
+                    node.file_path.as_deref(),
+                    node.start_line,
+                    node.end_line,
+                    root,
+                ).map(|r| r.source)
+            } else {
+                None
+            };
+
+            let candidate = Candidate {
+                node_id: node.id.clone(),
+                node_type: node.node_type.clone().unwrap_or_default(),
+                file_path: node.file_path.clone(),
+                signature: node.signature.clone(),
+                doc_comment: node.doc_comment.clone(),
+                description: node.description.clone(),
+                source_code,
+                hop_distance: 1,
+                modified_at: None,
+                connecting_relation: edge.relation.clone(),
+                token_estimate: 0,
+            };
+
+            // Categorize: tests_for → test, everything else → caller.
+            match edge.relation.as_str() {
+                "tests_for" => tests.push(candidate),
+                _ => callers.push(candidate),
+            }
+        }
+    }
+
+    (callers, tests)
+}
+
+/// GOAL-4.8: Filter by --include patterns.
+///
+/// If `include_patterns` is empty, all candidates pass.
+/// Patterns prefixed with "type:" match node_type (e.g., "type:function").
+/// Other patterns match file_path as a glob.
+fn passes_filters(candidate: &Candidate, filters: &ContextFilters) -> bool {
+    // Check exclude_ids
+    if filters.exclude_ids.iter().any(|ex| candidate.node_id == *ex) {
+        return false;
+    }
+
+    // Check modified_after
+    if let Some(threshold) = filters.modified_after {
+        if let Some(modified) = candidate.modified_at {
+            if modified < threshold { return false; }
+        }
+        // If no modified_at on node, keep it (don't filter on missing data).
+    }
+
+    // Check include_patterns (any-match semantics).
+    if filters.include_patterns.is_empty() { return true; }
+
+    for pattern in &filters.include_patterns {
+        if let Some(type_filter) = pattern.strip_prefix("type:") {
+            // Match by node_type.
+            if candidate.node_type == type_filter { return true; }
+        } else {
+            // Match by file path glob.
+            if let Some(ref path) = candidate.file_path {
+                if simple_glob_match(pattern, path) { return true; }
+            }
+        }
+    }
+
+    false // No pattern matched.
+}
+
+/// Simple glob matching for --include patterns.
+///
+/// Supports:
+/// - `*` matches any sequence of non-`/` characters
+/// - `**` matches any sequence including `/`
+/// - `?` matches a single character
+/// - Literal characters match exactly
+fn simple_glob_match(pattern: &str, text: &str) -> bool {
+    // Handle ** (matches everything including path separators).
+    if pattern == "**" { return true; }
+
+    // Split pattern on `**` segments for recursive matching.
+    if pattern.contains("**") {
+        let parts: Vec<&str> = pattern.split("**").collect();
+        if parts.len() == 2 {
+            let prefix = parts[0];
+            let suffix = parts[1];
+            // Prefix must match the start.
+            if !prefix.is_empty() {
+                let prefix_trimmed = prefix.trim_end_matches('/');
+                if !text.starts_with(prefix_trimmed) { return false; }
+            }
+            // Suffix must match the end (with glob).
+            if !suffix.is_empty() {
+                let suffix_trimmed = suffix.trim_start_matches('/');
+                // Check if any tail of text matches the suffix pattern.
+                for (i, _) in text.char_indices() {
+                    if simple_glob_segment(suffix_trimmed, &text[i..]) { return true; }
+                }
+                return simple_glob_segment(suffix_trimmed, "");
+            }
+            return true;
+        }
+    }
+
+    simple_glob_segment(pattern, text)
+}
+
+/// Match a glob pattern segment (without **) against text.
+fn simple_glob_segment(pattern: &str, text: &str) -> bool {
+    let mut pi = pattern.chars().peekable();
+    let mut ti = text.chars().peekable();
+
+    while pi.peek().is_some() || ti.peek().is_some() {
+        match pi.peek() {
+            Some('*') => {
+                pi.next();
+                // * matches zero or more non-/ chars.
+                if pi.peek().is_none() {
+                    // Trailing * — match rest if no slashes.
+                    return !ti.any(|c| c == '/');
+                }
+                // Try matching the rest of the pattern after *.
+                let remaining_pattern: String = pi.clone().collect();
+                let remaining_text: String = ti.clone().collect();
+                for i in 0..=remaining_text.len() {
+                    if remaining_text.is_char_boundary(i) {
+                        let slice = &remaining_text[i..];
+                        // * doesn't match across /.
+                        if i > 0 && remaining_text.as_bytes()[i - 1] == b'/' { break; }
+                        if simple_glob_segment(&remaining_pattern, slice) { return true; }
+                    }
+                }
+                return false;
+            }
+            Some('?') => {
+                pi.next();
+                match ti.next() {
+                    Some(c) if c != '/' => {}
+                    _ => return false,
+                }
+            }
+            Some(&pc) => {
+                pi.next();
+                match ti.next() {
+                    Some(tc) if tc == pc => {}
+                    _ => return false,
+                }
+            }
+            None => {
+                return ti.peek().is_none();
+            }
+        }
+    }
+
+    true
+}
+
+// =============================================================================
+// §10 Output Formatting (GOAL-4.9)
+// =============================================================================
+
+/// Format the assembled context as a string in the requested format. **[GOAL-4.9]**
+pub fn format_context(ctx: &AssembledContext, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(ctx).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        }
+        OutputFormat::Yaml => {
+            serde_yaml::to_string(ctx).unwrap_or_else(|e| format!("error: {}", e))
+        }
+        OutputFormat::Markdown => format_context_markdown(ctx),
+    }
+}
+
+/// Render context as human-readable markdown. **[GOAL-4.9]**
+fn format_context_markdown(ctx: &AssembledContext) -> String {
+    let mut out = String::new();
+
+    // Header with stats.
+    out.push_str(&format!(
+        "# Context Assembly\n\n\
+         **Tokens**: {}/{} | **Nodes**: {} visited, {} included, {} filtered\n\
+         **Elapsed**: {}ms\n\n",
+        ctx.stats.budget_used, ctx.stats.budget_total,
+        ctx.stats.nodes_visited, ctx.stats.nodes_included,
+        ctx.stats.nodes_excluded_by_filter,
+        ctx.stats.elapsed_ms,
+    ));
+
+    // Targets.
+    if !ctx.result.targets.is_empty() {
+        out.push_str("## Targets\n\n");
+        for target in &ctx.result.targets {
+            out.push_str(&format!("### `{}`", target.node_id));
+            if let Some(ref title) = target.title {
+                out.push_str(&format!(" — {}", title));
+            }
+            out.push('\n');
+            if let Some(ref fp) = target.file_path {
+                out.push_str(&format!("**File**: `{}`\n", fp));
+            }
+            if let Some(ref sig) = target.signature {
+                out.push_str(&format!("**Signature**: `{}`\n", sig));
+            }
+            if let Some(ref dc) = target.doc_comment {
+                out.push_str(&format!("**Doc**: {}\n", dc.lines().next().unwrap_or("")));
+            }
+            if let Some(ref src) = target.source_code {
+                let preview: String = src.lines().take(20).collect::<Vec<_>>().join("\n");
+                out.push_str(&format!("\n```\n{}\n```\n", preview));
+            }
+            out.push_str(&format!("*~{} tokens*\n\n", target.token_estimate));
+        }
+    }
+
+    // Dependencies.
+    if !ctx.result.dependencies.is_empty() {
+        out.push_str("## Dependencies\n\n");
+        for item in &ctx.result.dependencies {
+            format_context_item(&mut out, item);
+        }
+    }
+
+    // Callers.
+    if !ctx.result.callers.is_empty() {
+        out.push_str("## Callers\n\n");
+        for item in &ctx.result.callers {
+            format_context_item(&mut out, item);
+        }
+    }
+
+    // Tests.
+    if !ctx.result.tests.is_empty() {
+        out.push_str("## Tests\n\n");
+        for item in &ctx.result.tests {
+            format_context_item(&mut out, item);
+        }
+    }
+
+    // Truncation summary.
+    let trunc = &ctx.result.truncation_info;
+    if trunc.truncated_count > 0 || trunc.dropped_count > 0 {
+        out.push_str(&format!(
+            "---\n*Truncation: {} items truncated, {} items dropped*\n",
+            trunc.truncated_count, trunc.dropped_count,
+        ));
+    }
+
+    out
+}
+
+/// Format a single ContextItem for markdown output.
+fn format_context_item(out: &mut String, item: &ContextItem) {
+    out.push_str(&format!("- **`{}`**", item.node_id));
+    if let Some(ref fp) = item.file_path {
+        out.push_str(&format!(" (`{}`)", fp));
+    }
+    out.push_str(&format!(
+        " — {} | score: {:.2}{}",
+        item.connecting_relation,
+        item.score,
+        if item.truncated { " ⚠️truncated" } else { "" },
+    ));
+    out.push('\n');
+    if let Some(ref sig) = item.signature {
+        out.push_str(&format!("  Sig: `{}`\n", sig));
+    }
+    if let Some(ref content) = item.content {
+        let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n  ");
+        if !preview.is_empty() {
+            out.push_str(&format!("  {}\n", preview));
         }
     }
 }
@@ -2209,7 +2824,7 @@ mod tests {
             "Total tokens {} should be ≤ budget 650", result.estimated_tokens);
 
         // Verify truncation info is consistent
-        let total_in = result.total_included();
+        let _total_in = result.total_included();
         let total_possible = 4 + 2 + 2; // deps + callers + tests (excluding target)
         let items_included = result.dependencies.len() + result.callers.len() + result.tests.len();
         // items_included + dropped = total_possible
@@ -2822,5 +3437,667 @@ mod tests {
         assert_eq!(result.dependencies[0].node_id, "caller");
         assert_eq!(result.dependencies[1].node_id, "type_dep");
         assert_eq!(result.dependencies[2].node_id, "struct_dep");
+    }
+
+    // =========================================================================
+    // §9 Tests: ContextQuery + Pipeline (assemble_context)
+    // =========================================================================
+
+    fn make_code_node(id: &str, file_path: &str, sig: Option<&str>) -> Node {
+        let mut n = Node::new(id, id);
+        n.node_type = Some("function".to_string());
+        n.file_path = Some(file_path.to_string());
+        n.signature = sig.map(|s| s.to_string());
+        n
+    }
+
+    fn make_graph_with_deps() -> Graph {
+        // target -> dep1 -> dep2 (transitive)
+        // caller -> target (reverse)
+        // test -> target (tests_for)
+        let mut g = Graph::default();
+        let mut target = Node::new("target", "Target Function");
+        target.node_type = Some("function".to_string());
+        target.file_path = Some("src/lib.rs".to_string());
+        target.signature = Some("fn target() -> i32".to_string());
+        g.nodes.push(target);
+
+        let mut dep1 = Node::new("dep1", "Direct Dependency");
+        dep1.node_type = Some("function".to_string());
+        dep1.file_path = Some("src/dep.rs".to_string());
+        dep1.signature = Some("fn dep1() -> bool".to_string());
+        g.nodes.push(dep1);
+
+        let mut dep2 = Node::new("dep2", "Transitive Dependency");
+        dep2.node_type = Some("function".to_string());
+        dep2.file_path = Some("src/deep.rs".to_string());
+        g.nodes.push(dep2);
+
+        let mut caller = Node::new("caller1", "A Caller");
+        caller.node_type = Some("function".to_string());
+        caller.file_path = Some("src/main.rs".to_string());
+        g.nodes.push(caller);
+
+        let mut test = Node::new("test1", "Test for Target");
+        test.node_type = Some("function".to_string());
+        test.file_path = Some("tests/test_target.rs".to_string());
+        g.nodes.push(test);
+
+        // Edges
+        g.edges.push(Edge::new("target", "dep1", "calls"));
+        g.edges.push(Edge::new("dep1", "dep2", "calls"));
+        g.edges.push(Edge::new("caller1", "target", "calls"));
+        g.edges.push(Edge::new("test1", "target", "tests_for"));
+
+        g
+    }
+
+    #[test]
+    fn test_assemble_context_basic() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        assert_eq!(result.result.targets.len(), 1);
+        assert_eq!(result.result.targets[0].node_id, "target");
+        assert!(!result.result.dependencies.is_empty(), "should have deps");
+        assert!(!result.result.callers.is_empty(), "should have callers");
+        assert!(!result.result.tests.is_empty(), "should have tests");
+        assert!(result.stats.nodes_visited > 0);
+        assert!(result.stats.nodes_included > 0);
+        assert!(result.stats.budget_used > 0);
+        assert_eq!(result.stats.budget_total, 10000);
+    }
+
+    #[test]
+    fn test_assemble_context_empty_targets_errors() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec![],
+            ..Default::default()
+        };
+        let err = assemble_context(&graph, &query).unwrap_err();
+        assert!(err.to_string().contains("at least one target"));
+    }
+
+    #[test]
+    fn test_assemble_context_nonexistent_target_errors() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["nonexistent".into()],
+            ..Default::default()
+        };
+        let err = assemble_context(&graph, &query).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_assemble_context_depth_1() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 1,
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        // Only direct dep (dep1), not transitive (dep2).
+        let dep_ids: Vec<&str> = result.result.dependencies.iter()
+            .map(|d| d.node_id.as_str()).collect();
+        assert!(dep_ids.contains(&"dep1"), "should include direct dep");
+        assert!(!dep_ids.contains(&"dep2"), "should NOT include transitive dep at depth=1");
+    }
+
+    #[test]
+    fn test_assemble_context_depth_2_includes_transitive() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        let dep_ids: Vec<&str> = result.result.dependencies.iter()
+            .map(|d| d.node_id.as_str()).collect();
+        assert!(dep_ids.contains(&"dep1"), "should include direct dep");
+        assert!(dep_ids.contains(&"dep2"), "should include transitive dep at depth=2");
+    }
+
+    #[test]
+    fn test_assemble_context_include_filter_type() {
+        let mut graph = make_graph_with_deps();
+        // Add a class node as a dep.
+        let mut cls = Node::new("class1", "MyClass");
+        cls.node_type = Some("class".to_string());
+        cls.file_path = Some("src/class.rs".to_string());
+        graph.nodes.push(cls);
+        graph.edges.push(Edge::new("target", "class1", "uses"));
+
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            filters: ContextFilters {
+                include_patterns: vec!["type:function".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        // class1 should be excluded by the type filter.
+        let dep_ids: Vec<&str> = result.result.dependencies.iter()
+            .map(|d| d.node_id.as_str()).collect();
+        assert!(!dep_ids.contains(&"class1"), "class should be filtered out by type:function");
+        assert!(dep_ids.contains(&"dep1"), "functions should pass");
+    }
+
+    #[test]
+    fn test_assemble_context_include_filter_glob() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            filters: ContextFilters {
+                include_patterns: vec!["src/dep.rs".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        let dep_ids: Vec<&str> = result.result.dependencies.iter()
+            .map(|d| d.node_id.as_str()).collect();
+        assert!(dep_ids.contains(&"dep1"), "dep1 (src/dep.rs) should pass");
+        assert!(!dep_ids.contains(&"dep2"), "dep2 (src/deep.rs) should be filtered");
+        assert!(result.stats.nodes_excluded_by_filter > 0);
+    }
+
+    #[test]
+    fn test_assemble_context_multiple_targets() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into(), "dep1".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        assert_eq!(result.result.targets.len(), 2);
+        let target_ids: Vec<&str> = result.result.targets.iter()
+            .map(|t| t.node_id.as_str()).collect();
+        assert!(target_ids.contains(&"target"));
+        assert!(target_ids.contains(&"dep1"));
+    }
+
+    #[test]
+    fn test_assemble_context_tight_budget() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 50, // Very tight budget.
+            depth: 2,
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        // Targets always included, but deps/callers may be dropped.
+        assert_eq!(result.result.targets.len(), 1);
+        assert!(result.result.estimated_tokens <= 50 + result.result.targets[0].token_estimate,
+            "budget should be approximately respected");
+    }
+
+    #[test]
+    fn test_assemble_context_stats_populated() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let result = assemble_context(&graph, &query).unwrap();
+        assert!(result.stats.nodes_visited >= 4, "should visit target + dep1 + dep2 + caller + test");
+        assert!(result.stats.nodes_included >= 4, "should include target + dep1 + dep2 + caller + test");
+        assert_eq!(result.stats.nodes_excluded_by_filter, 0, "no filter applied");
+        assert_eq!(result.stats.budget_total, 10000);
+        assert!(result.stats.budget_used > 0);
+        // elapsed_ms might be 0 on fast machines, that's ok.
+    }
+
+    // =========================================================================
+    // §9.1 Tests: ContextFilters + passes_filters
+    // =========================================================================
+
+    #[test]
+    fn test_passes_filters_empty_filters() {
+        let c = Candidate {
+            node_id: "x".into(), node_type: "function".into(),
+            file_path: Some("src/lib.rs".into()), signature: None,
+            doc_comment: None, description: None, source_code: None,
+            hop_distance: 1, modified_at: None,
+            connecting_relation: "calls".into(), token_estimate: 10,
+        };
+        let filters = ContextFilters::default();
+        assert!(passes_filters(&c, &filters));
+    }
+
+    #[test]
+    fn test_passes_filters_type_match() {
+        let c = Candidate {
+            node_id: "x".into(), node_type: "function".into(),
+            file_path: None, signature: None,
+            doc_comment: None, description: None, source_code: None,
+            hop_distance: 1, modified_at: None,
+            connecting_relation: "calls".into(), token_estimate: 10,
+        };
+        let filters = ContextFilters {
+            include_patterns: vec!["type:function".into()],
+            ..Default::default()
+        };
+        assert!(passes_filters(&c, &filters));
+    }
+
+    #[test]
+    fn test_passes_filters_type_no_match() {
+        let c = Candidate {
+            node_id: "x".into(), node_type: "class".into(),
+            file_path: None, signature: None,
+            doc_comment: None, description: None, source_code: None,
+            hop_distance: 1, modified_at: None,
+            connecting_relation: "calls".into(), token_estimate: 10,
+        };
+        let filters = ContextFilters {
+            include_patterns: vec!["type:function".into()],
+            ..Default::default()
+        };
+        assert!(!passes_filters(&c, &filters));
+    }
+
+    #[test]
+    fn test_passes_filters_glob_match() {
+        let c = Candidate {
+            node_id: "x".into(), node_type: "file".into(),
+            file_path: Some("src/lib.rs".into()), signature: None,
+            doc_comment: None, description: None, source_code: None,
+            hop_distance: 1, modified_at: None,
+            connecting_relation: "calls".into(), token_estimate: 10,
+        };
+        let filters = ContextFilters {
+            include_patterns: vec!["**/*.rs".into()],
+            ..Default::default()
+        };
+        assert!(passes_filters(&c, &filters));
+    }
+
+    #[test]
+    fn test_passes_filters_glob_no_match() {
+        let c = Candidate {
+            node_id: "x".into(), node_type: "file".into(),
+            file_path: Some("src/lib.rs".into()), signature: None,
+            doc_comment: None, description: None, source_code: None,
+            hop_distance: 1, modified_at: None,
+            connecting_relation: "calls".into(), token_estimate: 10,
+        };
+        let filters = ContextFilters {
+            include_patterns: vec!["**/*.py".into()],
+            ..Default::default()
+        };
+        assert!(!passes_filters(&c, &filters));
+    }
+
+    #[test]
+    fn test_passes_filters_exclude_ids() {
+        let c = Candidate {
+            node_id: "excluded-node".into(), node_type: "function".into(),
+            file_path: None, signature: None,
+            doc_comment: None, description: None, source_code: None,
+            hop_distance: 1, modified_at: None,
+            connecting_relation: "calls".into(), token_estimate: 10,
+        };
+        let filters = ContextFilters {
+            exclude_ids: vec!["excluded-node".into()],
+            ..Default::default()
+        };
+        assert!(!passes_filters(&c, &filters));
+    }
+
+    #[test]
+    fn test_passes_filters_any_match_semantics() {
+        let c = Candidate {
+            node_id: "x".into(), node_type: "function".into(),
+            file_path: Some("src/lib.rs".into()), signature: None,
+            doc_comment: None, description: None, source_code: None,
+            hop_distance: 1, modified_at: None,
+            connecting_relation: "calls".into(), token_estimate: 10,
+        };
+        // One pattern doesn't match, the other does — should pass.
+        let filters = ContextFilters {
+            include_patterns: vec!["*.py".into(), "type:function".into()],
+            ..Default::default()
+        };
+        assert!(passes_filters(&c, &filters));
+    }
+
+    // =========================================================================
+    // §9.2 Tests: simple_glob_match
+    // =========================================================================
+
+    #[test]
+    fn test_glob_exact() {
+        assert!(simple_glob_match("foo.rs", "foo.rs"));
+        assert!(!simple_glob_match("foo.rs", "bar.rs"));
+    }
+
+    #[test]
+    fn test_glob_star() {
+        assert!(simple_glob_match("*.rs", "lib.rs"));
+        assert!(simple_glob_match("*.rs", "main.rs"));
+        assert!(!simple_glob_match("*.rs", "src/lib.rs")); // * doesn't cross /
+        assert!(!simple_glob_match("*.py", "lib.rs"));
+    }
+
+    #[test]
+    fn test_glob_doublestar() {
+        assert!(simple_glob_match("src/**", "src/lib.rs"));
+        assert!(simple_glob_match("src/**", "src/a/b/c.rs"));
+        assert!(!simple_glob_match("src/**", "tests/lib.rs"));
+    }
+
+    #[test]
+    fn test_glob_doublestar_suffix() {
+        assert!(simple_glob_match("**/*.rs", "src/lib.rs"));
+        assert!(simple_glob_match("**/*.rs", "a/b/c.rs"));
+        assert!(!simple_glob_match("**/*.py", "src/lib.rs"));
+    }
+
+    #[test]
+    fn test_glob_question_mark() {
+        assert!(simple_glob_match("?.rs", "a.rs"));
+        assert!(!simple_glob_match("?.rs", "ab.rs"));
+    }
+
+    // =========================================================================
+    // §9.3 Tests: OutputFormat
+    // =========================================================================
+
+    #[test]
+    fn test_output_format_parse() {
+        assert_eq!("json".parse::<OutputFormat>().unwrap(), OutputFormat::Json);
+        assert_eq!("markdown".parse::<OutputFormat>().unwrap(), OutputFormat::Markdown);
+        assert_eq!("md".parse::<OutputFormat>().unwrap(), OutputFormat::Markdown);
+        assert_eq!("yaml".parse::<OutputFormat>().unwrap(), OutputFormat::Yaml);
+        assert_eq!("yml".parse::<OutputFormat>().unwrap(), OutputFormat::Yaml);
+        assert!("xml".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn test_output_format_display() {
+        assert_eq!(OutputFormat::Json.to_string(), "json");
+        assert_eq!(OutputFormat::Markdown.to_string(), "markdown");
+        assert_eq!(OutputFormat::Yaml.to_string(), "yaml");
+    }
+
+    #[test]
+    fn test_output_format_default() {
+        assert_eq!(OutputFormat::default(), OutputFormat::Markdown);
+    }
+
+    // =========================================================================
+    // §9.4 Tests: format_context
+    // =========================================================================
+
+    #[test]
+    fn test_format_context_json() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let assembled = assemble_context(&graph, &query).unwrap();
+        let json_str = format_context(&assembled, OutputFormat::Json);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("valid JSON");
+        assert!(parsed.get("targets").is_some());
+        assert!(parsed.get("dependencies").is_some());
+        assert!(parsed.get("callers").is_some());
+        assert!(parsed.get("tests").is_some());
+        assert!(parsed.get("estimated_tokens").is_some());
+        assert!(parsed.get("stats").is_some());
+    }
+
+    #[test]
+    fn test_format_context_yaml() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let assembled = assemble_context(&graph, &query).unwrap();
+        let yaml_str = format_context(&assembled, OutputFormat::Yaml);
+        assert!(yaml_str.contains("targets:"), "YAML should contain targets key");
+        assert!(yaml_str.contains("stats:"), "YAML should contain stats key");
+    }
+
+    #[test]
+    fn test_format_context_markdown() {
+        let graph = make_graph_with_deps();
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let assembled = assemble_context(&graph, &query).unwrap();
+        let md_str = format_context(&assembled, OutputFormat::Markdown);
+        assert!(md_str.contains("# Context Assembly"), "markdown should have header");
+        assert!(md_str.contains("## Targets"), "markdown should have targets section");
+        assert!(md_str.contains("`target`"), "markdown should reference target node");
+        assert!(md_str.contains("## Dependencies"), "markdown should have deps section");
+    }
+
+    // =========================================================================
+    // §9.5 Tests: gather_targets
+    // =========================================================================
+
+    #[test]
+    fn test_gather_targets_basic() {
+        let graph = make_graph_with_deps();
+        let targets = gather_targets(&graph, &["target".into()], None).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].node_id, "target");
+        assert_eq!(targets[0].title.as_deref(), Some("Target Function"));
+        assert_eq!(targets[0].file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(targets[0].signature.as_deref(), Some("fn target() -> i32"));
+    }
+
+    #[test]
+    fn test_gather_targets_nonexistent() {
+        let graph = make_graph_with_deps();
+        let err = gather_targets(&graph, &["missing".into()], None).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // =========================================================================
+    // §9.6 Tests: gather_dependencies
+    // =========================================================================
+
+    #[test]
+    fn test_gather_deps_depth_1() {
+        let graph = make_graph_with_deps();
+        let (deps, filtered) = gather_dependencies(
+            &graph, &["target".into()], 1, &ContextFilters::default(), None,
+        );
+        assert_eq!(filtered, 0);
+        let ids: Vec<&str> = deps.iter().map(|d| d.node_id.as_str()).collect();
+        assert!(ids.contains(&"dep1"));
+        assert!(!ids.contains(&"dep2"), "depth=1 should not include transitive");
+    }
+
+    #[test]
+    fn test_gather_deps_depth_2() {
+        let graph = make_graph_with_deps();
+        let (deps, _) = gather_dependencies(
+            &graph, &["target".into()], 2, &ContextFilters::default(), None,
+        );
+        let ids: Vec<&str> = deps.iter().map(|d| d.node_id.as_str()).collect();
+        assert!(ids.contains(&"dep1"));
+        assert!(ids.contains(&"dep2"), "depth=2 should include transitive");
+    }
+
+    #[test]
+    fn test_gather_deps_with_filter() {
+        let graph = make_graph_with_deps();
+        let filters = ContextFilters {
+            include_patterns: vec!["src/dep.rs".into()],
+            ..Default::default()
+        };
+        let (deps, filtered) = gather_dependencies(
+            &graph, &["target".into()], 2, &filters, None,
+        );
+        assert_eq!(deps.len(), 1, "only dep1 should pass filter");
+        assert_eq!(deps[0].node_id, "dep1");
+        assert_eq!(filtered, 1, "dep2 should be filtered out");
+    }
+
+    #[test]
+    fn test_gather_deps_no_self_loops() {
+        let graph = make_graph_with_deps();
+        let (deps, _) = gather_dependencies(
+            &graph, &["target".into()], 2, &ContextFilters::default(), None,
+        );
+        // Target itself should not appear as a dependency.
+        assert!(!deps.iter().any(|d| d.node_id == "target"));
+    }
+
+    // =========================================================================
+    // §9.7 Tests: gather_callers_and_tests
+    // =========================================================================
+
+    #[test]
+    fn test_gather_callers_and_tests() {
+        let graph = make_graph_with_deps();
+        let (callers, tests) = gather_callers_and_tests(&graph, &["target".into()], None);
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].node_id, "caller1");
+        assert_eq!(callers[0].connecting_relation, "calls");
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].node_id, "test1");
+        assert_eq!(tests[0].connecting_relation, "tests_for");
+    }
+
+    #[test]
+    fn test_gather_callers_excludes_targets() {
+        // If target A calls target B, B calling A should not show A as a caller.
+        let graph = make_graph_with_deps();
+        let (callers, _) = gather_callers_and_tests(
+            &graph, &["target".into(), "caller1".into()], None,
+        );
+        // caller1 is also a target, so it should not appear as a caller.
+        assert!(!callers.iter().any(|c| c.node_id == "caller1"));
+    }
+
+    // =========================================================================
+    // §9.8 Tests: ContextQuery defaults
+    // =========================================================================
+
+    #[test]
+    fn test_context_query_defaults() {
+        let q = ContextQuery::default();
+        assert!(q.targets.is_empty());
+        assert_eq!(q.token_budget, 8000);
+        assert_eq!(q.depth, 2);
+        assert!(q.filters.include_patterns.is_empty());
+        assert!(q.filters.exclude_ids.is_empty());
+        assert_eq!(q.format, OutputFormat::Markdown);
+        assert!(q.project_root.is_none());
+    }
+
+    // =========================================================================
+    // §9.9 Tests: ContextStats
+    // =========================================================================
+
+    #[test]
+    fn test_context_stats_default() {
+        let s = ContextStats::default();
+        assert_eq!(s.nodes_visited, 0);
+        assert_eq!(s.nodes_included, 0);
+        assert_eq!(s.nodes_excluded_by_filter, 0);
+        assert_eq!(s.budget_used, 0);
+        assert_eq!(s.budget_total, 0);
+        assert_eq!(s.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn test_context_stats_serializable() {
+        let s = ContextStats {
+            nodes_visited: 10,
+            nodes_included: 5,
+            nodes_excluded_by_filter: 2,
+            budget_used: 3000,
+            budget_total: 8000,
+            elapsed_ms: 42,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"nodes_visited\":10"));
+        assert!(json.contains("\"elapsed_ms\":42"));
+    }
+
+    // =========================================================================
+    // §9.10 Tests: assemble_context edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_assemble_context_no_deps_no_callers() {
+        // Isolated node with no edges.
+        let mut g = Graph::default();
+        let mut n = Node::new("lonely", "Lonely Node");
+        n.node_type = Some("function".to_string());
+        g.nodes.push(n);
+
+        let query = ContextQuery {
+            targets: vec!["lonely".into()],
+            token_budget: 10000,
+            depth: 2,
+            ..Default::default()
+        };
+        let result = assemble_context(&g, &query).unwrap();
+        assert_eq!(result.result.targets.len(), 1);
+        assert!(result.result.dependencies.is_empty());
+        assert!(result.result.callers.is_empty());
+        assert!(result.result.tests.is_empty());
+    }
+
+    #[test]
+    fn test_assemble_context_diamond_dedup() {
+        // target -> A, target -> B, A -> C, B -> C
+        // C should appear only once.
+        let mut g = Graph::default();
+        g.nodes.push(Node::new("target", "T"));
+        g.nodes.push(Node::new("a", "A"));
+        g.nodes.push(Node::new("b", "B"));
+        g.nodes.push(Node::new("c", "C"));
+        g.edges.push(Edge::new("target", "a", "calls"));
+        g.edges.push(Edge::new("target", "b", "calls"));
+        g.edges.push(Edge::new("a", "c", "calls"));
+        g.edges.push(Edge::new("b", "c", "calls"));
+
+        let query = ContextQuery {
+            targets: vec!["target".into()],
+            token_budget: 10000,
+            depth: 3,
+            ..Default::default()
+        };
+        let result = assemble_context(&g, &query).unwrap();
+        let dep_ids: Vec<&str> = result.result.dependencies.iter()
+            .map(|d| d.node_id.as_str()).collect();
+        // C should appear exactly once (BFS deduplication).
+        assert_eq!(dep_ids.iter().filter(|&&id| id == "c").count(), 1);
     }
 }
