@@ -182,6 +182,48 @@ impl CodeGraph {
 
         // Detect available language servers
         let configs = LspServerConfig::detect_available();
+
+        // Detect languages present in the project for coverage check
+        let mut langs_in_project: HashMap<String, (usize, usize)> = HashMap::new();
+        for node in &self.nodes {
+            if node.kind == NodeKind::File {
+                let ext = node.file_path.rsplit('.').next().unwrap_or("");
+                let lang_id = extension_to_language_id(ext).to_string();
+                if lang_id != "plaintext" {
+                    langs_in_project.entry(lang_id).or_insert((0, 0)).0 += 1;
+                }
+            }
+        }
+        // Count call edges per language
+        for edge in &self.edges {
+            if edge.relation == EdgeRelation::Calls {
+                if let Some(caller) = self.node_by_id(&edge.from) {
+                    let ext = caller.file_path.rsplit('.').next().unwrap_or("");
+                    let lang_id = extension_to_language_id(ext).to_string();
+                    if lang_id != "plaintext" {
+                        langs_in_project.entry(lang_id).or_insert((0, 0)).1 += 1;
+                    }
+                }
+            }
+        }
+
+        // Check coverage — warn about missing LSP servers
+        let missing = LspServerConfig::check_coverage(&configs, &langs_in_project);
+        if !missing.is_empty() {
+            for m in &missing {
+                tracing::warn!(
+                    "[LSP] No language server for {} ({} files, {} call edges unrefined). Install: {}",
+                    m.language_id, m.file_count, m.edge_count, m.install_command
+                );
+                eprintln!(
+                    "⚠️  No LSP server for {} — {} files, {} call edges will use tree-sitter heuristics only",
+                    m.language_id, m.file_count, m.edge_count
+                );
+                eprintln!("   Install: {}", m.install_command);
+            }
+            stats.missing_servers = missing;
+        }
+
         if configs.is_empty() {
             stats.skipped = self
                 .edges

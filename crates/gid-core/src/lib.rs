@@ -85,7 +85,7 @@ pub use complexity::{
     is_high_risk_change, assess_risk_level,
 };
 pub use lsp_client::{
-    LspClient, LspEnrichmentStats, LspLocation, LspRefinementStats, LspServerConfig,
+    LspClient, LspEnrichmentStats, LspLocation, LspMissingServer, LspRefinementStats, LspServerConfig,
 };
 pub use identity::{
     Identity, Organization, Group, Email, SigningKey, IdentityError, IdentityBuilder,

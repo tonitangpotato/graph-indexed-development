@@ -64,6 +64,19 @@ pub struct LspLocation {
     pub character: u32,
 }
 
+/// A language server that's needed but not installed.
+#[derive(Debug, Clone)]
+pub struct LspMissingServer {
+    /// Language ID (e.g., "rust", "python", "typescript")
+    pub language_id: String,
+    /// Number of files in this language
+    pub file_count: usize,
+    /// Number of call edges that can't be refined
+    pub edge_count: usize,
+    /// Suggested install command
+    pub install_command: String,
+}
+
 /// Statistics from LSP refinement of call edges.
 #[derive(Debug, Default)]
 pub struct LspRefinementStats {
@@ -79,6 +92,8 @@ pub struct LspRefinementStats {
     pub skipped: usize,
     /// Language servers that were successfully used
     pub languages_used: Vec<String>,
+    /// Language servers needed but not installed
+    pub missing_servers: Vec<LspMissingServer>,
     /// Number of reference lookups performed
     pub references_queried: usize,
     /// New call edges discovered via references
@@ -182,6 +197,51 @@ impl LspServerConfig {
         }
 
         configs
+    }
+
+    /// Return the install command for a given language ID.
+    /// Used when an LSP server is needed but not detected.
+    pub fn install_suggestion(language_id: &str) -> String {
+        match language_id {
+            "rust" => "rustup component add rust-analyzer".to_string(),
+            "typescript" | "javascript" => "npm install -g typescript-language-server typescript".to_string(),
+            "python" => "pip install pyright".to_string(),
+            _ => format!("(no known LSP server for '{}')", language_id),
+        }
+    }
+
+    /// Check which languages in the project have no LSP server available.
+    /// Returns a list of missing servers with install suggestions.
+    ///
+    /// `languages_in_project` is a map of language_id → (file_count, call_edge_count).
+    pub fn check_coverage(
+        available: &[Self],
+        languages_in_project: &HashMap<String, (usize, usize)>,
+    ) -> Vec<LspMissingServer> {
+        let available_langs: HashSet<&str> = available
+            .iter()
+            .map(|c| c.language_id.as_str())
+            .collect();
+
+        let mut missing = Vec::new();
+        for (lang, &(file_count, edge_count)) in languages_in_project {
+            // Skip plaintext — no LSP for that
+            if lang == "plaintext" {
+                continue;
+            }
+            // Merge JS into TS (tsserver handles both)
+            let check_lang = if lang == "javascript" { "typescript" } else { lang.as_str() };
+            if !available_langs.contains(check_lang) {
+                missing.push(LspMissingServer {
+                    language_id: lang.clone(),
+                    file_count,
+                    edge_count,
+                    install_command: Self::install_suggestion(lang),
+                });
+            }
+        }
+        missing.sort_by(|a, b| b.edge_count.cmp(&a.edge_count));
+        missing
     }
 }
 
@@ -1170,5 +1230,91 @@ mod tests {
         };
         assert_eq!(loc.file_path, "src/main.ts");
         assert_eq!(loc.line, 42);
+    }
+
+    #[test]
+    fn test_install_suggestion_known_languages() {
+        assert!(LspServerConfig::install_suggestion("rust").contains("rust-analyzer"));
+        assert!(LspServerConfig::install_suggestion("typescript").contains("typescript-language-server"));
+        assert!(LspServerConfig::install_suggestion("javascript").contains("typescript-language-server"));
+        assert!(LspServerConfig::install_suggestion("python").contains("pyright"));
+    }
+
+    #[test]
+    fn test_install_suggestion_unknown_language() {
+        let suggestion = LspServerConfig::install_suggestion("cobol");
+        assert!(suggestion.contains("no known LSP"));
+    }
+
+    #[test]
+    fn test_check_coverage_all_covered() {
+        let configs = vec![
+            LspServerConfig {
+                command: "rust-analyzer".to_string(),
+                args: vec![],
+                language_id: "rust".to_string(),
+                extensions: vec!["rs".to_string()],
+            },
+        ];
+        let mut langs = std::collections::HashMap::new();
+        langs.insert("rust".to_string(), (10usize, 50usize));
+        let missing = LspServerConfig::check_coverage(&configs, &langs);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_check_coverage_missing_server() {
+        let configs = vec![]; // No LSP servers available
+        let mut langs = std::collections::HashMap::new();
+        langs.insert("rust".to_string(), (10, 50));
+        langs.insert("python".to_string(), (5, 20));
+        let missing = LspServerConfig::check_coverage(&configs, &langs);
+        assert_eq!(missing.len(), 2);
+        // Sorted by edge_count descending
+        assert_eq!(missing[0].language_id, "rust");
+        assert_eq!(missing[0].edge_count, 50);
+        assert_eq!(missing[1].language_id, "python");
+        assert_eq!(missing[1].edge_count, 20);
+        assert!(missing[0].install_command.contains("rust-analyzer"));
+        assert!(missing[1].install_command.contains("pyright"));
+    }
+
+    #[test]
+    fn test_check_coverage_js_covered_by_tsserver() {
+        let configs = vec![
+            LspServerConfig {
+                command: "npx".to_string(),
+                args: vec!["typescript-language-server".to_string()],
+                language_id: "typescript".to_string(),
+                extensions: vec!["ts".to_string(), "js".to_string()],
+            },
+        ];
+        let mut langs = std::collections::HashMap::new();
+        langs.insert("javascript".to_string(), (8, 30));
+        let missing = LspServerConfig::check_coverage(&configs, &langs);
+        // JS should be covered by tsserver
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_check_coverage_skips_plaintext() {
+        let configs = vec![];
+        let mut langs = std::collections::HashMap::new();
+        langs.insert("plaintext".to_string(), (100, 0));
+        let missing = LspServerConfig::check_coverage(&configs, &langs);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_lsp_missing_server_fields() {
+        let m = LspMissingServer {
+            language_id: "rust".to_string(),
+            file_count: 42,
+            edge_count: 1500,
+            install_command: "rustup component add rust-analyzer".to_string(),
+        };
+        assert_eq!(m.language_id, "rust");
+        assert_eq!(m.file_count, 42);
+        assert_eq!(m.edge_count, 1500);
     }
 }
