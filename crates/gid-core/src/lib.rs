@@ -49,6 +49,8 @@ pub use working_mem::{
 pub use history::{HistoryManager, HistoryEntry, GraphDiff};
 pub use visual::{render, render_ascii, render_dot, render_mermaid, VisualFormat};
 pub use advise::{analyze, AnalysisResult, Advice, Severity, AdviceType};
+#[cfg(feature = "infomap")]
+pub use advise::{detect_code_modules, DetectedModule};
 pub use design::{
     generate_graph_prompt, generate_scoped_graph_prompt,
     generate_features_prompt, generate_components_prompt,

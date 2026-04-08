@@ -14,7 +14,8 @@ graph = []
 sqlite = ["graph", "dep:rusqlite"]
 harness = ["graph", "dep:tokio", "dep:futures", "dep:async-trait", "dep:agentctl-auth", "dep:dirs", "dep:reqwest"]
 ritual = ["harness", "dep:glob", "dep:which"]
-full = ["ritual", "sqlite"]
+infomap = ["graph", "dep:infomap-rs"]
+full = ["ritual", "sqlite", "infomap"]
 
 [dependencies]
 serde = { workspace = true }
@@ -33,6 +34,9 @@ tree-sitter-javascript = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 sha2 = { workspace = true }
 deunicode = "1.6"
+
+# Optional: Infomap community detection for module grouping advice
+infomap-rs = { version = "0.1.0", path = "../../../infomap-rs", optional = true }
 
 # Optional: SQLite storage backend
 rusqlite = { version = "0.32", features = ["bundled", "backup"], optional = true }

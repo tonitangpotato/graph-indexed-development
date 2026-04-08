@@ -45,6 +45,7 @@ pub enum AdviceType {
     UnreachableTask,
     BlockedChain,
     DeadCode,
+    ModuleSuggestion,
 }
 
 impl std::fmt::Display for AdviceType {
@@ -63,6 +64,7 @@ impl std::fmt::Display for AdviceType {
             AdviceType::UnreachableTask => write!(f, "unreachable-task"),
             AdviceType::BlockedChain => write!(f, "blocked-chain"),
             AdviceType::DeadCode => write!(f, "dead-code"),
+            AdviceType::ModuleSuggestion => write!(f, "module-suggestion"),
         }
     }
 }
@@ -362,6 +364,13 @@ pub fn analyze(graph: &Graph) -> AnalysisResult {
     let dead_code_items = detect_dead_code(graph);
     items.extend(dead_code_items);
     
+    // Module grouping suggestion via Infomap community detection
+    #[cfg(feature = "infomap")]
+    {
+        let module_items = detect_modules(graph);
+        items.extend(module_items);
+    }
+    
     // Sort by severity (errors first)
     items.sort_by(|a, b| b.severity.cmp(&a.severity));
     
@@ -370,7 +379,9 @@ pub fn analyze(graph: &Graph) -> AnalysisResult {
     let error_count = items.iter().filter(|a| a.severity == Severity::Error).count();
     let warning_count = items.iter().filter(|a| a.severity == Severity::Warning).count();
     let info_count = items.iter()
-        .filter(|a| a.severity == Severity::Info && a.advice_type != AdviceType::DeadCode)
+        .filter(|a| a.severity == Severity::Info
+            && a.advice_type != AdviceType::DeadCode
+            && a.advice_type != AdviceType::ModuleSuggestion)
         .count();
     
     // Scoring: errors are critical, warnings matter, info is advisory
@@ -1120,6 +1131,332 @@ fn is_trait_impl(node: &crate::code_graph::CodeNode, code_graph: &CodeGraph) -> 
     false
 }
 
+/// Detect module groupings in the code dependency graph using Infomap community detection.
+///
+/// Converts code-layer nodes and their edges (calls, imports, defined_in) into an
+/// Infomap Network, runs community detection, and suggests module groupings where
+/// files in the same community should be co-located.
+///
+/// Only produces suggestions when:
+/// - There are at least 4 code nodes (below this, results are trivial)
+/// - Infomap finds at least 2 modules
+/// - At least one module contains files from different directories (indicating potential reorganization)
+#[cfg(feature = "infomap")]
+fn detect_modules(graph: &Graph) -> Vec<Advice> {
+    use infomap_rs::{Network, Infomap};
+    
+    let mut items = Vec::new();
+    
+    // Collect code-layer file nodes — these are the units we want to group
+    let code_files: Vec<&Node> = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("file"))
+        .collect();
+    
+    if code_files.len() < 4 {
+        return items; // Too few files for meaningful community detection
+    }
+    
+    // Build node ID → index mapping for the Infomap network
+    let id_to_idx: HashMap<&str, usize> = code_files.iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    
+    // Also map non-file code nodes (functions, classes, methods) to their parent file
+    // so we can translate calls/imports between functions into file-level edges
+    let mut node_to_file_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, file_node) in code_files.iter().enumerate() {
+        node_to_file_idx.insert(file_node.id.as_str(), i);
+    }
+    // Map function/class/method nodes to their file via file_path metadata or defined_in edges
+    for node in &graph.nodes {
+        if node.node_type.as_deref() == Some("file") {
+            continue;
+        }
+        // Try to find the file this node belongs to via file_path
+        if let Some(fp) = node.file_path.as_deref()
+            .or_else(|| node.metadata.get("file_path").and_then(|v| v.as_str()))
+        {
+            // Look for matching file node by file_path
+            let file_id = format!("file:{}", fp);
+            if let Some(&idx) = id_to_idx.get(file_id.as_str()) {
+                node_to_file_idx.insert(node.id.as_str(), idx);
+            }
+        }
+    }
+    
+    // Build the Infomap network from code edges
+    let mut net = Network::new();
+    // Ensure all file nodes exist in the network
+    if !code_files.is_empty() {
+        net.add_edge(0, 0, 0.0); // no-op (zero weight ignored), but let's use ensure_capacity
+    }
+    
+    // Edge relations that indicate structural coupling between code units
+    let coupling_relations = ["calls", "imports", "depends_on", "inherits", "implements"];
+    
+    for edge in &graph.edges {
+        if !coupling_relations.contains(&edge.relation.as_str()) {
+            continue;
+        }
+        
+        // Map both endpoints to file-level indices
+        let from_idx = node_to_file_idx.get(edge.from.as_str())
+            .or_else(|| id_to_idx.get(edge.from.as_str()));
+        let to_idx = node_to_file_idx.get(edge.to.as_str())
+            .or_else(|| id_to_idx.get(edge.to.as_str()));
+        
+        if let (Some(&from), Some(&to)) = (from_idx, to_idx) {
+            if from != to {
+                // Weight: explicit weight if present, else 1.0
+                let w = edge.weight.unwrap_or(1.0);
+                net.add_edge(from, to, w);
+            }
+        }
+    }
+    
+    // Need at least some edges for meaningful detection
+    if net.num_edges() < 2 {
+        return items;
+    }
+    
+    // Add node names for readable output
+    for (i, file_node) in code_files.iter().enumerate() {
+        let display_name = file_node.file_path.as_deref()
+            .unwrap_or(&file_node.title);
+        net.add_node_name(i, display_name);
+    }
+    
+    // Run Infomap with sensible defaults for code graphs
+    let result = Infomap::new(&net)
+        .seed(42)
+        .num_trials(5)          // Fewer trials since code graphs are smaller
+        .hierarchical(false)    // Flat grouping is most useful for module suggestions
+        .run();
+    
+    if result.num_modules() < 2 {
+        return items; // Everything in one module — no reorganization needed
+    }
+    
+    // Analyze each detected module: extract file paths and check if they span directories
+    let mut modules_with_files: Vec<(usize, Vec<&str>)> = Vec::new();
+    
+    for module_info in result.modules() {
+        let file_paths: Vec<&str> = module_info.nodes.iter()
+            .filter_map(|&node_idx| {
+                code_files.get(node_idx)
+                    .and_then(|n| n.file_path.as_deref()
+                        .or_else(|| n.metadata.get("file_path").and_then(|v| v.as_str())))
+            })
+            .collect();
+        
+        if file_paths.len() >= 2 {
+            modules_with_files.push((module_info.id, file_paths));
+        }
+    }
+    
+    if modules_with_files.is_empty() {
+        return items;
+    }
+    
+    // Check for cross-directory modules (files from different dirs in same community)
+    // These are the interesting suggestions — files that are tightly coupled but scattered
+    for (module_id, files) in &modules_with_files {
+        let directories: HashSet<&str> = files.iter()
+            .filter_map(|fp| {
+                let p = std::path::Path::new(fp);
+                p.parent().and_then(|d| d.to_str())
+            })
+            .collect();
+        
+        if directories.len() > 1 {
+            // Files from multiple directories are tightly coupled — suggest grouping
+            let file_list: Vec<String> = files.iter()
+                .take(8)
+                .map(|f| f.to_string())
+                .collect();
+            let remaining = files.len().saturating_sub(8);
+            
+            let dir_list: Vec<&str> = directories.iter().take(5).copied().collect();
+            
+            let message = if remaining > 0 {
+                format!(
+                    "Module {} ({} files): tightly coupled files span {} directories ({}). Shown: {} (and {} more)",
+                    module_id,
+                    files.len(),
+                    directories.len(),
+                    dir_list.join(", "),
+                    file_list.join(", "),
+                    remaining
+                )
+            } else {
+                format!(
+                    "Module {} ({} files): tightly coupled files span {} directories ({}): {}",
+                    module_id,
+                    files.len(),
+                    directories.len(),
+                    dir_list.join(", "),
+                    file_list.join(", ")
+                )
+            };
+            
+            items.push(Advice {
+                advice_type: AdviceType::ModuleSuggestion,
+                severity: Severity::Info,
+                message,
+                nodes: files.iter().map(|f| format!("file:{}", f)).collect(),
+                suggestion: Some(format!(
+                    "Consider co-locating these files into a dedicated module — they form a cohesive unit based on dependency analysis."
+                )),
+            });
+        }
+    }
+    
+    // If no cross-directory suggestions, provide a summary of detected modules
+    if items.is_empty() && modules_with_files.len() >= 2 {
+        let summary_parts: Vec<String> = modules_with_files.iter()
+            .take(5)
+            .map(|(id, files)| {
+                let sample: Vec<&&str> = files.iter().take(3).collect();
+                let names: Vec<String> = sample.iter()
+                    .filter_map(|fp| std::path::Path::new(fp).file_name()
+                        .and_then(|f| f.to_str())
+                        .map(String::from))
+                    .collect();
+                format!("Module {}: {} files ({})", id, files.len(), names.join(", "))
+            })
+            .collect();
+        
+        let remaining_modules = modules_with_files.len().saturating_sub(5);
+        let mut message = format!(
+            "Infomap detected {} code modules (codelength {:.3}): {}",
+            result.num_modules(),
+            result.codelength(),
+            summary_parts.join("; ")
+        );
+        if remaining_modules > 0 {
+            message.push_str(&format!(" (and {} more)", remaining_modules));
+        }
+        
+        items.push(Advice {
+            advice_type: AdviceType::ModuleSuggestion,
+            severity: Severity::Info,
+            message,
+            nodes: vec![],
+            suggestion: Some(
+                "Code modules are well-organized within their directories.".to_string()
+            ),
+        });
+    }
+    
+    items
+}
+
+/// Public API for running Infomap module detection independently.
+/// Returns a list of detected modules with their file paths and metadata.
+#[cfg(feature = "infomap")]
+pub fn detect_code_modules(graph: &Graph) -> Vec<DetectedModule> {
+    use infomap_rs::{Network, Infomap};
+    
+    let code_files: Vec<&Node> = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("file"))
+        .collect();
+    
+    if code_files.len() < 2 {
+        return vec![];
+    }
+    
+    let id_to_idx: HashMap<&str, usize> = code_files.iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    
+    // Map code nodes to file indices
+    let mut node_to_file_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, file_node) in code_files.iter().enumerate() {
+        node_to_file_idx.insert(file_node.id.as_str(), i);
+    }
+    for node in &graph.nodes {
+        if node.node_type.as_deref() == Some("file") {
+            continue;
+        }
+        if let Some(fp) = node.file_path.as_deref()
+            .or_else(|| node.metadata.get("file_path").and_then(|v| v.as_str()))
+        {
+            let file_id = format!("file:{}", fp);
+            if let Some(&idx) = id_to_idx.get(file_id.as_str()) {
+                node_to_file_idx.insert(node.id.as_str(), idx);
+            }
+        }
+    }
+    
+    let mut net = Network::new();
+    let coupling_relations = ["calls", "imports", "depends_on", "inherits", "implements"];
+    
+    for edge in &graph.edges {
+        if !coupling_relations.contains(&edge.relation.as_str()) {
+            continue;
+        }
+        let from_idx = node_to_file_idx.get(edge.from.as_str())
+            .or_else(|| id_to_idx.get(edge.from.as_str()));
+        let to_idx = node_to_file_idx.get(edge.to.as_str())
+            .or_else(|| id_to_idx.get(edge.to.as_str()));
+        
+        if let (Some(&from), Some(&to)) = (from_idx, to_idx) {
+            if from != to {
+                net.add_edge(from, to, edge.weight.unwrap_or(1.0));
+            }
+        }
+    }
+    
+    if net.num_edges() < 1 {
+        return vec![];
+    }
+    
+    let result = Infomap::new(&net)
+        .seed(42)
+        .num_trials(5)
+        .hierarchical(false)
+        .run();
+    
+    result.modules().iter().map(|m| {
+        let files: Vec<String> = m.nodes.iter()
+            .filter_map(|&idx| code_files.get(idx))
+            .map(|n| n.file_path.as_deref()
+                .or_else(|| n.metadata.get("file_path").and_then(|v| v.as_str()))
+                .unwrap_or(&n.title)
+                .to_string())
+            .collect();
+        let node_ids: Vec<String> = m.nodes.iter()
+            .filter_map(|&idx| code_files.get(idx))
+            .map(|n| n.id.clone())
+            .collect();
+        DetectedModule {
+            id: m.id,
+            files,
+            node_ids,
+            flow: m.flow,
+            size: m.num_nodes,
+        }
+    }).collect()
+}
+
+/// A detected code module (community) from Infomap analysis.
+#[cfg(feature = "infomap")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedModule {
+    /// Module ID (0-based)
+    pub id: usize,
+    /// File paths in this module
+    pub files: Vec<String>,
+    /// Node IDs in this module
+    pub node_ids: Vec<String>,
+    /// Flow proportion (higher = more internal traffic)
+    pub flow: f64,
+    /// Number of files
+    pub size: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,5 +1504,222 @@ mod tests {
         
         let result = analyze(&graph);
         assert!(result.items.iter().any(|a| a.advice_type == AdviceType::HighFanIn));
+    }
+    
+    /// Helper to create a file node for testing
+    fn make_file_node(path: &str) -> Node {
+        let mut node = Node::new(&format!("file:{}", path), path);
+        node.node_type = Some("file".to_string());
+        node.file_path = Some(path.to_string());
+        node
+    }
+    
+    /// Helper to create a function node for testing
+    fn make_func_node(path: &str, name: &str) -> Node {
+        let id = format!("func:{}:{}", path, name);
+        let mut node = Node::new(&id, name);
+        node.node_type = Some("function".to_string());
+        node.file_path = Some(path.to_string());
+        node
+    }
+    
+    #[cfg(feature = "infomap")]
+    #[test]
+    fn test_detect_modules_too_few_files() {
+        // Less than 4 file nodes → no module suggestions
+        let mut graph = Graph::new();
+        graph.add_node(make_file_node("src/a.rs"));
+        graph.add_node(make_file_node("src/b.rs"));
+        graph.add_edge(Edge::new("file:src/a.rs", "file:src/b.rs", "imports"));
+        
+        let result = detect_modules(&graph);
+        assert!(result.is_empty(), "Should return nothing for < 4 files");
+    }
+    
+    #[cfg(feature = "infomap")]
+    #[test]
+    fn test_detect_modules_no_edges() {
+        // Files with no coupling edges → no suggestions
+        let mut graph = Graph::new();
+        for i in 0..6 {
+            graph.add_node(make_file_node(&format!("src/file{}.rs", i)));
+        }
+        
+        let result = detect_modules(&graph);
+        assert!(result.is_empty(), "Should return nothing with no edges");
+    }
+    
+    #[cfg(feature = "infomap")]
+    #[test]
+    fn test_detect_modules_two_clusters() {
+        // Two clearly separated clusters of files
+        let mut graph = Graph::new();
+        
+        // Cluster 1: auth module (in src/auth/)
+        graph.add_node(make_file_node("src/auth/login.rs"));
+        graph.add_node(make_file_node("src/auth/token.rs"));
+        graph.add_node(make_file_node("src/auth/middleware.rs"));
+        
+        // Cluster 2: api module (in src/api/)
+        graph.add_node(make_file_node("src/api/routes.rs"));
+        graph.add_node(make_file_node("src/api/handlers.rs"));
+        graph.add_node(make_file_node("src/api/response.rs"));
+        
+        // Strong coupling within cluster 1
+        graph.add_edge(Edge::new("file:src/auth/login.rs", "file:src/auth/token.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/auth/token.rs", "file:src/auth/login.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/auth/middleware.rs", "file:src/auth/token.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/auth/login.rs", "file:src/auth/middleware.rs", "imports"));
+        
+        // Strong coupling within cluster 2
+        graph.add_edge(Edge::new("file:src/api/routes.rs", "file:src/api/handlers.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/api/handlers.rs", "file:src/api/routes.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/api/response.rs", "file:src/api/handlers.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/api/routes.rs", "file:src/api/response.rs", "imports"));
+        
+        // Weak cross-cluster connection
+        graph.add_edge({
+            let mut e = Edge::new("file:src/api/handlers.rs", "file:src/auth/middleware.rs", "imports");
+            e.weight = Some(0.1);
+            e
+        });
+        
+        let result = detect_modules(&graph);
+        // Should detect at least 2 modules — the clusters are well-organized in their dirs
+        // so it might not produce cross-dir suggestions, but the public API should find them
+        let modules = detect_code_modules(&graph);
+        assert!(modules.len() >= 2, "Should detect at least 2 modules, got {}", modules.len());
+    }
+    
+    #[cfg(feature = "infomap")]
+    #[test]
+    fn test_detect_modules_cross_directory_suggestion() {
+        // Files that are tightly coupled but live in DIFFERENT directories
+        // → should suggest grouping
+        let mut graph = Graph::new();
+        
+        // Tightly coupled files scattered across dirs
+        graph.add_node(make_file_node("src/models/user.rs"));
+        graph.add_node(make_file_node("src/handlers/user_handler.rs"));
+        graph.add_node(make_file_node("src/validators/user_validator.rs"));
+        
+        // Another group, cleanly in one dir
+        graph.add_node(make_file_node("src/util/hash.rs"));
+        graph.add_node(make_file_node("src/util/crypto.rs"));
+        graph.add_node(make_file_node("src/util/encoding.rs"));
+        
+        // Tight coupling in the user-related group (cross-dir)
+        graph.add_edge(Edge::new("file:src/models/user.rs", "file:src/handlers/user_handler.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/handlers/user_handler.rs", "file:src/models/user.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/validators/user_validator.rs", "file:src/models/user.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/handlers/user_handler.rs", "file:src/validators/user_validator.rs", "imports"));
+        
+        // Tight coupling in util group (same dir)
+        graph.add_edge(Edge::new("file:src/util/hash.rs", "file:src/util/crypto.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/util/crypto.rs", "file:src/util/hash.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/util/encoding.rs", "file:src/util/crypto.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/util/encoding.rs", "file:src/util/hash.rs", "imports"));
+        
+        let result = detect_modules(&graph);
+        // Should have at least one cross-directory suggestion for the user-related files
+        let cross_dir = result.iter()
+            .any(|a| a.advice_type == AdviceType::ModuleSuggestion
+                && a.message.contains("span"));
+        assert!(cross_dir, "Should suggest grouping for cross-directory coupled files. Items: {:?}", 
+            result.iter().map(|a| &a.message).collect::<Vec<_>>());
+    }
+    
+    #[cfg(feature = "infomap")]
+    #[test]
+    fn test_detect_modules_function_level_edges() {
+        // Edges between functions should be mapped to file-level connections
+        let mut graph = Graph::new();
+        
+        // Files
+        graph.add_node(make_file_node("src/a.rs"));
+        graph.add_node(make_file_node("src/b.rs"));
+        graph.add_node(make_file_node("src/c.rs"));
+        graph.add_node(make_file_node("src/d.rs"));
+        
+        // Functions in files
+        graph.add_node(make_func_node("src/a.rs", "foo"));
+        graph.add_node(make_func_node("src/b.rs", "bar"));
+        graph.add_node(make_func_node("src/c.rs", "baz"));
+        graph.add_node(make_func_node("src/d.rs", "qux"));
+        
+        // Function-level call edges
+        graph.add_edge(Edge::new("func:src/a.rs:foo", "func:src/b.rs:bar", "calls"));
+        graph.add_edge(Edge::new("func:src/b.rs:bar", "func:src/a.rs:foo", "calls"));
+        graph.add_edge(Edge::new("func:src/c.rs:baz", "func:src/d.rs:qux", "calls"));
+        graph.add_edge(Edge::new("func:src/d.rs:qux", "func:src/c.rs:baz", "calls"));
+        
+        let modules = detect_code_modules(&graph);
+        // Function-level edges should still be detected and mapped to files
+        assert!(modules.len() >= 1, "Should detect modules from function-level edges");
+    }
+    
+    #[cfg(feature = "infomap")]
+    #[test]
+    fn test_detect_code_modules_public_api() {
+        let mut graph = Graph::new();
+        
+        for i in 0..6 {
+            graph.add_node(make_file_node(&format!("src/mod{}.rs", i)));
+        }
+        
+        // Two clusters: {0,1,2} and {3,4,5}
+        graph.add_edge(Edge::new("file:src/mod0.rs", "file:src/mod1.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/mod1.rs", "file:src/mod2.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/mod2.rs", "file:src/mod0.rs", "imports"));
+        
+        graph.add_edge(Edge::new("file:src/mod3.rs", "file:src/mod4.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/mod4.rs", "file:src/mod5.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/mod5.rs", "file:src/mod3.rs", "imports"));
+        
+        let modules = detect_code_modules(&graph);
+        assert!(modules.len() >= 2, "Public API should detect 2+ modules");
+        
+        // Each module should have files and flow info
+        for m in &modules {
+            assert!(!m.files.is_empty());
+            assert!(!m.node_ids.is_empty());
+            assert!(m.size > 0);
+            assert!(m.flow >= 0.0);
+        }
+    }
+    
+    #[cfg(feature = "infomap")]
+    #[test]
+    fn test_module_suggestion_does_not_affect_health_score() {
+        // ModuleSuggestion is informational — should NOT deduct from health score
+        let mut graph = Graph::new();
+        
+        // Create a graph with two clusters in different dirs
+        for i in 0..3 {
+            graph.add_node(make_file_node(&format!("src/alpha/f{}.rs", i)));
+            graph.add_node(make_file_node(&format!("src/beta/g{}.rs", i)));
+        }
+        
+        // Coupling within clusters
+        graph.add_edge(Edge::new("file:src/alpha/f0.rs", "file:src/alpha/f1.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/alpha/f1.rs", "file:src/alpha/f2.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/alpha/f2.rs", "file:src/alpha/f0.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/beta/g0.rs", "file:src/beta/g1.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/beta/g1.rs", "file:src/beta/g2.rs", "imports"));
+        graph.add_edge(Edge::new("file:src/beta/g2.rs", "file:src/beta/g0.rs", "imports"));
+        
+        let result = analyze(&graph);
+        
+        // Module suggestions should not tank the score
+        let has_module_suggestion = result.items.iter()
+            .any(|a| a.advice_type == AdviceType::ModuleSuggestion);
+        
+        // Score should still be high (only orphan warnings for file nodes without project connections)
+        // The point is: ModuleSuggestion doesn't subtract from health_score
+        if has_module_suggestion {
+            // Even with suggestions, health shouldn't be tanked by them
+            assert!(result.health_score >= 50, 
+                "ModuleSuggestion should not heavily impact health score, got {}", result.health_score);
+        }
     }
 }
