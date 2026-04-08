@@ -55,7 +55,7 @@ impl WatchConfig {
             watch_dir,
             gid_dir,
             debounce_ms: 1000,
-            lsp: false,
+            lsp: true,
             no_semantify: false,
         }
     }

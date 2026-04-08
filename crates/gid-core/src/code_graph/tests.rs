@@ -1459,4 +1459,65 @@ impl Person {
             "Person should have inherits edge"
         );
     }
+
+    #[test]
+    fn test_no_duplicate_ids_trait_impl_for_primitive() {
+        // Regression test: `trait Foo { fn bar(); }` + `impl Foo for str { fn bar() {} }`
+        // used to produce duplicate method IDs because both the trait definition and
+        // the primitive impl attributed to the same parent (the trait class node).
+        let source = r#"
+trait ToTitleCase {
+    fn to_title_case(&self) -> String;
+}
+
+impl ToTitleCase for str {
+    fn to_title_case(&self) -> String {
+        self.to_string()
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _, _) = extract_rust_tree_sitter("skills.rs", source, &mut parser, &mut class_map);
+
+        // Collect all node IDs
+        let all_ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+
+        // Check for duplicates
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut duplicates = Vec::new();
+        for id in &all_ids {
+            if !seen.insert(id) {
+                duplicates.push(*id);
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "Found duplicate node IDs: {:?}",
+            duplicates
+        );
+
+        // The trait definition should still have the method
+        assert!(
+            nodes.iter().any(|n| n.id == "method:skills.rs:ToTitleCase.to_title_case"),
+            "Trait method should exist from trait definition"
+        );
+
+        // Check for duplicate edges too
+        let edge_keys: Vec<String> = edges.iter()
+            .map(|e| format!("{}->{} ({:?})", e.from, e.to, e.relation))
+            .collect();
+        let mut seen_edges: HashSet<&str> = HashSet::new();
+        let mut dup_edges = Vec::new();
+        for ek in &edge_keys {
+            if !seen_edges.insert(ek.as_str()) {
+                dup_edges.push(ek.clone());
+            }
+        }
+        assert!(
+            dup_edges.is_empty(),
+            "Found duplicate edges: {:?}",
+            dup_edges
+        );
+    }
 }

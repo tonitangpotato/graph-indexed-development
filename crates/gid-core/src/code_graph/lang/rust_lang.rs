@@ -373,11 +373,16 @@ pub(crate) fn extract_rust_node(
             }
 
             // Extract methods from impl block
-            if let Some(body) = node.child_by_field_name("body") {
-                let mut body_cursor = body.walk();
-                for body_child in body.children(&mut body_cursor) {
-                    if body_child.kind() == "function_item" {
-                        extract_rust_method(body_child, source, source_str, path, &method_parent_id, nodes, edges);
+            // Skip for primitive trait impls — the trait definition already has
+            // the method nodes, and re-extracting them here with the same parent
+            // (the trait) produces duplicate IDs.
+            if !is_primitive {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut body_cursor = body.walk();
+                    for body_child in body.children(&mut body_cursor) {
+                        if body_child.kind() == "function_item" {
+                            extract_rust_method(body_child, source, source_str, path, &method_parent_id, nodes, edges);
+                        }
                     }
                 }
             }
@@ -968,7 +973,21 @@ pub(crate) fn build_scope_map_rust(
                 } else {
                     // Top-level impl block: extract target type for method ID generation
                     let impl_type = extract_impl_type(current, source);
-                    let impl_id = impl_type.as_ref().map(|t| format!("class:{}:{}", rel_path, t));
+                    
+                    // For primitive trait impls (e.g., `impl Foo for str`), use the trait
+                    // as the scope context instead of the primitive type. This matches the
+                    // node extraction, which skips primitive impl methods and uses the
+                    // trait's method node as the canonical node.
+                    let is_prim = impl_type.as_ref()
+                        .map(|t| is_rust_primitive_or_builtin(t))
+                        .unwrap_or(false);
+                    let impl_id = if is_prim {
+                        // Extract trait name from `impl Trait for PrimitiveType`
+                        extract_impl_trait_name(current, source)
+                            .map(|t| format!("class:{}:{}", rel_path, t))
+                    } else {
+                        impl_type.as_ref().map(|t| format!("class:{}:{}", rel_path, t))
+                    };
                     
                     let child_count = current.child_count();
                     for i in (0..child_count).rev() {
@@ -1597,6 +1616,49 @@ pub(crate) fn extract_rust_call_target(node: tree_sitter::Node, source: &[u8]) -
 }
 
 /// Extract impl type from impl_item node
+/// Extract the trait name from an impl block.
+/// For `impl Trait for Type`, returns Some("Trait").
+/// For `impl Type` (no trait), returns None.
+pub(crate) fn extract_impl_trait_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut first_type: Option<String> = None;
+    let mut seen_for = false;
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "type_identifier" | "generic_type" | "scoped_type_identifier" | "primitive_type" => {
+                let name = if child.kind() == "generic_type" {
+                    child.child_by_field_name("type")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .map(|s| s.to_string())
+                } else if child.kind() == "scoped_type_identifier" {
+                    child.utf8_text(source).ok()
+                        .map(|s| s.rsplit("::").next().unwrap_or(s).to_string())
+                } else {
+                    child.utf8_text(source).ok().map(|s| s.to_string())
+                };
+
+                if first_type.is_none() {
+                    first_type = name;
+                } else if !seen_for {
+                    // Second type without 'for' — shouldn't happen normally
+                    return None;
+                }
+            }
+            _ => {
+                if child.utf8_text(source).ok() == Some("for") {
+                    seen_for = true;
+                    // first_type was the trait
+                    return first_type;
+                }
+            }
+        }
+    }
+
+    // No `for` keyword — `impl Type`, no trait
+    None
+}
+
 pub(crate) fn extract_impl_type(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     // For `impl Type`, return Type. For `impl Trait for Type`, return Type (not Trait).
     // The `for` keyword separates trait from type in tree-sitter AST.
