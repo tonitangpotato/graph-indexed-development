@@ -218,9 +218,9 @@ enum Commands {
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Use LSP servers for precise call edge resolution
+        /// Skip LSP refinement (LSP is enabled by default for precise call edges)
         #[arg(long)]
-        lsp: bool,
+        no_lsp: bool,
         /// Force full rebuild (ignore cached metadata)
         #[arg(long)]
         force: bool,
@@ -505,6 +505,9 @@ enum Commands {
         /// Debounce interval in milliseconds (default: 1000)
         #[arg(long, default_value = "1000")]
         debounce: u64,
+        /// Skip LSP refinement (LSP is enabled by default)
+        #[arg(long)]
+        no_lsp: bool,
         /// Skip semantify/bridge edge generation (faster)
         #[arg(long)]
         no_semantify: bool,
@@ -840,7 +843,7 @@ fn main() -> Result<()> {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_edit_graph_ctx(&ctx, &operations, cli.json)
         }
-        Commands::Extract { dir, format, output, lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp, force, no_semantify, cli.graph.as_ref()),
+        Commands::Extract { dir, format, output, no_lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, !no_lsp, force, no_semantify, cli.graph.as_ref()),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
         Commands::CodeFailures { changed, p2p, f2p, dir } => cmd_code_failures(&dir, &changed, p2p.as_deref(), f2p.as_deref(), cli.json),
@@ -935,8 +938,8 @@ fn main() -> Result<()> {
                 RitualCommands::Templates => cmd_ritual_templates(&cwd, cli.json),
             }
         }
-        Commands::Watch { dir, debounce, no_semantify } => {
-            cmd_watch(&dir, debounce, no_semantify, cli.graph.as_ref())
+        Commands::Watch { dir, debounce, no_lsp, no_semantify } => {
+            cmd_watch(&dir, debounce, no_lsp, no_semantify, cli.graph.as_ref())
         }
     }
 }
@@ -2391,6 +2394,18 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
                             stats.implementation_edges_added,
                         );
                     }
+                    if !stats.missing_servers.is_empty() {
+                        eprintln!();
+                        eprintln!("⚠️  Missing LSP servers ({} language{}):", 
+                            stats.missing_servers.len(),
+                            if stats.missing_servers.len() > 1 { "s" } else { "" }
+                        );
+                        for m in &stats.missing_servers {
+                            eprintln!("   • {} — {} files, {} call edges unrefined", m.language_id, m.file_count, m.edge_count);
+                            eprintln!("     Install: {}", m.install_command);
+                        }
+                        eprintln!();
+                    }
                 }
             }
             Err(e) => {
@@ -2435,9 +2450,6 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
 
         // Generate bridge edges between project and code nodes
         gid_core::unify::generate_bridge_edges(&mut graph);
-
-        // Auto-link task nodes to code nodes based on file mentions in task titles/descriptions
-        gid_core::link_tasks_to_code(&code_graph, &mut graph);
 
         let bridge_count = graph.bridge_edges().len();
 
@@ -4437,7 +4449,7 @@ fn phase_kind_name(kind: &gid_core::ritual::PhaseKind) -> &'static str {
 // Watch Command
 // =============================================================================
 
-fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_semantify: bool, graph_override: Option<&PathBuf>) -> Result<()> {
+fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_lsp: bool, no_semantify: bool, graph_override: Option<&PathBuf>) -> Result<()> {
     use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
     use std::sync::mpsc::channel;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4482,7 +4494,7 @@ fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_semantify: bool, graph_override
         watch_dir: dir.clone(),
         gid_dir: gid_dir.clone(),
         debounce_ms,
-        lsp: false,
+        lsp: !no_lsp,
         no_semantify,
     };
 
