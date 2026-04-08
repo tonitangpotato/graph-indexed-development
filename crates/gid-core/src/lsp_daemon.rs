@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::lsp_client::{LspClient, LspLocation, LspServerConfig};
+use crate::code_graph::FileDelta;
+use crate::lsp_client::{LspClient, LspLocation, LspServerConfig, extension_to_language_id};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Protocol: messages between client and daemon over Unix socket
@@ -76,6 +77,13 @@ enum DaemonRequest {
     ShutdownAll,
     /// Get status of all managed servers.
     Status,
+    /// Incrementally refine: notify LSP of added/modified/deleted files.
+    RefineIncremental {
+        added: Vec<String>,
+        modified: Vec<String>,
+        deleted: Vec<String>,
+        root_dir: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +108,9 @@ enum DaemonResponse {
     },
     Error {
         message: String,
+    },
+    Refined {
+        files_processed: usize,
     },
 }
 
@@ -323,6 +334,86 @@ impl LspDaemon {
                     }
                 }).collect();
                 DaemonResponse::Status { servers }
+            }
+
+            DaemonRequest::RefineIncremental { added, modified, deleted, root_dir } => {
+                let root = PathBuf::from(&root_dir);
+                let mut processed: usize = 0;
+
+                // For deleted files: close in all servers that might have them open
+                for rel_path in &deleted {
+                    for server in self.servers.values_mut() {
+                        server.last_used = Instant::now();
+                        let _ = server.client.close_file(rel_path);
+                    }
+                    processed += 1;
+                }
+
+                // For modified files: close then re-open with new content
+                for rel_path in &modified {
+                    let abs_path = root.join(rel_path);
+                    let content = match std::fs::read_to_string(&abs_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[LSP daemon] Failed to read modified file {}: {}", rel_path, e);
+                            continue;
+                        }
+                    };
+                    let ext = Path::new(rel_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    let lang_id = extension_to_language_id(ext);
+
+                    if let Some(server) = self.servers.get_mut(lang_id) {
+                        server.last_used = Instant::now();
+                        let _ = server.client.close_file(rel_path);
+                        match server.client.open_file(rel_path, &content, lang_id) {
+                            Ok(()) => { server.files_opened += 1; }
+                            Err(e) => {
+                                eprintln!("[LSP daemon] Failed to re-open modified file {}: {}", rel_path, e);
+                                continue;
+                            }
+                        }
+                    }
+                    processed += 1;
+                }
+
+                // For added files: open with content
+                for rel_path in &added {
+                    let abs_path = root.join(rel_path);
+                    let content = match std::fs::read_to_string(&abs_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[LSP daemon] Failed to read added file {}: {}", rel_path, e);
+                            continue;
+                        }
+                    };
+                    let ext = Path::new(rel_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    let lang_id = extension_to_language_id(ext);
+
+                    if let Err(e) = self.ensure_server(lang_id) {
+                        eprintln!("[LSP daemon] Failed to ensure server for {}: {}", lang_id, e);
+                        continue;
+                    }
+
+                    if let Some(server) = self.servers.get_mut(lang_id) {
+                        server.last_used = Instant::now();
+                        match server.client.open_file(rel_path, &content, lang_id) {
+                            Ok(()) => { server.files_opened += 1; }
+                            Err(e) => {
+                                eprintln!("[LSP daemon] Failed to open added file {}: {}", rel_path, e);
+                                continue;
+                            }
+                        }
+                    }
+                    processed += 1;
+                }
+
+                DaemonResponse::Refined { files_processed: processed }
             }
         }
     }
@@ -573,6 +664,23 @@ impl DaemonLspClient {
             rel_path: rel_path.to_string(),
         });
         Ok(())
+    }
+
+    /// Incrementally refine: notify the daemon of file changes from a FileDelta.
+    /// The daemon will close deleted files, re-open modified files, and open added files
+    /// in the appropriate LSP servers.
+    /// Returns the number of files processed.
+    pub fn refine_incremental(&mut self, delta: &FileDelta, root_dir: &Path) -> Result<usize> {
+        match self.send_recv(DaemonRequest::RefineIncremental {
+            added: delta.added.clone(),
+            modified: delta.modified.clone(),
+            deleted: delta.deleted.clone(),
+            root_dir: root_dir.to_string_lossy().to_string(),
+        })? {
+            DaemonResponse::Refined { files_processed } => Ok(files_processed),
+            DaemonResponse::Error { message } => bail!("Refine incremental error: {}", message),
+            _ => bail!("Unexpected response to refine_incremental"),
+        }
     }
 }
 

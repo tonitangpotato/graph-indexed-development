@@ -35,6 +35,7 @@ pub use code_graph::{
     ImpactReport, CausalChain, ChainNode,
     UnifiedGraphResult, UnifiedNode, UnifiedEdge,
     ExtractMetadata, FileState, FileDelta, ExtractReport,
+    compute_file_delta,
 };
 #[allow(deprecated)]
 pub use unified::{build_unified_graph, merge_relevant_code, link_tasks_to_code, UnifiedStats};

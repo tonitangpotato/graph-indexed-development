@@ -1005,6 +1005,57 @@ pub fn open_project_files(
     Ok(count)
 }
 
+/// Incrementally refine an LSP client by notifying it of file changes from a FileDelta.
+/// - Closes deleted files
+/// - For modified files: close + re-open with new content
+/// - Opens newly added files
+/// Returns the count of files processed.
+pub fn refine_files(
+    client: &mut LspClient,
+    delta: &super::code_graph::FileDelta,
+    root_dir: &Path,
+) -> Result<usize> {
+    let mut processed: usize = 0;
+
+    // Close deleted files
+    for rel_path in &delta.deleted {
+        client.close_file(rel_path)?;
+        processed += 1;
+    }
+
+    // Modified files: close then re-open with new content
+    for rel_path in &delta.modified {
+        client.close_file(rel_path)?;
+
+        let abs_path = root_dir.join(rel_path);
+        let content = std::fs::read_to_string(&abs_path)
+            .with_context(|| format!("read modified file: {}", rel_path))?;
+        let ext = Path::new(rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let lang_id = extension_to_language_id(ext);
+        client.open_file(rel_path, &content, lang_id)?;
+        processed += 1;
+    }
+
+    // Open added files
+    for rel_path in &delta.added {
+        let abs_path = root_dir.join(rel_path);
+        let content = std::fs::read_to_string(&abs_path)
+            .with_context(|| format!("read added file: {}", rel_path))?;
+        let ext = Path::new(rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let lang_id = extension_to_language_id(ext);
+        client.open_file(rel_path, &content, lang_id)?;
+        processed += 1;
+    }
+
+    Ok(processed)
+}
+
 /// Build a lookup table: (file_path, line) → node_id for resolving LSP definition targets.
 pub fn build_definition_target_index(
     nodes: &[super::code_graph::CodeNode],

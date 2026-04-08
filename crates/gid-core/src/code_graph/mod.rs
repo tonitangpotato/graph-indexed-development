@@ -18,3 +18,4 @@ mod tests;
 
 pub use types::*;
 pub use types::{ExtractMetadata, FileState, FileDelta, ExtractReport};
+pub use extract::compute_file_delta;
