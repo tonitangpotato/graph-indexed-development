@@ -2,6 +2,12 @@
 //!
 //! Save snapshots with timestamps, list/diff/restore versions.
 
+// TODO: GOAL-3.1 — When SQLite backend is active, use rusqlite::backup::Backup
+// to create history snapshots as .db files instead of serializing to YAML.
+// Current approach: serialize Graph → YAML file (works for both backends)
+// Future approach: if source is .db, use Backup::new() for atomic, consistent snapshots
+// The rusqlite "backup" feature is already enabled in Cargo.toml.
+
 use std::path::{Path, PathBuf};
 use std::fs;
 use anyhow::{Context, Result, bail};
@@ -131,6 +137,7 @@ impl HistoryManager {
     
     /// Save a snapshot of the current graph.
     pub fn save_snapshot(&self, graph: &Graph, message: Option<&str>) -> Result<String> {
+        let start = std::time::Instant::now();
         self.ensure_dir()?;
         
         let timestamp = Utc::now();
@@ -144,11 +151,20 @@ impl HistoryManager {
             serde_yaml::to_string(graph)?
         };
         
-        fs::write(&filepath, yaml)
+        let file_size = yaml.len();
+        fs::write(&filepath, &yaml)
             .with_context(|| format!("Failed to save snapshot: {}", filepath.display()))?;
         
         // Clean up old history entries
         self.cleanup()?;
+        
+        let elapsed = start.elapsed();
+        tracing::info!(
+            filename = %filename,
+            file_size_bytes = file_size,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "saved history snapshot"
+        );
         
         Ok(filename)
     }
@@ -269,12 +285,47 @@ impl HistoryManager {
     
     /// Diff current graph against a historical version.
     pub fn diff_against(&self, version: &str, current: &Graph) -> Result<GraphDiff> {
+        let start = std::time::Instant::now();
         let historical = self.load_version(version)?;
-        Ok(Self::diff(&historical, current))
+        let diff = Self::diff(&historical, current);
+        let elapsed = start.elapsed();
+        tracing::info!(
+            version = %version,
+            added = diff.added_nodes.len(),
+            removed = diff.removed_nodes.len(),
+            modified = diff.modified_nodes.len(),
+            added_edges = diff.added_edges,
+            removed_edges = diff.removed_edges,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "diff_against complete"
+        );
+        Ok(diff)
+    }
+    
+    /// Diff two historical snapshots against each other.
+    pub fn diff_versions(&self, version_a: &str, version_b: &str) -> Result<GraphDiff> {
+        let start = std::time::Instant::now();
+        let graph_a = self.load_version(version_a)?;
+        let graph_b = self.load_version(version_b)?;
+        let diff = Self::diff(&graph_a, &graph_b);
+        let elapsed = start.elapsed();
+        tracing::info!(
+            version_a = %version_a,
+            version_b = %version_b,
+            added = diff.added_nodes.len(),
+            removed = diff.removed_nodes.len(),
+            modified = diff.modified_nodes.len(),
+            added_edges = diff.added_edges,
+            removed_edges = diff.removed_edges,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "diff_versions complete"
+        );
+        Ok(diff)
     }
     
     /// Restore a historical version to the main graph file.
     pub fn restore(&self, version: &str, graph_path: &Path) -> Result<()> {
+        let start = std::time::Instant::now();
         let historical = self.load_version(version)?;
         
         // Save current state to history first
@@ -286,6 +337,13 @@ impl HistoryManager {
         
         // Write the historical version as the current graph
         save_graph(&historical, graph_path)?;
+        
+        let elapsed = start.elapsed();
+        tracing::info!(
+            version = %version,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "restored historical version"
+        );
         
         Ok(())
     }
@@ -1546,5 +1604,74 @@ mod tests {
         assert_eq!(n.knowledge.file_cache.get("src/main.rs").unwrap(), "fn main() {}");
         assert_eq!(n.knowledge.tool_history.len(), 1);
         assert_eq!(n.knowledge.tool_history[0].tool_name, "read_file");
+    }
+
+    // ── diff_versions Tests ──
+
+    #[test]
+    fn test_diff_versions_basic() {
+        let temp = TempDir::new().unwrap();
+        let gid_dir = temp.path().join(".gid");
+        fs::create_dir_all(&gid_dir).unwrap();
+        let mgr = HistoryManager::new(&gid_dir);
+
+        // Snapshot A: one node
+        let mut graph_a = Graph::new();
+        graph_a.add_node(Node::new("a", "Alpha"));
+        let file_a = mgr.save_snapshot(&graph_a, Some("v1")).unwrap();
+
+        // Sleep to ensure different filenames
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Snapshot B: different node
+        let mut graph_b = Graph::new();
+        graph_b.add_node(Node::new("a", "Alpha Changed"));
+        graph_b.add_node(Node::new("b", "Beta"));
+        let file_b = mgr.save_snapshot(&graph_b, Some("v2")).unwrap();
+
+        let diff = mgr.diff_versions(&file_a, &file_b).unwrap();
+        assert_eq!(diff.added_nodes, vec!["b"]);
+        assert!(diff.removed_nodes.is_empty());
+        assert_eq!(diff.modified_nodes, vec!["a"]);
+    }
+
+    #[test]
+    fn test_diff_versions_same() {
+        let temp = TempDir::new().unwrap();
+        let gid_dir = temp.path().join(".gid");
+        fs::create_dir_all(&gid_dir).unwrap();
+        let mgr = HistoryManager::new(&gid_dir);
+
+        let mut graph = Graph::new();
+        graph.add_node(Node::new("a", "Alpha"));
+        let filename = mgr.save_snapshot(&graph, Some("v1")).unwrap();
+
+        // Diff a version against itself should show no changes
+        let diff = mgr.diff_versions(&filename, &filename).unwrap();
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_diff_versions_nonexistent() {
+        let temp = TempDir::new().unwrap();
+        let gid_dir = temp.path().join(".gid");
+        fs::create_dir_all(&gid_dir).unwrap();
+        let mgr = HistoryManager::new(&gid_dir);
+
+        let mut graph = Graph::new();
+        graph.add_node(Node::new("a", "Alpha"));
+        let filename = mgr.save_snapshot(&graph, Some("v1")).unwrap();
+
+        // Nonexistent version_a
+        let result = mgr.diff_versions("nonexistent.yml", &filename);
+        assert!(result.is_err());
+
+        // Nonexistent version_b
+        let result = mgr.diff_versions(&filename, "nonexistent.yml");
+        assert!(result.is_err());
+
+        // Both nonexistent
+        let result = mgr.diff_versions("nope1.yml", "nope2.yml");
+        assert!(result.is_err());
     }
 }

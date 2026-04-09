@@ -581,10 +581,12 @@ enum HistoryCommands {
         message: Option<String>,
     },
 
-    /// Diff current graph against a historical version
+    /// Diff current graph against a historical version (or diff two versions)
     Diff {
-        /// Version filename to compare against
+        /// Version filename to compare against (or first version when comparing two)
         version: String,
+        /// Optional second version filename; when provided, diffs version vs version2
+        version2: Option<String>,
     },
 
     /// Restore a historical version
@@ -861,7 +863,7 @@ fn main() -> Result<()> {
             match hc {
                 HistoryCommands::List => cmd_history_list(&ctx.gid_dir, cli.json),
                 HistoryCommands::Save { message } => cmd_history_save(&ctx.graph_yml, &ctx.gid_dir, message.as_deref(), cli.json),
-                HistoryCommands::Diff { version } => cmd_history_diff(&ctx.graph_yml, &ctx.gid_dir, &version, cli.json),
+                HistoryCommands::Diff { version, version2 } => cmd_history_diff(&ctx.graph_yml, &ctx.gid_dir, &version, version2.as_deref(), cli.json),
                 HistoryCommands::Restore { version, force } => cmd_history_restore(&ctx.graph_yml, &ctx.gid_dir, &version, force, cli.json),
             }
         }
@@ -2736,15 +2738,29 @@ fn cmd_history_save(graph_path: &PathBuf, gid_dir: &std::path::Path, message: Op
     Ok(())
 }
 
-fn cmd_history_diff(graph_path: &PathBuf, gid_dir: &std::path::Path, version: &str, json: bool) -> Result<()> {
-    let current = load_graph(graph_path)?;
+fn cmd_history_diff(graph_path: &PathBuf, gid_dir: &std::path::Path, version: &str, version2: Option<&str>, json: bool) -> Result<()> {
     let mgr = HistoryManager::new(gid_dir);
-    let diff = mgr.diff_against(version, &current)?;
+    
+    let diff = if let Some(v2) = version2 {
+        // Diff two historical versions against each other
+        let d = mgr.diff_versions(version, v2)?;
+        if !json {
+            println!("\n📊 Comparing {} → {}\n", version, v2);
+        }
+        d
+    } else {
+        // Diff historical version against current graph
+        let current = load_graph(graph_path)?;
+        let d = mgr.diff_against(version, &current)?;
+        if !json {
+            println!("\n📊 Comparing {} → current\n", version);
+        }
+        d
+    };
     
     if json {
         println!("{}", serde_json::to_string_pretty(&diff)?);
     } else {
-        println!("\n📊 Comparing {} → current\n", version);
         println!("{}", diff);
     }
     Ok(())
