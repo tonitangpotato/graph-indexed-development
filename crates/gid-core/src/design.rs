@@ -430,7 +430,11 @@ fn to_snake_case(s: &str) -> String {
             if i > 0 && !prev_was_upper {
                 result.push('_');
             }
-            result.push(c.to_lowercase().next().unwrap());
+            // to_lowercase() can yield multiple chars for some Unicode (e.g. 'İ' → 'i̇')
+            // Use the first char, fallback to original if iterator is empty (shouldn't happen)
+            for lc in c.to_lowercase() {
+                result.push(lc);
+            }
             prev_was_upper = true;
         } else if c == '-' || c == ' ' {
             result.push('_');

@@ -169,62 +169,103 @@ impl<'a> Validator<'a> {
         missing
     }
 
-    /// Find cycles in the graph (specifically in depends_on edges).
+    /// Find cycles in the graph using Tarjan's SCC algorithm.
+    /// By default checks depends_on edges. Any SCC with size > 1 is a cycle.
     pub fn find_cycles(&self) -> Vec<Vec<String>> {
-        let mut cycles = Vec::new();
-        let mut visited = HashSet::new();
-        let mut rec_stack = HashSet::new();
+        self.find_cycles_for_relations(&["depends_on"])
+    }
 
-        // Build adjacency list for depends_on edges
+    /// Find cycles considering specific edge relations.
+    pub fn find_cycles_for_relations(&self, relations: &[&str]) -> Vec<Vec<String>> {
+        let relation_set: HashSet<&str> = relations.iter().copied().collect();
+
+        // Build adjacency list for specified edge relations
         let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
         for node in &self.graph.nodes {
             adj.entry(&node.id).or_default();
         }
         for edge in &self.graph.edges {
-            if edge.relation == "depends_on" {
+            if relation_set.contains(edge.relation.as_str()) {
                 adj.entry(&edge.from).or_default().push(&edge.to);
             }
         }
 
-        fn dfs<'a>(
+        // Tarjan's SCC
+        let mut index_counter: usize = 0;
+        let mut stack: Vec<&str> = Vec::new();
+        let mut on_stack: HashSet<&str> = HashSet::new();
+        let mut indices: HashMap<&str, usize> = HashMap::new();
+        let mut lowlinks: HashMap<&str, usize> = HashMap::new();
+        let mut sccs: Vec<Vec<String>> = Vec::new();
+
+        fn strongconnect<'a>(
             node: &'a str,
             adj: &HashMap<&'a str, Vec<&'a str>>,
-            visited: &mut HashSet<&'a str>,
-            rec_stack: &mut HashSet<&'a str>,
-            path: &mut Vec<String>,
-            cycles: &mut Vec<Vec<String>>,
+            index_counter: &mut usize,
+            stack: &mut Vec<&'a str>,
+            on_stack: &mut HashSet<&'a str>,
+            indices: &mut HashMap<&'a str, usize>,
+            lowlinks: &mut HashMap<&'a str, usize>,
+            sccs: &mut Vec<Vec<String>>,
         ) {
-            visited.insert(node);
-            rec_stack.insert(node);
-            path.push(node.to_string());
+            indices.insert(node, *index_counter);
+            lowlinks.insert(node, *index_counter);
+            *index_counter += 1;
+            stack.push(node);
+            on_stack.insert(node);
 
             if let Some(neighbors) = adj.get(node) {
                 for &neighbor in neighbors {
-                    if !visited.contains(neighbor) {
-                        dfs(neighbor, adj, visited, rec_stack, path, cycles);
-                    } else if rec_stack.contains(neighbor) {
-                        // Found a cycle - extract the cycle portion
-                        if let Some(start_idx) = path.iter().position(|x| x == neighbor) {
-                            let mut cycle: Vec<String> = path[start_idx..].to_vec();
-                            cycle.push(neighbor.to_string()); // Close the cycle
-                            cycles.push(cycle);
+                    if !indices.contains_key(neighbor) {
+                        strongconnect(neighbor, adj, index_counter, stack, on_stack, indices, lowlinks, sccs);
+                        let neighbor_low = lowlinks[neighbor];
+                        let node_low = lowlinks.get_mut(node).unwrap();
+                        if neighbor_low < *node_low {
+                            *node_low = neighbor_low;
+                        }
+                    } else if on_stack.contains(neighbor) {
+                        let neighbor_idx = indices[neighbor];
+                        let node_low = lowlinks.get_mut(node).unwrap();
+                        if neighbor_idx < *node_low {
+                            *node_low = neighbor_idx;
                         }
                     }
                 }
             }
 
-            path.pop();
-            rec_stack.remove(node);
-        }
-
-        for node in &self.graph.nodes {
-            if !visited.contains(node.id.as_str()) {
-                let mut path = Vec::new();
-                dfs(&node.id, &adj, &mut visited, &mut rec_stack, &mut path, &mut cycles);
+            // If node is a root of an SCC
+            if lowlinks[node] == indices[node] {
+                let mut scc = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack.remove(w);
+                    scc.push(w.to_string());
+                    if w == node {
+                        break;
+                    }
+                }
+                // Only report SCCs with size > 1 (actual cycles)
+                if scc.len() > 1 {
+                    scc.reverse(); // Put in traversal order
+                    // Add closing node to match the existing format: [a, b, c, a]
+                    if let Some(first) = scc.first().cloned() {
+                        scc.push(first);
+                    }
+                    sccs.push(scc);
+                }
             }
         }
 
-        cycles
+        for node in &self.graph.nodes {
+            if !indices.contains_key(node.id.as_str()) {
+                strongconnect(
+                    &node.id, &adj, &mut index_counter, &mut stack,
+                    &mut on_stack, &mut indices, &mut lowlinks, &mut sccs,
+                );
+            }
+        }
+
+        sccs
     }
 
     /// Find duplicate node IDs.
@@ -386,5 +427,62 @@ mod tests {
         let validator = Validator::new(&graph);
         let cycles = validator.find_cycles();
         assert!(!cycles.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_independent_cycles() {
+        let mut graph = Graph::new();
+        // Cycle 1: a -> b -> a
+        graph.add_node(Node::new("a", "A"));
+        graph.add_node(Node::new("b", "B"));
+        graph.add_edge(Edge::depends_on("a", "b"));
+        graph.add_edge(Edge::depends_on("b", "a"));
+        // Cycle 2: c -> d -> c
+        graph.add_node(Node::new("c", "C"));
+        graph.add_node(Node::new("d", "D"));
+        graph.add_edge(Edge::depends_on("c", "d"));
+        graph.add_edge(Edge::depends_on("d", "c"));
+        // Unconnected node
+        graph.add_node(Node::new("e", "E"));
+
+        let validator = Validator::new(&graph);
+        let cycles = validator.find_cycles();
+        assert_eq!(cycles.len(), 2, "Should find both independent cycles");
+    }
+
+    #[test]
+    fn test_no_false_positives_on_dag() {
+        let mut graph = Graph::new();
+        // Diamond DAG: a -> b, a -> c, b -> d, c -> d
+        graph.add_node(Node::new("a", "A"));
+        graph.add_node(Node::new("b", "B"));
+        graph.add_node(Node::new("c", "C"));
+        graph.add_node(Node::new("d", "D"));
+        graph.add_edge(Edge::depends_on("a", "b"));
+        graph.add_edge(Edge::depends_on("a", "c"));
+        graph.add_edge(Edge::depends_on("b", "d"));
+        graph.add_edge(Edge::depends_on("c", "d"));
+
+        let validator = Validator::new(&graph);
+        let cycles = validator.find_cycles();
+        assert!(cycles.is_empty(), "Diamond DAG should have no cycles");
+    }
+
+    #[test]
+    fn test_cycle_detection_multi_relation() {
+        let mut graph = Graph::new();
+        graph.add_node(Node::new("a", "A"));
+        graph.add_node(Node::new("b", "B"));
+        // No depends_on cycle, but blocks creates one
+        graph.add_edge(Edge::new("a", "b", "blocks"));
+        graph.add_edge(Edge::new("b", "a", "blocks"));
+
+        let validator = Validator::new(&graph);
+        // Default: only depends_on — no cycles
+        let cycles = validator.find_cycles();
+        assert!(cycles.is_empty());
+        // With blocks relation — finds cycle
+        let cycles = validator.find_cycles_for_relations(&["blocks"]);
+        assert_eq!(cycles.len(), 1);
     }
 }

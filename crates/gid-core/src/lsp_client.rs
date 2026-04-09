@@ -688,8 +688,8 @@ impl LspClient {
                 eprintln!("[DEBUG-DEF] NULL response for {}:{}:{}", rel_path, line, character);
             }
             return Ok(None);
-        } else if resp.is_array() {
-            let arr = resp.as_array().unwrap().clone();
+        } else if let Some(arr) = resp.as_array() {
+            let arr = arr.to_vec();
             if count < 10 {
                 eprintln!("[DEBUG-DEF] Array response (len={}) for {}:{}:{}", arr.len(), rel_path, line, character);
             }
@@ -771,8 +771,8 @@ impl LspClient {
     fn parse_locations(&self, resp: Value) -> Vec<LspLocation> {
         let raw = if resp.is_null() {
             return Vec::new();
-        } else if resp.is_array() {
-            resp.as_array().unwrap().clone()
+        } else if let Some(arr) = resp.as_array() {
+            arr.to_vec()
         } else {
             vec![resp]
         };

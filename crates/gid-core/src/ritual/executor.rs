@@ -483,13 +483,48 @@ impl GidCommandExecutor {
             }
             "validate" => {
                 let graph = load_graph_auto(&context.gid_root, None).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let validator = crate::validator::Validator::new(&graph);
+                let result = validator.validate();
                 let summary = graph.summary();
                 let health = graph.health();
-                Ok(format!(
+                
+                let mut output = format!(
                     "Graph: {} nodes, {} edges\nHealth: {:.0}%\nDone: {}/{} tasks",
                     summary.total_nodes, summary.total_edges,
                     health * 100.0, summary.done, summary.total_nodes
-                ))
+                );
+                
+                if !result.is_valid() {
+                    output.push_str(&format!("\n⚠️ {} issues found:", result.issue_count()));
+                    if !result.cycles.is_empty() {
+                        output.push_str(&format!("\n  🔴 {} cycle(s)", result.cycles.len()));
+                        for cycle in &result.cycles {
+                            output.push_str(&format!("\n     {}", cycle.join(" → ")));
+                        }
+                    }
+                    if !result.orphan_nodes.is_empty() {
+                        output.push_str(&format!("\n  🟡 {} orphan node(s)", result.orphan_nodes.len()));
+                    }
+                    if !result.missing_refs.is_empty() {
+                        output.push_str(&format!("\n  🔴 {} missing ref(s)", result.missing_refs.len()));
+                        for mr in &result.missing_refs {
+                            output.push_str(&format!("\n     {} → {} (missing: {})", mr.edge_from, mr.edge_to, mr.missing_node));
+                        }
+                    }
+                    if !result.duplicate_nodes.is_empty() {
+                        output.push_str(&format!("\n  🟡 {} duplicate node(s)", result.duplicate_nodes.len()));
+                    }
+                    if !result.duplicate_edges.is_empty() {
+                        output.push_str(&format!("\n  🟡 {} duplicate edge(s)", result.duplicate_edges.len()));
+                    }
+                    if !result.self_edges.is_empty() {
+                        output.push_str(&format!("\n  🟡 {} self-edge(s)", result.self_edges.len()));
+                    }
+                } else {
+                    output.push_str("\n✅ No issues found");
+                }
+                
+                Ok(output)
             }
             "design" => {
                 // design --parse needs LLM — use Skill phase instead of GidCommand

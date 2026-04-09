@@ -143,8 +143,8 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
         edges,
     };
 
-    // Auto-link task nodes to code files mentioned in task titles/descriptions
-    link_tasks_to_code(code_graph, &mut unified);
+    // Auto-link task nodes to code files using the modern bridge edge system
+    crate::unify::generate_bridge_edges(&mut unified);
 
     unified
 }
