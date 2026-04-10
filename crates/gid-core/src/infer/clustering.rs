@@ -5,7 +5,7 @@
 //! and returns a [`ClusterResult`] containing inferred component `Node`s and
 //! membership `Edge`s. The input graph is never mutated.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use infomap_rs::{Infomap, Network};
@@ -65,6 +65,9 @@ pub struct ClusterConfig {
     pub dir_colocation_weight: f64,
     /// Random seed for reproducibility (default: 42).
     pub seed: u64,
+    /// Maximum cluster size. Clusters exceeding this are sub-clustered.
+    /// `None` means auto-compute: `max(20, total_file_count / 5)`.
+    pub max_cluster_size: Option<usize>,
 }
 
 impl Default for ClusterConfig {
@@ -76,6 +79,7 @@ impl Default for ClusterConfig {
             dir_colocation_weight: WEIGHT_DIR_COLOCATION,
             hierarchical: false,
             seed: 42,
+            max_cluster_size: None,
         }
     }
 }
@@ -114,6 +118,10 @@ pub struct ClusterMetrics {
     pub orphans_assigned_by_dir: usize,
     /// Diagnostic: final number of size=1 clusters after all reassignment.
     pub singleton_clusters_final: usize,
+    /// Number of clusters that were split via sub-clustering.
+    pub clusters_split: usize,
+    /// Total sub-clusters created from splitting.
+    pub sub_clusters_created: usize,
 }
 
 /// The output of clustering: new component nodes, membership edges, and metrics.
@@ -320,9 +328,214 @@ pub fn run_clustering(
         orphans_merged_by_affinity: diag.merged_by_affinity,
         orphans_assigned_by_dir: diag.assigned_by_dir,
         singleton_clusters_final: diag.singleton_clusters_final,
+        ..Default::default()
     };
 
     (clusters, metrics)
+}
+
+// ── Mega-cluster splitting ─────────────────────────────────────────────────
+
+/// Split oversized clusters via recursive sub-clustering.
+///
+/// Scans all clusters for any exceeding `max_cluster_size`. For each oversized
+/// cluster:
+/// 1. Extract subgraph (internal files + internal edges only)
+/// 2. Run Infomap again with higher teleportation rate (1.5× parent's τ, capped at 0.15)
+/// 3. If subgraph produces >1 cluster → replace original with sub-clusters
+/// 4. If subgraph produces 1 cluster → stop (monolithic, don't force-split)
+/// 5. Recursively check sub-results for remaining oversized clusters
+///
+/// Max recursion depth = 3 to prevent infinite loops.
+pub fn split_mega_clusters(
+    clusters: Vec<RawCluster>,
+    net: &Network,
+    idx_to_id: &[String],
+    config: &ClusterConfig,
+    max_cluster_size: usize,
+) -> Vec<RawCluster> {
+    split_mega_clusters_recursive(clusters, net, idx_to_id, config, max_cluster_size, 0, 3)
+}
+
+/// Recursively split oversized clusters by running Infomap on their subgraphs.
+///
+/// For each cluster exceeding `max_cluster_size`:
+/// 1. Extract the subgraph (internal edges only from the network)
+/// 2. Run Infomap with higher teleportation rate (1.5× parent's τ, capped at 0.15)
+/// 3. If >1 sub-cluster produced → replace the mega-cluster with sub-clusters
+/// 4. If only 1 sub-cluster (truly monolithic) → keep as-is, stop recursing
+/// 5. Recurse on sub-results that still exceed threshold (max depth)
+fn split_mega_clusters_recursive(
+    clusters: Vec<RawCluster>,
+    net: &Network,
+    idx_to_id: &[String],
+    config: &ClusterConfig,
+    max_cluster_size: usize,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<RawCluster> {
+    if depth >= max_depth {
+        if depth > 0 {
+            eprintln!(
+                "⚠ Max recursion depth {} reached for mega-cluster splitting",
+                max_depth
+            );
+        }
+        return clusters;
+    }
+
+    let mut result_clusters: Vec<RawCluster> = Vec::new();
+    let mut any_split = false;
+
+    for cluster in clusters {
+        if cluster.member_ids.len() <= max_cluster_size {
+            // Cluster is within size limit, keep as-is
+            result_clusters.push(cluster);
+            continue;
+        }
+
+        // Attempt to split this oversized cluster
+        eprintln!(
+            "  🔪 Splitting mega-cluster {} with {} files (max: {})",
+            cluster.id,
+            cluster.member_ids.len(),
+            max_cluster_size
+        );
+
+        // Build id → network index lookup
+        let mut id_to_net_idx: HashMap<&str, usize> = HashMap::new();
+        for (idx, nid) in idx_to_id.iter().enumerate() {
+            id_to_net_idx.insert(nid.as_str(), idx);
+        }
+
+        // Get network indices for cluster members
+        let member_net_indices: Vec<usize> = cluster
+            .member_ids
+            .iter()
+            .filter_map(|mid| id_to_net_idx.get(mid.as_str()).copied())
+            .collect();
+
+        if member_net_indices.is_empty() {
+            result_clusters.push(cluster);
+            continue;
+        }
+
+        // Build subgraph: only internal edges (edges between cluster members)
+        let subgraph = extract_subgraph(net, &member_net_indices);
+        let sub_idx_to_id: Vec<String> = member_net_indices
+            .iter()
+            .map(|&idx| idx_to_id[idx].clone())
+            .collect();
+
+        if subgraph.num_nodes() < 2 {
+            // Not enough nodes to cluster
+            result_clusters.push(cluster);
+            continue;
+        }
+
+        // Run Infomap on subgraph with higher teleportation rate for better resolution
+        let sub_tau = (config.teleportation_rate * 1.5).min(0.15);
+        let mut sub_config = config.clone();
+        sub_config.teleportation_rate = sub_tau;
+        sub_config.hierarchical = false; // Always flat for sub-clustering
+        sub_config.dir_colocation_weight = 0.0; // No dir colocation in sub-clustering
+
+        eprintln!(
+            "    📊 Subgraph: {} nodes, {} edges, tau={:.4}",
+            subgraph.num_nodes(),
+            subgraph.num_edges(),
+            sub_config.teleportation_rate,
+        );
+
+        let sub_result = Infomap::new(&subgraph)
+            .seed(sub_config.seed)
+            .num_trials(sub_config.num_trials as usize)
+            .hierarchical(false) // Always use flat for sub-clustering
+            .tau(sub_config.teleportation_rate)
+            .run();
+
+        let sub_modules = sub_result.modules();
+
+        if sub_modules.len() <= 1 {
+            // Truly monolithic — cannot split further
+            eprintln!(
+                "    ℹ Cluster {} is monolithic (1 sub-module), keeping as-is (edges: {})",
+                cluster.id,
+                subgraph.num_edges(),
+            );
+            result_clusters.push(cluster);
+            continue;
+        }
+
+        // Successfully split — create sub-clusters
+        any_split = true;
+        eprintln!(
+            "    ✓ Split cluster {} into {} sub-clusters",
+            cluster.id,
+            sub_modules.len()
+        );
+
+        let base_id = result_clusters.len();
+        for (sub_idx, module) in sub_modules.iter().enumerate() {
+            let sub_member_ids: Vec<String> = module
+                .nodes
+                .iter()
+                .map(|&idx| sub_idx_to_id[idx].clone())
+                .collect();
+
+            if !sub_member_ids.is_empty() {
+                result_clusters.push(RawCluster {
+                    id: base_id + sub_idx,
+                    member_ids: sub_member_ids,
+                    flow: module.flow,
+                    parent: None,
+                    children: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // If any splits occurred, recursively check the results
+    if any_split {
+        split_mega_clusters_recursive(
+            result_clusters,
+            net,
+            idx_to_id,
+            config,
+            max_cluster_size,
+            depth + 1,
+            max_depth,
+        )
+    } else {
+        result_clusters
+    }
+}
+
+/// Extract a subgraph containing only the specified node indices and edges between them.
+fn extract_subgraph(net: &Network, node_indices: &[usize]) -> Network {
+    let mut subgraph = Network::new();
+
+    // Create a mapping from original indices to subgraph indices
+    let mut old_to_new: HashMap<usize, usize> = HashMap::new();
+    for (new_idx, &old_idx) in node_indices.iter().enumerate() {
+        old_to_new.insert(old_idx, new_idx);
+        // Add node to subgraph
+        subgraph.add_node_name(new_idx, &format!("{}", old_idx));
+    }
+
+    // Add edges that are internal to the subgraph
+    let node_set: HashSet<usize> = node_indices.iter().copied().collect();
+    for &from_old in node_indices {
+        for &(to_old, weight) in net.out_neighbors(from_old) {
+            if node_set.contains(&to_old) {
+                let from_new = old_to_new[&from_old];
+                let to_new = old_to_new[&to_old];
+                subgraph.add_edge(from_new, to_new, weight);
+            }
+        }
+    }
+
+    subgraph
 }
 
 /// Diagnostic counters for orphan reassignment.
@@ -1015,6 +1228,16 @@ pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
     }
 
     let (clusters, metrics) = run_clustering(&net, &idx_to_id, config);
+
+    // Compute effective max cluster size
+    let total_files = idx_to_id.len();
+    let max_size = config
+        .max_cluster_size
+        .unwrap_or_else(|| total_files.max(100) / 5);
+    let max_size = max_size.max(20); // Never below 20
+
+    // Split mega-clusters
+    let clusters = split_mega_clusters(clusters, &net, &idx_to_id, config, max_size);
 
     let mut result = map_to_components(&clusters, graph);
     result.metrics = metrics;
@@ -2218,5 +2441,261 @@ mod tests {
         // fixtures/ and generated/ are each alone → will be singletons
         let singleton_count = metrics.singleton_clusters_final;
         eprintln!("Singletons: {} (these are truly isolated files)", singleton_count);
+    }
+
+    // ── Sub-clustering tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_split_mega_cluster() {
+        // Create a graph with 30+ files that would cluster into one mega-cluster
+        // (files in two loose groups but heavily interconnected).
+        let mut g = Graph::default();
+        let file_count = 30;
+        let files: Vec<String> = (0..file_count)
+            .map(|i| format!("src/big/file{}.rs", i))
+            .collect();
+        for f in &files {
+            g.nodes.push(make_file_node(f));
+        }
+        // Fully connect all files → single mega-cluster
+        for i in 0..file_count {
+            for j in 0..file_count {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", files[i]),
+                        &format!("file:{}", files[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // With max_cluster_size=10, the mega-cluster should be split
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 1,
+            max_cluster_size: Some(10),
+            ..Default::default()
+        };
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
+        let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
+
+        // Before splitting: should have some clusters (possibly 1 big one)
+        let big_before = clusters.iter().filter(|c| c.member_ids.len() > 10).count();
+
+        let total_files_val = idx_to_id.len();
+        let max_size = config
+            .max_cluster_size
+            .unwrap_or_else(|| total_files_val.max(100) / 5)
+            .max(20);
+        let split_clusters = split_mega_clusters_recursive(
+            clusters,
+            &net,
+            &idx_to_id,
+            &config,
+            max_size,
+            0,
+            3,
+        );
+
+        // All files should still be accounted for
+        let total_members: usize = split_clusters.iter().map(|c| c.member_ids.len()).sum();
+        assert_eq!(
+            total_members, file_count,
+            "All {} files should be present after split, got {}",
+            file_count, total_members
+        );
+
+        eprintln!(
+            "test_split_mega_cluster: big_before={}, clusters_after={}, max_size={}",
+            big_before,
+            split_clusters.len(),
+            max_size
+        );
+    }
+
+    #[test]
+    fn test_split_preserves_small_clusters() {
+        // Two groups of 5 files each, well-separated
+        let mut g = Graph::default();
+        let group_a: Vec<String> = (0..5).map(|i| format!("src/alpha/a{}.rs", i)).collect();
+        let group_b: Vec<String> = (0..5).map(|i| format!("src/beta/b{}.rs", i)).collect();
+
+        for f in group_a.iter().chain(group_b.iter()) {
+            g.nodes.push(make_file_node(f));
+        }
+
+        // Fully connect group A
+        for i in 0..group_a.len() {
+            for j in 0..group_a.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", group_a[i]),
+                        &format!("file:{}", group_a[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+        // Fully connect group B
+        for i in 0..group_b.len() {
+            for j in 0..group_b.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", group_b[i]),
+                        &format!("file:{}", group_b[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 1,
+            max_cluster_size: Some(10), // both groups are under 10
+            ..Default::default()
+        };
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
+        let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
+
+        let clusters_before = clusters.len();
+        let split_clusters =
+            split_mega_clusters_recursive(clusters, &net, &idx_to_id, &config, 10, 0, 3);
+
+        // Neither cluster should be touched since both are ≤10
+        assert_eq!(
+            split_clusters.len(),
+            clusters_before,
+            "Small clusters should not be split: before={}, after={}",
+            clusters_before,
+            split_clusters.len()
+        );
+    }
+
+    #[test]
+    fn test_split_stops_on_monolith() {
+        // Create a completely connected graph with 15 files
+        let mut g = Graph::default();
+        let file_count = 15;
+        let files: Vec<String> = (0..file_count)
+            .map(|i| format!("src/mono/m{}.rs", i))
+            .collect();
+
+        for f in &files {
+            g.nodes.push(make_file_node(f));
+        }
+
+        // Perfect clique: every file calls every other file
+        for i in 0..file_count {
+            for j in 0..file_count {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", files[i]),
+                        &format!("file:{}", files[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 1,
+            max_cluster_size: Some(10),
+            ..Default::default()
+        };
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
+        let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
+
+        let split_clusters =
+            split_mega_clusters_recursive(clusters, &net, &idx_to_id, &config, 10, 0, 3);
+
+        // All files should still be accounted for
+        let total_members: usize = split_clusters.iter().map(|c| c.member_ids.len()).sum();
+        assert_eq!(
+            total_members, file_count,
+            "All {} files should be present, got {}",
+            file_count, total_members
+        );
+
+        // The monolithic cluster may or may not be split depending on Infomap's behavior.
+        // But we verify it doesn't panic and all members are preserved.
+        eprintln!(
+            "test_split_stops_on_monolith: {} clusters, sizes: {:?}",
+            split_clusters.len(),
+            split_clusters
+                .iter()
+                .map(|c| c.member_ids.len())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_split_max_depth() {
+        // Create a graph with 30 files in one cluster
+        let mut g = Graph::default();
+        let file_count = 30;
+        let files: Vec<String> = (0..file_count)
+            .map(|i| format!("src/deep/d{}.rs", i))
+            .collect();
+        for f in &files {
+            g.nodes.push(make_file_node(f));
+        }
+        // Fully connect → likely one big cluster
+        for i in 0..file_count {
+            for j in 0..file_count {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", files[i]),
+                        &format!("file:{}", files[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 1,
+            max_cluster_size: Some(10),
+            ..Default::default()
+        };
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
+        let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
+
+        let clusters_snapshot = clusters.clone();
+
+        // max_depth=0 → no splitting at all
+        let no_split =
+            split_mega_clusters_recursive(clusters_snapshot, &net, &idx_to_id, &config, 10, 0, 0);
+
+        // With depth=0, no splitting should occur — clusters should be unchanged
+        let original_sizes: Vec<usize> = clusters
+            .iter()
+            .map(|c| c.member_ids.len())
+            .collect();
+        let no_split_sizes: Vec<usize> = no_split
+            .iter()
+            .map(|c| c.member_ids.len())
+            .collect();
+
+        assert_eq!(
+            original_sizes, no_split_sizes,
+            "max_depth=0 should produce identical clusters: original={:?}, got={:?}",
+            original_sizes, no_split_sizes
+        );
     }
 }

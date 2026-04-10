@@ -147,6 +147,7 @@ pub struct ProjectContext {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ComponentLabel {
     /// Component ID this label applies to.
+    #[serde(alias = "id")]
     pub component_id: String,
     /// Human-readable component title (e.g., "Authentication & Authorization").
     pub title: String,
@@ -809,10 +810,13 @@ pub async fn name_components(
         }
 
         // Call LLM
+        eprintln!("  📡 Calling LLM for batch {}/{}...", batch_start / config.batch_size + 1, (contexts.len() + config.batch_size - 1) / config.batch_size);
         match llm.complete(&prompt).await {
             Ok(response) => {
+                eprintln!("  📝 Got response ({} chars)", response.len());
                 match parse_naming_response(&response) {
                     Ok(labels) => {
+                        eprintln!("  ✅ Parsed {} labels", labels.len());
                         // Match labels to batch components, fill in missing with fallback
                         let label_map: HashMap<&str, &ComponentLabel> = labels
                             .iter()
@@ -832,7 +836,9 @@ pub async fn name_components(
                             }
                         }
                     }
-                    Err(_e) => {
+                    Err(ref _e) => {
+                        eprintln!("  ❌ Parse failure: {}", _e);
+                        eprintln!("  📄 Response preview: {}", &response[..response.len().min(500)]);
                         // Parse failure — fall back to auto_name for entire batch
                         for ctx in &batch {
                             all_labels.push(ComponentLabel {
@@ -844,7 +850,8 @@ pub async fn name_components(
                     }
                 }
             }
-            Err(_e) => {
+            Err(ref _e) => {
+                eprintln!("  ❌ LLM call failed: {}", _e);
                 // LLM call failure — fall back to auto_name for entire batch
                 for ctx in &batch {
                     all_labels.push(ComponentLabel {
@@ -897,26 +904,58 @@ pub async fn infer_features(
 
     // Check token budget
     let estimated_tokens = llm.estimate_tokens(&prompt) * 2;
+    eprintln!("  🏷️  Feature inference: prompt ~{} tokens, budget remaining: {}", estimated_tokens / 2, config.tokens_remaining());
     if !config.record_tokens(estimated_tokens) {
+        eprintln!("  ⚠️  Token budget exceeded for feature inference");
         return Ok(Vec::new()); // Budget exceeded, graceful degradation
     }
 
     // Collect valid component IDs for validation
+    // Also build a map for fuzzy matching (LLMs sometimes return just the number)
     let valid_ids: HashSet<&str> = labels
         .iter()
         .map(|l| l.component_id.as_str())
         .collect();
+    
+    // Build fuzzy lookup: "42" → "infer:component:42", etc.
+    let mut fuzzy_map: HashMap<String, &str> = HashMap::new();
+    for id in &valid_ids {
+        fuzzy_map.insert(id.to_string(), id);
+        // Extract trailing number: "infer:component:42" → "42"
+        if let Some(num) = id.rsplit(':').next() {
+            fuzzy_map.insert(num.to_string(), id);
+        }
+        // Also try without prefix: "component:42"
+        if let Some(rest) = id.strip_prefix("infer:") {
+            fuzzy_map.insert(rest.to_string(), id);
+        }
+    }
 
     // Call LLM
+    eprintln!("  📡 Calling LLM for feature inference...");
     let response = match llm.complete(&prompt).await {
         Ok(r) => r,
-        Err(_e) => return Ok(Vec::new()), // LLM failure → no features (GUARD-3)
+        Err(ref _e) => {
+            eprintln!("  ❌ Feature LLM call failed: {}", _e);
+            return Ok(Vec::new());
+        }
     };
+    eprintln!("  📝 Feature response ({} chars)", response.len());
 
     // Parse response
     let raw_features = match parse_feature_response(&response) {
-        Ok(f) => f,
-        Err(_e) => return Ok(Vec::new()), // Parse failure → no features
+        Ok(f) => {
+            eprintln!("  ✅ Parsed {} features", f.len());
+            for rf in &f {
+                eprintln!("    {} ({} components): {:?}", rf.title, rf.components.len(), &rf.components[..rf.components.len().min(3)]);
+            }
+            f
+        },
+        Err(ref _e) => {
+            eprintln!("  ❌ Feature parse failure: {}", _e);
+            eprintln!("  📄 Response preview: {}", &response[..response.len().min(500)]);
+            return Ok(Vec::new());
+        }
     };
 
     // Validate and convert to InferredFeature
@@ -925,12 +964,34 @@ pub async fn infer_features(
         // Filter out invalid component IDs
         let valid_component_ids: Vec<String> = raw
             .components
-            .into_iter()
-            .filter(|id| valid_ids.contains(id.as_str()))
+            .iter()
+            .filter_map(|id| {
+                // Try exact match first, then fuzzy
+                if valid_ids.contains(id.as_str()) {
+                    Some(id.clone())
+                } else if let Some(&canonical) = fuzzy_map.get(id.as_str()) {
+                    Some(canonical.to_string())
+                } else {
+                    None
+                }
+            })
             .collect();
+
+        let dropped = raw.components.len() - valid_component_ids.len();
+        if dropped > 0 {
+            eprintln!("    ⚠️  Feature '{}': dropped {} invalid component refs (kept {})", raw.title, dropped, valid_component_ids.len());
+            // Show first few invalid ones
+            let invalid: Vec<_> = raw.components.iter()
+                .filter(|id| !valid_ids.contains(id.as_str()))
+                .take(3)
+                .collect();
+            eprintln!("      Invalid refs: {:?}", invalid);
+            eprintln!("      Valid ID sample: {:?}", valid_ids.iter().take(3).collect::<Vec<_>>());
+        }
 
         // Skip features with no valid components
         if valid_component_ids.is_empty() {
+            eprintln!("    ❌ Feature '{}' dropped: 0 valid component refs", raw.title);
             continue;
         }
 

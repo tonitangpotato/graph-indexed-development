@@ -562,6 +562,10 @@ enum Commands {
         /// Minimum community size (smaller clusters dissolved)
         #[arg(long)]
         min_community_size: Option<usize>,
+
+        /// Maximum files per component (oversized clusters are split)
+        #[arg(long)]
+        max_cluster_size: Option<usize>,
     },
 }
 
@@ -1011,10 +1015,10 @@ fn main() -> Result<()> {
         Commands::Watch { dir, debounce, no_lsp, no_semantify } => {
             cmd_watch(&dir, debounce, no_lsp, no_semantify, cli.graph.as_ref())
         }
-        Commands::Infer { level, phase, model, no_llm, dry_run, format, max_tokens, source, hierarchical, num_trials, min_community_size } => {
+        Commands::Infer { level, phase, model, no_llm, dry_run, format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_infer(&ctx, &level, phase.as_deref(), &model, no_llm, dry_run, &format, max_tokens, source, hierarchical, num_trials, min_community_size, cli.json))
+            rt.block_on(cmd_infer(&ctx, &level, phase.as_deref(), &model, no_llm, dry_run, &format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size, cli.json))
         }
     }
 }
@@ -4328,6 +4332,7 @@ async fn cmd_infer(
     hierarchical: bool,
     num_trials: Option<u32>,
     min_community_size: Option<usize>,
+    max_cluster_size: Option<usize>,
     json: bool,
 ) -> Result<()> {
     use gid_core::infer;
@@ -4358,6 +4363,9 @@ async fn cmd_infer(
     }
     if let Some(n) = min_community_size {
         cluster_config.min_community_size = n;
+    }
+    if let Some(n) = max_cluster_size {
+        cluster_config.max_cluster_size = Some(n);
     }
 
     // Build labeling config

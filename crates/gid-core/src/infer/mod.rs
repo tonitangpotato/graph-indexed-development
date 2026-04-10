@@ -168,7 +168,15 @@ pub async fn run(
         if config.clustering.min_community_size == ClusterConfig::default().min_community_size {
             // Build network early to compute density-aware config
             let (net, _) = clustering::build_network(effective_graph);
-            clustering::auto_config_with_network(file_count, &net)
+            let mut auto = clustering::auto_config_with_network(file_count, &net);
+            // Preserve user-specified overrides that auto_config doesn't know about
+            if config.clustering.max_cluster_size.is_some() {
+                auto.max_cluster_size = config.clustering.max_cluster_size;
+            }
+            if config.clustering.hierarchical {
+                auto.hierarchical = true;
+            }
+            auto
         } else {
             config.clustering.clone()
         }
@@ -189,7 +197,16 @@ pub async fn run(
     };
 
     // Step 3: Build InferResult from both phases
-    Ok(InferResult::from_phases(&cluster_result, &labeling_result))
+    eprintln!("  📊 Labeling result: {} labels, {} features, {} feature_edges",
+        labeling_result.component_labels.len(),
+        labeling_result.features.len(),
+        labeling_result.feature_edges.len());
+    let result = InferResult::from_phases(&cluster_result, &labeling_result);
+    eprintln!("  📊 InferResult: {} components, {} features, {} edges",
+        result.component_nodes.len(),
+        result.feature_nodes.len(),
+        result.edges.len());
+    Ok(result)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
