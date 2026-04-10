@@ -203,6 +203,11 @@ mod tests {
                 docstring: None,
                 line_count: 10,
                 is_test: false,
+                visibility: None,
+                lang: None,
+                body_hash: None,
+                end_line: None,
+                complexity: None,
             });
         }
         
@@ -229,6 +234,11 @@ mod tests {
             docstring: None,
             line_count: 20,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         });
         
         // Add many callers
@@ -245,6 +255,11 @@ mod tests {
                 docstring: None,
                 line_count: 5,
                 is_test: false,
+                visibility: None,
+                lang: None,
+                body_hash: None,
+                end_line: None,
+                complexity: None,
             });
             graph.edges.push(CodeEdge::new(&caller_id, "func:core.py:hot_func", EdgeRelation::Calls));
         }

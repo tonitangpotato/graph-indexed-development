@@ -24,6 +24,11 @@ pub const WEIGHT_TYPE_REF: f64 = 0.5;
 pub const WEIGHT_STRUCTURAL: f64 = 0.2;
 /// Weight for generic "depends_on" edges.
 pub const WEIGHT_DEPENDS_ON: f64 = 0.4;
+/// Weight for synthetic directory co-location edges between files in the same directory.
+pub const WEIGHT_DIR_COLOCATION: f64 = 0.3;
+/// Maximum directory size for pairwise co-location edges. Directories with more
+/// files than this skip co-location to avoid O(n²) edge explosion.
+pub const MAX_DIR_SIZE_FOR_COLOCATION: usize = 50;
 
 /// Map an edge relation string to its clustering weight.
 ///
@@ -44,14 +49,20 @@ pub fn relation_weight(relation: &str) -> f64 {
 /// Configuration for the clustering algorithm.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
-    /// Teleportation rate for the random walker (default: 0.15).
+    /// Teleportation rate for the random walker (default: 0.05).
+    /// Lower values keep the walker inside communities longer, improving
+    /// detection on structured code graphs. Web-scale graphs use 0.15;
+    /// code dependency graphs work better at 0.01–0.05.
     pub teleportation_rate: f64,
-    /// Number of Infomap optimization trials (default: 5).
+    /// Number of Infomap optimization trials (default: 10).
     pub num_trials: u32,
     /// Minimum community size; smaller clusters are dissolved (default: 2).
     pub min_community_size: usize,
     /// Whether to run hierarchical decomposition (default: false).
     pub hierarchical: bool,
+    /// Weight for synthetic directory co-location edges (default: 0.3).
+    /// Set to 0.0 to disable directory co-location.
+    pub dir_colocation_weight: f64,
     /// Random seed for reproducibility (default: 42).
     pub seed: u64,
 }
@@ -59,9 +70,10 @@ pub struct ClusterConfig {
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
-            teleportation_rate: 0.15,
-            num_trials: 5,
+            teleportation_rate: 0.05,
+            num_trials: 10,
             min_community_size: 2,
+            dir_colocation_weight: WEIGHT_DIR_COLOCATION,
             hierarchical: false,
             seed: 42,
         }
@@ -86,7 +98,7 @@ pub struct RawCluster {
 }
 
 /// Summary metrics from a clustering run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClusterMetrics {
     /// Map equation codelength (lower is better).
     pub codelength: f64,
@@ -94,6 +106,14 @@ pub struct ClusterMetrics {
     pub num_communities: usize,
     /// Total number of nodes in the network.
     pub num_total: usize,
+    /// Diagnostic: number of Infomap modules with size < min_community_size (before reassignment).
+    pub orphan_count_raw: usize,
+    /// Diagnostic: orphans successfully merged via edge affinity.
+    pub orphans_merged_by_affinity: usize,
+    /// Diagnostic: orphans assigned via directory fallback.
+    pub orphans_assigned_by_dir: usize,
+    /// Diagnostic: final number of size=1 clusters after all reassignment.
+    pub singleton_clusters_final: usize,
 }
 
 /// The output of clustering: new component nodes, membership edges, and metrics.
@@ -117,6 +137,7 @@ impl ClusterResult {
                 codelength: 0.0,
                 num_communities: 0,
                 num_total: 0,
+                ..Default::default()
             },
         }
     }
@@ -220,6 +241,47 @@ pub fn build_network(graph: &Graph) -> (Network, Vec<String>) {
     (net, idx_to_id)
 }
 
+/// Add synthetic directory co-location edges to the network.
+///
+/// Files sharing the same parent directory get bidirectional edges with the
+/// given weight. Directories with more than `MAX_DIR_SIZE_FOR_COLOCATION`
+/// files are skipped to avoid O(n²) edge explosion.
+pub fn add_dir_colocation_edges(net: &mut Network, idx_to_id: &[String], weight: f64) {
+    if weight <= 0.0 {
+        return;
+    }
+
+    // Group file indices by parent directory.
+    let mut dir_groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, node_id) in idx_to_id.iter().enumerate() {
+        let path = node_id.strip_prefix("file:").unwrap_or(node_id);
+        let dir = match path.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+            _ => "root".to_string(),
+        };
+        dir_groups.entry(dir).or_default().push(idx);
+    }
+
+    // Add pairwise bidirectional edges within each directory group.
+    for (dir, files) in &dir_groups {
+        if files.len() > MAX_DIR_SIZE_FOR_COLOCATION {
+            eprintln!(
+                "⚠ Directory '{}' has {} files — skipping co-location edges (limit: {})",
+                dir,
+                files.len(),
+                MAX_DIR_SIZE_FOR_COLOCATION
+            );
+            continue;
+        }
+        for i in 0..files.len() {
+            for j in (i + 1)..files.len() {
+                net.add_edge(files[i], files[j], weight);
+                net.add_edge(files[j], files[i], weight);
+            }
+        }
+    }
+}
+
 // ── Clustering execution ───────────────────────────────────────────────────
 
 /// Run Infomap on the network and return raw clusters plus metrics.
@@ -237,19 +299,72 @@ pub fn run_clustering(
         .tau(config.teleportation_rate)
         .run();
 
-    let metrics = ClusterMetrics {
-        codelength: result.codelength(),
-        num_communities: result.num_modules(),
-        num_total: net.num_nodes(),
-    };
-
-    let clusters = if config.hierarchical {
-        build_hierarchical_clusters(&result, idx_to_id)
+    let (clusters, diag) = if config.hierarchical {
+        let c = build_hierarchical_clusters(&result, idx_to_id);
+        let singleton_count = c.iter().filter(|cl| cl.member_ids.len() == 1).count();
+        (c, OrphanDiagnostics {
+            orphan_count_raw: 0,
+            merged_by_affinity: 0,
+            assigned_by_dir: 0,
+            singleton_clusters_final: singleton_count,
+        })
     } else {
         build_flat_clusters(&result, idx_to_id, net, config.min_community_size)
     };
 
+    let metrics = ClusterMetrics {
+        codelength: result.codelength(),
+        num_communities: result.num_modules(),
+        num_total: net.num_nodes(),
+        orphan_count_raw: diag.orphan_count_raw,
+        orphans_merged_by_affinity: diag.merged_by_affinity,
+        orphans_assigned_by_dir: diag.assigned_by_dir,
+        singleton_clusters_final: diag.singleton_clusters_final,
+    };
+
     (clusters, metrics)
+}
+
+/// Diagnostic counters for orphan reassignment.
+#[derive(Debug, Clone, Default)]
+struct OrphanDiagnostics {
+    /// Infomap modules with size < min_community_size.
+    orphan_count_raw: usize,
+    /// Orphans merged into existing clusters via edge affinity.
+    merged_by_affinity: usize,
+    /// Orphans assigned to directory-based clusters as fallback.
+    assigned_by_dir: usize,
+    /// Final number of size=1 clusters.
+    singleton_clusters_final: usize,
+}
+
+/// Extract the parent directory from a node ID like `"file:src/auth/login.rs"`.
+///
+/// Strips the `"file:"` prefix, then returns the parent directory path.
+/// If no parent directory exists, returns `"root"`.
+fn extract_parent_dir(node_id: &str) -> String {
+    let path = node_id.strip_prefix("file:").unwrap_or(node_id);
+    match path.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+        _ => "root".to_string(),
+    }
+}
+
+/// Compute the length of the longest common directory prefix between two paths.
+/// This is segment-aware: "src/auth" and "src/api" share "src" (len 3), not "src/a" (len 5).
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    let a_segments: Vec<&str> = a.split('/').collect();
+    let b_segments: Vec<&str> = b.split('/').collect();
+    let mut common = 0;
+    for (sa, sb) in a_segments.iter().zip(b_segments.iter()) {
+        if sa == sb {
+            // +1 for the separator (except we count chars)
+            common += sa.len() + 1;
+        } else {
+            break;
+        }
+    }
+    common
 }
 
 /// Build flat clusters from Infomap module results with min-size enforcement.
@@ -258,7 +373,8 @@ fn build_flat_clusters(
     idx_to_id: &[String],
     net: &Network,
     min_community_size: usize,
-) -> Vec<RawCluster> {
+) -> (Vec<RawCluster>, OrphanDiagnostics) {
+    let mut diag = OrphanDiagnostics::default();
     let modules = result.modules();
 
     let mut clusters: Vec<RawCluster> = Vec::new();
@@ -287,22 +403,17 @@ fn build_flat_clusters(
         }
     }
 
-    // Reassign orphan nodes to the cluster of their strongest-connected neighbor.
+    diag.orphan_count_raw = orphan_nodes.len();
+
+    // Reassign orphan nodes using aggregate cluster affinity with iterative propagation.
     if !orphan_nodes.is_empty() && !clusters.is_empty() {
-        // Build a set of node_id → cluster_index for already-assigned nodes.
-        let mut id_to_cluster: HashMap<String, usize> = HashMap::new();
-        // Also need node_id → network idx for weight lookup.
+        // Build node_id → network idx lookup.
         let mut id_to_net_idx: HashMap<&str, usize> = HashMap::new();
         for (idx, nid) in idx_to_id.iter().enumerate() {
             id_to_net_idx.insert(nid.as_str(), idx);
         }
-        for (ci, cluster) in clusters.iter().enumerate() {
-            for mid in &cluster.member_ids {
-                id_to_cluster.insert(mid.clone(), ci);
-            }
-        }
 
-        // Build cluster membership from assigned nodes by network idx.
+        // Build cluster membership map: network idx → cluster index.
         let mut net_idx_to_cluster: HashMap<usize, usize> = HashMap::new();
         for (ci, cluster) in clusters.iter().enumerate() {
             for mid in &cluster.member_ids {
@@ -312,61 +423,143 @@ fn build_flat_clusters(
             }
         }
 
-        let mut misc_ids: Vec<String> = Vec::new();
+        // Multi-pass iterative reassignment (fixes Bug C).
+        // Orphans can merge through other orphans that were assigned in earlier passes.
+        let mut unassigned: Vec<(usize, String)> = orphan_nodes;
+        let max_iterations = 100;
 
-        for (node_idx, node_id) in &orphan_nodes {
-            // Find the strongest-connected neighbor that belongs to an existing cluster.
-            let mut best_cluster: Option<usize> = None;
-            let mut best_weight: f64 = 0.0;
+        for _iter in 0..max_iterations {
+            let mut merged_any = false;
+            let mut still_unassigned: Vec<(usize, String)> = Vec::new();
 
-            // Check outgoing neighbors.
-            for &(neighbor_idx, w) in net.out_neighbors(*node_idx) {
-                if let Some(&ci) = net_idx_to_cluster.get(&neighbor_idx) {
-                    if w > best_weight {
-                        best_weight = w;
-                        best_cluster = Some(ci);
+            for (node_idx, node_id) in unassigned {
+                // Compute aggregate cluster affinity (fixes Bug D):
+                // sum all edge weights to each candidate cluster.
+                let mut cluster_weights: HashMap<usize, f64> = HashMap::new();
+
+                // Check BOTH out_neighbors AND in_neighbors (fixes Bug A).
+                for &(neighbor_idx, w) in net.out_neighbors(node_idx) {
+                    if let Some(&ci) = net_idx_to_cluster.get(&neighbor_idx) {
+                        *cluster_weights.entry(ci).or_insert(0.0) += w;
                     }
+                }
+                for &(neighbor_idx, w) in net.in_neighbors(node_idx) {
+                    if let Some(&ci) = net_idx_to_cluster.get(&neighbor_idx) {
+                        *cluster_weights.entry(ci).or_insert(0.0) += w;
+                    }
+                }
+
+                // Pick cluster with highest aggregate weight.
+                if let Some((&best_ci, _)) = cluster_weights
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                {
+                    clusters[best_ci].member_ids.push(node_id);
+                    net_idx_to_cluster.insert(node_idx, best_ci);
+                    merged_any = true;
+                    diag.merged_by_affinity += 1;
+                } else {
+                    still_unassigned.push((node_idx, node_id));
                 }
             }
 
-            // Also check incoming neighbors (since edges are directed).
-            // Use a trick: iterate all clusters' member indices and check if they connect to node_idx.
-            // More efficient: iterate all nodes, check if they have an outgoing edge to node_idx.
-            // For correctness, we check net.out_neighbors for each assigned node pointing to node_idx.
-            // But that's O(N*E). Instead, check if node_idx has incoming from assigned nodes.
-            // Network has in_neighbors if available; let's use out_neighbors of all nodes pointing here.
-            // Actually, we can iterate all nodes' outgoing edges to find incoming to node_idx,
-            // but that's expensive. We'll approximate with outgoing edges only for now.
-            // The Network API doesn't expose in_neighbors publicly... wait, it does.
-            // But the task spec only shows out_neighbors. Let's just use outgoing for simplicity
-            // since the graph is directed and out_neighbors is the primary signal.
+            unassigned = still_unassigned;
 
-            if let Some(ci) = best_cluster {
-                clusters[ci].member_ids.push(node_id.clone());
-                net_idx_to_cluster.insert(*node_idx, ci);
-            } else {
-                misc_ids.push(node_id.clone());
+            // If no merges happened this round, stop iterating.
+            if !merged_any {
+                break;
+            }
+            // If all orphans have been assigned, stop.
+            if unassigned.is_empty() {
+                break;
             }
         }
 
-        // Create a "misc" cluster for truly unconnected orphans.
-        if !misc_ids.is_empty() {
-            for misc_id in misc_ids {
-                clusters.push(RawCluster {
-                    id: clusters.len(),
-                    member_ids: vec![misc_id],
-                    flow: 0.0,
-                    parent: None,
-                    children: Vec::new(),
-                });
+        // Directory-based fallback for remaining unmerged orphans (fixes Bug B).
+        if !unassigned.is_empty() {
+            let mut dir_groups: HashMap<String, Vec<String>> = HashMap::new();
+            for (_, node_id) in unassigned {
+                diag.assigned_by_dir += 1;
+                let dir = extract_parent_dir(&node_id);
+                dir_groups.entry(dir).or_default().push(node_id);
+            }
+
+            // Phase 1: Merge dir groups with ≥2 members directly into new clusters.
+            // Phase 2: For singleton dir groups, try to merge with an existing cluster
+            //          whose members share the closest ancestor directory.
+            let mut singleton_orphans: Vec<String> = Vec::new();
+            for (_, group) in dir_groups {
+                if group.len() >= min_community_size {
+                    clusters.push(RawCluster {
+                        id: clusters.len(),
+                        member_ids: group,
+                        flow: 0.0,
+                        parent: None,
+                        children: Vec::new(),
+                    });
+                } else {
+                    singleton_orphans.extend(group);
+                }
+            }
+
+            // Phase 2: For each singleton orphan, find the existing cluster whose
+            // members share the longest common directory prefix.
+            if !singleton_orphans.is_empty() && !clusters.is_empty() {
+                for orphan_id in &singleton_orphans {
+                    let orphan_dir = extract_parent_dir(orphan_id);
+                    let mut best_cluster: Option<usize> = None;
+                    let mut best_prefix_len: usize = 0;
+
+                    for (ci, cluster) in clusters.iter().enumerate() {
+                        for member in &cluster.member_ids {
+                            let member_dir = extract_parent_dir(member);
+                            let prefix_len = common_prefix_len(&orphan_dir, &member_dir);
+                            if prefix_len > best_prefix_len {
+                                best_prefix_len = prefix_len;
+                                best_cluster = Some(ci);
+                            }
+                        }
+                    }
+
+                    if let Some(ci) = best_cluster {
+                        clusters[ci].member_ids.push(orphan_id.clone());
+                    } else {
+                        // Truly unreachable: no cluster shares any common prefix.
+                        // Create a singleton as last resort.
+                        clusters.push(RawCluster {
+                            id: clusters.len(),
+                            member_ids: vec![orphan_id.clone()],
+                            flow: 0.0,
+                            parent: None,
+                            children: Vec::new(),
+                        });
+                    }
+                }
+            } else if !singleton_orphans.is_empty() {
+                // No existing clusters at all — each orphan gets its own cluster.
+                for orphan_id in singleton_orphans {
+                    clusters.push(RawCluster {
+                        id: clusters.len(),
+                        member_ids: vec![orphan_id],
+                        flow: 0.0,
+                        parent: None,
+                        children: Vec::new(),
+                    });
+                }
             }
         }
     } else if !orphan_nodes.is_empty() {
-        // No clusters to merge into — make each orphan its own singleton.
+        // No clusters to merge into — group orphans by directory (fixes Bug B).
+        let mut dir_groups: HashMap<String, Vec<String>> = HashMap::new();
         for (_, node_id) in orphan_nodes {
+            diag.assigned_by_dir += 1;
+            let dir = extract_parent_dir(&node_id);
+            dir_groups.entry(dir).or_default().push(node_id);
+        }
+        for (_, group) in dir_groups {
             clusters.push(RawCluster {
                 id: clusters.len(),
-                member_ids: vec![node_id],
+                member_ids: group,
                 flow: 0.0,
                 parent: None,
                 children: Vec::new(),
@@ -379,7 +572,9 @@ fn build_flat_clusters(
         c.id = i;
     }
 
-    clusters
+    diag.singleton_clusters_final = clusters.iter().filter(|c| c.member_ids.len() == 1).count();
+
+    (clusters, diag)
 }
 
 /// Recursively build hierarchical clusters from the Infomap tree.
@@ -563,6 +758,7 @@ pub fn map_to_components(clusters: &[RawCluster], graph: &Graph) -> ClusterResul
         codelength: 0.0,
         num_communities: clusters.len(),
         num_total: 0,
+        ..Default::default()
     };
 
     ClusterResult {
@@ -686,8 +882,12 @@ pub fn auto_name(file_paths: &[&str]) -> String {
 
 // ── Auto-configuration ─────────────────────────────────────────────────────
 
-/// Auto-select clustering parameters based on graph size.
-/// Returns a ClusterConfig tuned for the file count.
+/// Auto-select clustering parameters based on graph size and density.
+///
+/// Adapts teleportation rate based on average node degree:
+/// - Sparse graphs (avg degree < 3): τ=0.01 — keep walker in community
+/// - Normal code graphs (avg degree 3–20): τ=0.05
+/// - Dense graphs (avg degree > 20): τ=0.10 — allow more exploration
 pub fn auto_config(file_count: usize) -> ClusterConfig {
     let (min_community_size, hierarchical) = match file_count {
         0..=49 => (2, false),
@@ -700,6 +900,30 @@ pub fn auto_config(file_count: usize) -> ClusterConfig {
         hierarchical,
         ..ClusterConfig::default()
     }
+}
+
+/// Auto-select clustering parameters with network density awareness.
+///
+/// Unlike [`auto_config`] which only considers file count, this version
+/// also adapts the teleportation rate based on the actual network's
+/// average degree.
+pub fn auto_config_with_network(file_count: usize, net: &Network) -> ClusterConfig {
+    let mut config = auto_config(file_count);
+
+    // Adapt teleportation rate based on average degree.
+    let num_nodes = net.num_nodes();
+    if num_nodes > 0 {
+        let avg_degree = net.num_edges() as f64 / num_nodes as f64;
+        config.teleportation_rate = if avg_degree < 3.0 {
+            0.01
+        } else if avg_degree <= 20.0 {
+            0.05
+        } else {
+            0.10
+        };
+    }
+
+    config
 }
 
 // ── Post-processing ────────────────────────────────────────────────────────
@@ -781,7 +1005,10 @@ fn deduplicate_names(nodes: &mut [Node]) {
 /// This is the main entry point. It builds a file-level network, runs Infomap,
 /// and maps results back to component nodes and membership edges.
 pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
-    let (net, idx_to_id) = build_network(graph);
+    let (mut net, idx_to_id) = build_network(graph);
+
+    // Add directory co-location edges if configured.
+    add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
 
     if net.num_nodes() < 2 {
         return Ok(ClusterResult::empty());
@@ -1328,5 +1555,668 @@ mod tests {
         edges1.sort();
         edges2.sort();
         assert_eq!(edges1, edges2, "Deterministic: same seed should produce identical clustering");
+    }
+
+    // ── 17. test_orphan_reassignment_uses_in_neighbors ─────────────────
+
+    /// An orphan file that only has *incoming* edges (other files import it, but
+    /// it imports nothing) should still be merged into the correct cluster.
+    #[test]
+    fn test_orphan_reassignment_uses_in_neighbors() {
+        let mut g = Graph::default();
+
+        // Cluster A: 3 tightly connected files
+        let cluster_a = ["src/core/a.rs", "src/core/b.rs", "src/core/c.rs"];
+        for p in &cluster_a {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..cluster_a.len() {
+            for j in 0..cluster_a.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", cluster_a[i]),
+                        &format!("file:{}", cluster_a[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // Orphan: a utility file that imports nothing but IS imported by cluster A
+        g.nodes.push(make_file_node("src/utils/types.rs"));
+        // Edges go FROM cluster A files TO the orphan (orphan has only incoming)
+        g.edges.push(Edge::new("file:src/core/a.rs", "file:src/utils/types.rs", "imports"));
+        g.edges.push(Edge::new("file:src/core/b.rs", "file:src/utils/types.rs", "imports"));
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            ..Default::default()
+        };
+        let result = cluster(&g, &config).unwrap();
+
+        // The orphan should be merged into cluster A, not be a singleton
+        let total_members: usize = result
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains")
+            .filter(|e| !e.from.starts_with("file:") && !e.to.starts_with("infer:"))
+            .count();
+        assert_eq!(total_members, 4, "All 4 nodes should be assigned");
+
+        // Verify no singleton clusters (all components should have ≥2 members)
+        for node in &result.nodes {
+            let size = node.metadata.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            assert!(
+                size >= 2,
+                "Component '{}' has size {} — orphan with incoming edges should have merged",
+                node.title, size
+            );
+        }
+    }
+
+    // ── 18. test_orphan_reassignment_aggregate_weight ──────────────────
+
+    /// When an orphan has 3 weak edges to cluster A and 1 strong edge to cluster B,
+    /// it should go to A (aggregate 0.9 > 0.8).
+    #[test]
+    fn test_orphan_reassignment_aggregate_weight() {
+        let mut g = Graph::default();
+
+        // Cluster A: 3 files
+        let cluster_a = ["src/web/handler.rs", "src/web/router.rs", "src/web/middleware.rs"];
+        for p in &cluster_a {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..cluster_a.len() {
+            for j in 0..cluster_a.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", cluster_a[i]),
+                        &format!("file:{}", cluster_a[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // Cluster B: 3 files
+        let cluster_b = ["src/db/pool.rs", "src/db/query.rs", "src/db/migrate.rs"];
+        for p in &cluster_b {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..cluster_b.len() {
+            for j in 0..cluster_b.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", cluster_b[i]),
+                        &format!("file:{}", cluster_b[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // Orphan with 3 weak edges to A (depends_on=0.4 each, total 1.2)
+        // and 1 strong edge to B (calls=1.0)
+        g.nodes.push(make_file_node("src/shared/config.rs"));
+        g.edges.push(Edge::new("file:src/shared/config.rs", "file:src/web/handler.rs", "depends_on"));
+        g.edges.push(Edge::new("file:src/shared/config.rs", "file:src/web/router.rs", "depends_on"));
+        g.edges.push(Edge::new("file:src/shared/config.rs", "file:src/web/middleware.rs", "depends_on"));
+        g.edges.push(Edge::new("file:src/shared/config.rs", "file:src/db/pool.rs", "calls"));
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            ..Default::default()
+        };
+        let result = cluster(&g, &config).unwrap();
+
+        // Find which cluster the orphan ended up in
+        let orphan_id = "file:src/shared/config.rs";
+        let orphan_cluster = result
+            .edges
+            .iter()
+            .find(|e| e.relation == "contains" && e.to == orphan_id)
+            .map(|e| e.from.clone());
+
+        assert!(orphan_cluster.is_some(), "Orphan should be assigned to a cluster");
+
+        // Find which cluster has the web files (cluster A)
+        let web_cluster = result
+            .edges
+            .iter()
+            .find(|e| e.relation == "contains" && e.to == "file:src/web/handler.rs")
+            .map(|e| e.from.clone());
+
+        assert_eq!(
+            orphan_cluster, web_cluster,
+            "Orphan should be in cluster A (aggregate depends_on 1.2 > calls 1.0)"
+        );
+    }
+
+    // ── 19. test_orphan_directory_fallback ─────────────────────────────
+
+    /// Isolated files in the same directory should be grouped together,
+    /// not become individual singletons.
+    #[test]
+    fn test_orphan_directory_fallback() {
+        let mut g = Graph::default();
+
+        // A proper cluster
+        let cluster_a = ["src/core/a.rs", "src/core/b.rs", "src/core/c.rs"];
+        for p in &cluster_a {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..cluster_a.len() {
+            for j in 0..cluster_a.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", cluster_a[i]),
+                        &format!("file:{}", cluster_a[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // 3 isolated files in the same directory — no edges at all
+        g.nodes.push(make_file_node("src/config/base.rs"));
+        g.nodes.push(make_file_node("src/config/env.rs"));
+        g.nodes.push(make_file_node("src/config/defaults.rs"));
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            ..Default::default()
+        };
+        let result = cluster(&g, &config).unwrap();
+
+        // Count how many components the config files ended up in
+        let config_files = ["file:src/config/base.rs", "file:src/config/env.rs", "file:src/config/defaults.rs"];
+        let config_clusters: std::collections::HashSet<&str> = result
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains" && config_files.contains(&e.to.as_str()))
+            .map(|e| e.from.as_str())
+            .collect();
+
+        assert_eq!(
+            config_clusters.len(), 1,
+            "All 3 config files should be in ONE directory-based cluster, not {} clusters",
+            config_clusters.len()
+        );
+
+        // Verify there are no singleton clusters
+        for node in &result.nodes {
+            let size = node.metadata.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            assert!(
+                size >= 2,
+                "Component '{}' has size {} — should not have singletons",
+                node.title, size
+            );
+        }
+    }
+
+    // ── 20. test_orphan_iterative_propagation ──────────────────────────
+
+    /// Chain: cluster ← orphan_A ← orphan_B.
+    /// orphan_A can merge directly, then orphan_B merges through orphan_A.
+    #[test]
+    fn test_orphan_iterative_propagation() {
+        let mut g = Graph::default();
+
+        // A proper cluster of 3
+        let cluster_a = ["src/lib/x.rs", "src/lib/y.rs", "src/lib/z.rs"];
+        for p in &cluster_a {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..cluster_a.len() {
+            for j in 0..cluster_a.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", cluster_a[i]),
+                        &format!("file:{}", cluster_a[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // orphan_A connects to cluster_a
+        g.nodes.push(make_file_node("src/ext/bridge.rs"));
+        g.edges.push(Edge::new("file:src/ext/bridge.rs", "file:src/lib/x.rs", "imports"));
+
+        // orphan_B connects ONLY to orphan_A (no direct path to cluster)
+        g.nodes.push(make_file_node("src/ext/adapter.rs"));
+        g.edges.push(Edge::new("file:src/ext/adapter.rs", "file:src/ext/bridge.rs", "calls"));
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            ..Default::default()
+        };
+        let result = cluster(&g, &config).unwrap();
+
+        // All 5 files should be assigned to clusters (no singletons)
+        let total_members: usize = result
+            .edges
+            .iter()
+            .filter(|e| e.relation == "contains")
+            .filter(|e| !e.from.starts_with("file:") && !e.to.starts_with("infer:"))
+            .count();
+        assert_eq!(total_members, 5, "All 5 nodes should be assigned to clusters");
+
+        // orphan_B should either be in the same cluster as orphan_A (iterative merge)
+        // or in a directory-based group with orphan_A. Either way, not a singleton.
+        let bridge_cluster = result
+            .edges
+            .iter()
+            .find(|e| e.relation == "contains" && e.to == "file:src/ext/bridge.rs")
+            .map(|e| e.from.clone());
+        let adapter_cluster = result
+            .edges
+            .iter()
+            .find(|e| e.relation == "contains" && e.to == "file:src/ext/adapter.rs")
+            .map(|e| e.from.clone());
+
+        assert!(bridge_cluster.is_some(), "bridge.rs should be assigned");
+        assert!(adapter_cluster.is_some(), "adapter.rs should be assigned");
+    }
+
+    // ── 21. test_extract_parent_dir ───────────────────────────────────
+
+    #[test]
+    fn test_extract_parent_dir() {
+        assert_eq!(extract_parent_dir("file:src/auth/login.rs"), "src/auth");
+        assert_eq!(extract_parent_dir("file:src/main.rs"), "src");
+        assert_eq!(extract_parent_dir("file:lib.rs"), "root");
+        assert_eq!(extract_parent_dir("src/utils/helper.rs"), "src/utils");
+    }
+
+    // ── 22. test_default_teleportation_rate ────────────────────────────
+
+    #[test]
+    fn test_default_teleportation_rate() {
+        let config = ClusterConfig::default();
+        assert!(
+            (config.teleportation_rate - 0.05).abs() < f64::EPSILON,
+            "Default teleportation rate should be 0.05, got {}",
+            config.teleportation_rate
+        );
+        assert_eq!(config.num_trials, 10, "Default num_trials should be 10");
+    }
+
+    // ── 23. test_auto_config_with_network_sparse ──────────────────────
+
+    #[test]
+    fn test_auto_config_with_network_sparse() {
+        // Sparse graph: 10 nodes, 5 edges → avg degree 0.5
+        let mut net = Network::new();
+        for i in 0..10 {
+            net.add_node_name(i, &format!("node_{}", i));
+        }
+        // Only 5 edges across 10 nodes
+        net.add_edge(0, 1, 1.0);
+        net.add_edge(2, 3, 1.0);
+        net.add_edge(4, 5, 1.0);
+        net.add_edge(6, 7, 1.0);
+        net.add_edge(8, 9, 1.0);
+
+        let config = auto_config_with_network(10, &net);
+        assert!(
+            (config.teleportation_rate - 0.01).abs() < f64::EPSILON,
+            "Sparse graph (avg degree < 3) should get τ=0.01, got {}",
+            config.teleportation_rate
+        );
+    }
+
+    // ── 24. test_auto_config_with_network_dense ───────────────────────
+
+    #[test]
+    fn test_auto_config_with_network_dense() {
+        // Dense graph: 5 nodes, fully connected = 20 edges → avg degree 4.0
+        let mut net = Network::new();
+        for i in 0..5 {
+            net.add_node_name(i, &format!("node_{}", i));
+        }
+        for i in 0..5 {
+            for j in 0..5 {
+                if i != j {
+                    net.add_edge(i, j, 1.0);
+                }
+            }
+        }
+
+        let config = auto_config_with_network(5, &net);
+        assert!(
+            (config.teleportation_rate - 0.05).abs() < f64::EPSILON,
+            "Normal density graph (avg degree 3-20) should get τ=0.05, got {}",
+            config.teleportation_rate
+        );
+    }
+
+    // ── 25. test_auto_config_with_network_very_dense ──────────────────
+
+    #[test]
+    fn test_auto_config_with_network_very_dense() {
+        // Very dense: 3 nodes, many edges → avg degree > 20
+        let mut net = Network::new();
+        for i in 0..3 {
+            net.add_node_name(i, &format!("node_{}", i));
+        }
+        // Add lots of edges (multi-edges to inflate degree)
+        for _ in 0..30 {
+            net.add_edge(0, 1, 1.0);
+            net.add_edge(1, 2, 1.0);
+            net.add_edge(2, 0, 1.0);
+        }
+
+        let config = auto_config_with_network(3, &net);
+        assert!(
+            (config.teleportation_rate - 0.10).abs() < f64::EPSILON,
+            "Very dense graph (avg degree > 20) should get τ=0.10, got {}",
+            config.teleportation_rate
+        );
+    }
+
+    // ── 26. test_dir_colocation_edges_basic ────────────────────────────
+
+    #[test]
+    fn test_dir_colocation_edges_basic() {
+        let mut g = Graph::default();
+        // 3 files in same directory, no explicit edges
+        g.nodes.push(make_file_node("src/models/user.rs"));
+        g.nodes.push(make_file_node("src/models/post.rs"));
+        g.nodes.push(make_file_node("src/models/comment.rs"));
+        // 1 file in different directory
+        g.nodes.push(make_file_node("src/utils/helper.rs"));
+
+        let (mut net, idx_to_id) = build_network(&g);
+
+        // Before co-location: no edges at all
+        assert_eq!(net.num_edges(), 0, "Should have no edges before co-location");
+
+        add_dir_colocation_edges(&mut net, &idx_to_id, 0.3);
+
+        // After: 3 files in src/models → 3 pairs × 2 directions = 6 edges
+        // helper.rs is alone in src/utils → 0 new edges
+        assert_eq!(
+            net.num_edges(), 6,
+            "3 files in same dir should produce 6 directed co-location edges"
+        );
+    }
+
+    // ── 27. test_dir_colocation_improves_clustering ────────────────────
+
+    #[test]
+    fn test_dir_colocation_improves_clustering() {
+        let mut g = Graph::default();
+
+        // Cluster A: tightly connected
+        let cluster_a = ["src/core/a.rs", "src/core/b.rs", "src/core/c.rs"];
+        for p in &cluster_a {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..cluster_a.len() {
+            for j in 0..cluster_a.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", cluster_a[i]),
+                        &format!("file:{}", cluster_a[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // 3 isolated files in same directory — no explicit edges
+        // With co-location, they should cluster together instead of being singletons
+        g.nodes.push(make_file_node("src/config/base.rs"));
+        g.nodes.push(make_file_node("src/config/env.rs"));
+        g.nodes.push(make_file_node("src/config/defaults.rs"));
+
+        // With co-location enabled (default)
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            ..Default::default()
+        };
+        let result = cluster(&g, &config).unwrap();
+
+        // No singletons allowed
+        for node in &result.nodes {
+            let size = node.metadata.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            assert!(
+                size >= 2,
+                "Component '{}' has size {} — co-location should prevent singletons",
+                node.title, size
+            );
+        }
+    }
+
+    // ── 28. test_dir_colocation_disabled ───────────────────────────────
+
+    #[test]
+    fn test_dir_colocation_disabled() {
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("src/models/a.rs"));
+        g.nodes.push(make_file_node("src/models/b.rs"));
+
+        let (mut net, idx_to_id) = build_network(&g);
+        assert_eq!(net.num_edges(), 0);
+
+        // Weight = 0.0 should disable co-location
+        add_dir_colocation_edges(&mut net, &idx_to_id, 0.0);
+        assert_eq!(net.num_edges(), 0, "Weight 0.0 should add no edges");
+    }
+
+    // ── 29. test_sink_file_diagnostics — Verifies orphan metrics for sink patterns ──
+
+    #[test]
+    fn test_sink_file_diagnostics() {
+        // Simulate the "sink file" pattern:
+        // errors.ts is imported by files in 3 different semantic clusters
+        // but errors.ts itself doesn't import anything.
+        // Question: does orphan reassignment correctly merge it, or does it stay singleton?
+
+        let mut g = Graph::default();
+
+        // 3 distinct clusters of files (tight internal coupling)
+        // Cluster A: auth module
+        for name in &["auth/login.ts", "auth/register.ts", "auth/session.ts"] {
+            g.nodes.push(make_file_node(&format!("src/{}", name)));
+        }
+        // Cluster B: commands module
+        for name in &[
+            "commands/run.ts",
+            "commands/build.ts",
+            "commands/test.ts",
+            "commands/deploy.ts",
+        ] {
+            g.nodes.push(make_file_node(&format!("src/{}", name)));
+        }
+        // Cluster C: ui module
+        for name in &["ui/render.ts", "ui/layout.ts", "ui/theme.ts"] {
+            g.nodes.push(make_file_node(&format!("src/{}", name)));
+        }
+
+        // The sink file — imported by everyone, imports nothing
+        g.nodes.push(make_file_node("src/utils/errors.ts"));
+
+        // Internal cluster edges (strong coupling within clusters)
+        let cluster_a = vec!["src/auth/login.ts", "src/auth/register.ts", "src/auth/session.ts"];
+        for i in 0..cluster_a.len() {
+            for j in (i + 1)..cluster_a.len() {
+                g.edges.push(Edge::new(
+                    &format!("file:{}", cluster_a[i]),
+                    &format!("file:{}", cluster_a[j]),
+                    "imports",
+                ));
+            }
+        }
+        let cluster_b = vec![
+            "src/commands/run.ts",
+            "src/commands/build.ts",
+            "src/commands/test.ts",
+            "src/commands/deploy.ts",
+        ];
+        for i in 0..cluster_b.len() {
+            for j in (i + 1)..cluster_b.len() {
+                g.edges.push(Edge::new(
+                    &format!("file:{}", cluster_b[i]),
+                    &format!("file:{}", cluster_b[j]),
+                    "imports",
+                ));
+            }
+        }
+        let cluster_c = vec!["src/ui/render.ts", "src/ui/layout.ts", "src/ui/theme.ts"];
+        for i in 0..cluster_c.len() {
+            for j in (i + 1)..cluster_c.len() {
+                g.edges.push(Edge::new(
+                    &format!("file:{}", cluster_c[i]),
+                    &format!("file:{}", cluster_c[j]),
+                    "imports",
+                ));
+            }
+        }
+
+        // Sink edges: multiple files import errors.ts
+        // More importers from cluster B (4 files) than A (2) or C (1)
+        for src in &["src/auth/login.ts", "src/auth/register.ts"] {
+            g.edges.push(Edge::new(
+                &format!("file:{}", src),
+                "file:src/utils/errors.ts",
+                "imports",
+            ));
+        }
+        for src in &[
+            "src/commands/run.ts",
+            "src/commands/build.ts",
+            "src/commands/test.ts",
+            "src/commands/deploy.ts",
+        ] {
+            g.edges.push(Edge::new(
+                &format!("file:{}", src),
+                "file:src/utils/errors.ts",
+                "imports",
+            ));
+        }
+        g.edges.push(Edge::new(
+            "file:src/ui/render.ts",
+            "file:src/utils/errors.ts",
+            "imports",
+        ));
+
+        let config = ClusterConfig {
+            min_community_size: 2,
+            ..Default::default()
+        };
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
+        let (clusters, metrics) = run_clustering(&net, &idx_to_id, &config);
+
+        eprintln!("=== Sink File Diagnostic Test ===");
+        eprintln!("Total nodes: {}", metrics.num_total);
+        eprintln!("Infomap communities: {}", metrics.num_communities);
+        eprintln!("Orphans (raw): {}", metrics.orphan_count_raw);
+        eprintln!("Merged by affinity: {}", metrics.orphans_merged_by_affinity);
+        eprintln!("Assigned by dir: {}", metrics.orphans_assigned_by_dir);
+        eprintln!("Singleton clusters (final): {}", metrics.singleton_clusters_final);
+        eprintln!("Total clusters: {}", clusters.len());
+        for (i, c) in clusters.iter().enumerate() {
+            eprintln!("  Cluster {}: {} members: {:?}", i, c.member_ids.len(), c.member_ids);
+        }
+
+        // errors.ts SHOULD be merged into some cluster (not be a singleton)
+        let errors_cluster = clusters
+            .iter()
+            .find(|c| c.member_ids.iter().any(|m| m.contains("errors.ts")));
+        assert!(
+            errors_cluster.is_some(),
+            "errors.ts should be in a cluster"
+        );
+        let errors_cluster = errors_cluster.unwrap();
+
+        // Key assertion: errors.ts should NOT be alone
+        assert!(
+            errors_cluster.member_ids.len() > 1,
+            "errors.ts should be merged with its importers, not be a singleton. Cluster: {:?}",
+            errors_cluster.member_ids
+        );
+
+        // Diagnostic: which cluster did it join? Ideally cluster B (most importers)
+        let joined_commands = errors_cluster
+            .member_ids
+            .iter()
+            .any(|m| m.contains("commands"));
+        eprintln!(
+            "errors.ts joined commands cluster: {} (expected: true, since 4/7 importers are commands)",
+            joined_commands
+        );
+    }
+
+    // ── 30. test_truly_isolated_files — Files with zero edges become dir-fallback singletons ──
+
+    #[test]
+    fn test_truly_isolated_files() {
+        // Simulate files that have NO import/call edges — only dir colocation.
+        // These are the real source of singletons: standalone tool files, test fixtures, etc.
+
+        let mut g = Graph::default();
+
+        // One real cluster
+        for name in &["core/engine.ts", "core/parser.ts", "core/lexer.ts"] {
+            g.nodes.push(make_file_node(&format!("src/{}", name)));
+        }
+        g.edges.push(Edge::new("file:src/core/engine.ts", "file:src/core/parser.ts", "imports"));
+        g.edges.push(Edge::new("file:src/core/engine.ts", "file:src/core/lexer.ts", "imports"));
+        g.edges.push(Edge::new("file:src/core/parser.ts", "file:src/core/lexer.ts", "imports"));
+
+        // Isolated files in different directories (each alone in its dir)
+        g.nodes.push(make_file_node("src/tools/bash.ts"));
+        g.nodes.push(make_file_node("src/tools/glob.ts"));
+        g.nodes.push(make_file_node("src/tools/grep.ts"));
+        g.nodes.push(make_file_node("src/fixtures/sample.ts"));
+        g.nodes.push(make_file_node("src/generated/schema.ts"));
+
+        let config = ClusterConfig {
+            min_community_size: 2,
+            ..Default::default()
+        };
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
+        let (clusters, metrics) = run_clustering(&net, &idx_to_id, &config);
+
+        eprintln!("=== Truly Isolated Files Test ===");
+        eprintln!("Total nodes: {}", metrics.num_total);
+        eprintln!("Infomap communities: {}", metrics.num_communities);
+        eprintln!("Orphans (raw): {}", metrics.orphan_count_raw);
+        eprintln!("Merged by affinity: {}", metrics.orphans_merged_by_affinity);
+        eprintln!("Assigned by dir: {}", metrics.orphans_assigned_by_dir);
+        eprintln!("Singleton clusters (final): {}", metrics.singleton_clusters_final);
+        eprintln!("Total clusters: {}", clusters.len());
+        for (i, c) in clusters.iter().enumerate() {
+            eprintln!("  Cluster {}: {} members: {:?}", i, c.member_ids.len(), c.member_ids);
+        }
+
+        // tools/ directory has 3 files → should be grouped by dir colocation
+        let tools_cluster = clusters
+            .iter()
+            .find(|c| c.member_ids.iter().any(|m| m.contains("tools/")));
+        if let Some(tc) = tools_cluster {
+            eprintln!("Tools cluster size: {} (expected: 3 from dir colocation)", tc.member_ids.len());
+        }
+
+        // fixtures/ and generated/ are each alone → will be singletons
+        let singleton_count = metrics.singleton_clusters_final;
+        eprintln!("Singletons: {} (these are truly isolated files)", singleton_count);
     }
 }

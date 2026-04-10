@@ -154,6 +154,21 @@ pub struct CodeNode {
     pub line_count: usize,
     #[serde(default)]
     pub is_test: bool,
+    /// Visibility: "pub", "pub(crate)", "pub(super)", "private", "export", "module" etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Language this node was extracted from
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// Hash of the function/struct body for change detection
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
+    /// End line number (1-indexed), paired with `line` (start_line)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    /// Cyclomatic complexity estimate (branch count + 1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<f64>,
 }
 
 impl CodeNode {
@@ -169,6 +184,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: path.contains("/test") || path.contains("_test."),
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -184,6 +204,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: name.starts_with("Test") || path.contains("/test"),
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -200,6 +225,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: name.starts_with("test_") || name.starts_with("Test") || path.contains("/test"),
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -215,6 +245,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -230,6 +265,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -245,6 +285,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -260,6 +305,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -275,6 +325,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 
@@ -293,6 +348,11 @@ impl CodeNode {
             docstring: None,
             line_count: 0,
             is_test: dir_path.contains("/test") || dir_path.contains("/tests"),
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         }
     }
 }

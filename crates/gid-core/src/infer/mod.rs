@@ -24,9 +24,11 @@ pub mod integration;
 
 #[cfg(feature = "infomap")]
 pub use clustering::{
-    auto_config, auto_name, build_network, cluster, map_to_components, relation_weight,
-    run_clustering, ClusterConfig, ClusterMetrics, ClusterResult, RawCluster, WEIGHT_CALLS,
-    WEIGHT_DEPENDS_ON, WEIGHT_IMPORTS, WEIGHT_STRUCTURAL, WEIGHT_TYPE_REF,
+    auto_config, auto_config_with_network, auto_name, add_dir_colocation_edges,
+    build_network, cluster, map_to_components, relation_weight, run_clustering,
+    ClusterConfig, ClusterMetrics, ClusterResult, RawCluster,
+    WEIGHT_CALLS, WEIGHT_DEPENDS_ON, WEIGHT_DIR_COLOCATION, WEIGHT_IMPORTS,
+    WEIGHT_STRUCTURAL, WEIGHT_TYPE_REF, MAX_DIR_SIZE_FOR_COLOCATION,
 };
 
 #[cfg(feature = "infomap")]
@@ -162,9 +164,11 @@ pub async fn run(
                         && n.node_kind.as_deref() == Some("File"))
             })
             .count();
-        // If user specified default min_community_size (2), auto-tune
+        // If user specified default min_community_size, auto-tune based on graph properties
         if config.clustering.min_community_size == ClusterConfig::default().min_community_size {
-            clustering::auto_config(file_count)
+            // Build network early to compute density-aware config
+            let (net, _) = clustering::build_network(effective_graph);
+            clustering::auto_config_with_network(file_count, &net)
         } else {
             config.clustering.clone()
         }

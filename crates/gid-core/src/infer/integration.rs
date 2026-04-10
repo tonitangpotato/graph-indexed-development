@@ -77,6 +77,7 @@ impl InferResult {
                 codelength: 0.0,
                 num_communities: 0,
                 num_total: 0,
+                ..Default::default()
             },
             token_usage: TokenUsage::default(),
         }
@@ -586,6 +587,7 @@ mod tests {
                 codelength: 3.14,
                 num_communities: n,
                 num_total: n * 5,
+                ..Default::default()
             },
         }
     }
@@ -743,6 +745,7 @@ mod tests {
                 codelength: 0.0,
                 num_communities: 0,
                 num_total: 0,
+                ..Default::default()
             },
             token_usage: TokenUsage::default(),
         };
@@ -836,6 +839,7 @@ mod tests {
                 codelength: 0.0,
                 num_communities: 0,
                 num_total: 0,
+                ..Default::default()
             },
             token_usage: TokenUsage::default(),
         };
@@ -952,6 +956,7 @@ mod tests {
                 codelength: 1.0,
                 num_communities: 0,
                 num_total: 0,
+                ..Default::default()
             },
             token_usage: TokenUsage {
                 naming_tokens: 0,

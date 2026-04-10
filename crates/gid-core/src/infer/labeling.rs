@@ -1171,6 +1171,7 @@ mod tests {
                 codelength: 0.0,
                 num_communities: num,
                 num_total: 0,
+                ..Default::default()
             },
         }
     }
@@ -1251,6 +1252,7 @@ mod tests {
                 codelength: 0.0,
                 num_communities: 2,
                 num_total: 2,
+                ..Default::default()
             },
         };
 
@@ -1291,7 +1293,7 @@ mod tests {
             edges: vec![
                 Edge::new("infer:component:0", "file:src/main.rs", "contains"),
             ],
-            metrics: ClusterMetrics { codelength: 0.0, num_communities: 1, num_total: 1 },
+            metrics: ClusterMetrics { codelength: 0.0, num_communities: 1, num_total: 1, ..Default::default() },
         };
 
         let config = LabelingConfig::default();
@@ -1313,7 +1315,7 @@ mod tests {
             edges: vec![
                 Edge::new("infer:component:0", "file:src/lib.rs", "contains"),
             ],
-            metrics: ClusterMetrics { codelength: 0.0, num_communities: 1, num_total: 1 },
+            metrics: ClusterMetrics { codelength: 0.0, num_communities: 1, num_total: 1, ..Default::default() },
         };
 
         let config = LabelingConfig::default();
@@ -1401,7 +1403,7 @@ mod tests {
                 Edge::new("infer:component:1", "file:b1.rs", "contains"),
                 Edge::new("infer:component:1", "file:b2.rs", "contains"),
             ],
-            metrics: ClusterMetrics { codelength: 0.0, num_communities: 2, num_total: 4 },
+            metrics: ClusterMetrics { codelength: 0.0, num_communities: 2, num_total: 4, ..Default::default() },
         };
 
         // Features: each maps to one component
@@ -1453,7 +1455,7 @@ mod tests {
                 Edge::new("infer:component:0", "file:a.rs", "contains"),
                 Edge::new("infer:component:1", "file:b.rs", "contains"),
             ],
-            metrics: ClusterMetrics { codelength: 0.0, num_communities: 2, num_total: 2 },
+            metrics: ClusterMetrics { codelength: 0.0, num_communities: 2, num_total: 2, ..Default::default() },
         };
 
         let features = vec![
@@ -1527,7 +1529,7 @@ mod tests {
                 Edge::new("infer:component:0", "file:src/auth.rs", "contains"),
                 Edge::new("infer:component:1", "file:src/db.rs", "contains"),
             ],
-            metrics: ClusterMetrics { codelength: 0.0, num_communities: 2, num_total: 2 },
+            metrics: ClusterMetrics { codelength: 0.0, num_communities: 2, num_total: 2, ..Default::default() },
         };
 
         // Naming response
@@ -1572,7 +1574,7 @@ mod tests {
             edges: vec![
                 Edge::new("infer:component:0", "file:src/main.rs", "contains"),
             ],
-            metrics: ClusterMetrics { codelength: 0.0, num_communities: 1, num_total: 1 },
+            metrics: ClusterMetrics { codelength: 0.0, num_communities: 1, num_total: 1, ..Default::default() },
         };
 
         let llm = FailingLlm;
@@ -1609,7 +1611,7 @@ mod tests {
         let cluster = ClusterResult {
             nodes: comp_nodes,
             edges: comp_edges,
-            metrics: ClusterMetrics { codelength: 0.0, num_communities: 15, num_total: 15 },
+            metrics: ClusterMetrics { codelength: 0.0, num_communities: 15, num_total: 15, ..Default::default() },
         };
 
         // Build 3 naming responses (batch_size=5 → batches of 5 components each)

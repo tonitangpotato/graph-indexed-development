@@ -7,6 +7,27 @@ use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
 
+/// Determine Python visibility by naming convention.
+fn extract_python_visibility(name: &str) -> String {
+    if name.starts_with("__") && !name.ends_with("__") {
+        "private".to_string()
+    } else if name.starts_with("_") {
+        "protected".to_string()
+    } else {
+        "public".to_string()
+    }
+}
+
+/// Compute body hash for change detection.
+fn compute_python_body_hash(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let text = body.utf8_text(source).ok()?;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
 pub(crate) fn collect_decorators(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut decorators = Vec::new();
     let mut cursor = node.walk();
@@ -300,6 +321,11 @@ pub(crate) fn extract_class_node(
         docstring: class_docstring,
         line_count: class_line_count,
         is_test: class_is_test,
+        visibility: Some(extract_python_visibility(&class_name)),
+        lang: Some("python".to_string()),
+        body_hash: compute_python_body_hash(node, source),
+        end_line: Some(node.end_position().row + 1),
+        complexity: None,
     });
 
     edges.push(CodeEdge {
@@ -420,7 +446,7 @@ pub(crate) fn extract_method_node(
     nodes.push(CodeNode {
         id: method_id.clone(),
         kind: NodeKind::Function,
-        name: func_name,
+        name: func_name.clone(),
         file_path: path.to_string(),
         line: Some(line_num),
         decorators: decorators.to_vec(),
@@ -428,6 +454,11 @@ pub(crate) fn extract_method_node(
         docstring,
         line_count,
         is_test,
+        visibility: Some(extract_python_visibility(&func_name)),
+        lang: Some("python".to_string()),
+        body_hash: compute_python_body_hash(node, source),
+        end_line: Some(node.end_position().row + 1),
+        complexity: None,
     });
 
     edges.push(CodeEdge {
@@ -484,7 +515,7 @@ pub(crate) fn extract_function_node(
     nodes.push(CodeNode {
         id: func_id.clone(),
         kind: NodeKind::Function,
-        name: func_name,
+        name: func_name.clone(),
         file_path: path.to_string(),
         line: Some(line_num),
         decorators: decorators.to_vec(),
@@ -492,6 +523,11 @@ pub(crate) fn extract_function_node(
         docstring,
         line_count,
         is_test,
+        visibility: Some(extract_python_visibility(&func_name)),
+        lang: Some("python".to_string()),
+        body_hash: compute_python_body_hash(node, source),
+        end_line: Some(node.end_position().row + 1),
+        complexity: None,
     });
 
     edges.push(CodeEdge {

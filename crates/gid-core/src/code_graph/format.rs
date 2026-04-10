@@ -359,6 +359,11 @@ impl CodeGraph {
                                     docstring: None,
                                     line_count: 0,
                                     is_test: false,
+                                    visibility: None,
+                                    lang: None,
+                                    body_hash: None,
+                                    end_line: None,
+                                    complexity: None,
                                 });
                                 break;
                             }
@@ -484,6 +489,11 @@ impl CodeGraph {
                             docstring: None,
                             line_count: 0,
                             is_test: false,
+                            visibility: None,
+                            lang: None,
+                            body_hash: None,
+                            end_line: None,
+                            complexity: None,
                         });
                     }
                 }
@@ -506,6 +516,11 @@ impl CodeGraph {
                             docstring: None,
                             line_count: 0,
                             is_test: false,
+                            visibility: None,
+                            lang: None,
+                            body_hash: None,
+                            end_line: None,
+                            complexity: None,
                         });
                     }
                 }

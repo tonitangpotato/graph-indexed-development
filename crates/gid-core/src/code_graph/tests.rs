@@ -1047,6 +1047,11 @@ mod tests {
                 docstring: None,
                 line_count: 0,
                 is_test: false,
+                visibility: None,
+                lang: None,
+                body_hash: None,
+                end_line: None,
+                complexity: None,
             },
             CodeNode {
                 id: "method:code_graph/format.rs:CodeGraph.format_for_llm".to_string(),
@@ -1059,6 +1064,11 @@ mod tests {
                 docstring: None,
                 line_count: 0,
                 is_test: false,
+                visibility: None,
+                lang: None,
+                body_hash: None,
+                end_line: None,
+                complexity: None,
             },
         ];
 

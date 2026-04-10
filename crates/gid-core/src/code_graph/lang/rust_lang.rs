@@ -8,6 +8,35 @@ use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
 
+// ─── Helpers for new CodeNode fields ───
+
+/// Extract visibility modifier from a Rust AST node.
+fn extract_rust_visibility(node: tree_sitter::Node, source: &[u8]) -> String {
+    // tree-sitter-rust: visibility is a named child "visibility_modifier"
+    // Try field name first, then scan children
+    if let Some(vis) = node.child_by_field_name("visibility") {
+        return vis.utf8_text(source).unwrap_or("pub").to_string();
+    }
+    // Scan direct children for visibility_modifier node
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            return child.utf8_text(source).unwrap_or("pub").to_string();
+        }
+    }
+    "private".to_string()
+}
+
+/// Compute a hash of the body node text for change detection.
+fn compute_body_hash(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let text = body.utf8_text(source).ok()?;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
 // ─── Rust Tree-Sitter Extraction ───
 
 /// Extract from Rust source using tree-sitter AST parsing.
@@ -180,6 +209,11 @@ pub(crate) fn extract_rust_node(
                 docstring,
                 line_count,
                 is_test: path.contains("/tests/") || full_name.contains("Test"),
+                visibility: Some(extract_rust_visibility(node, source)),
+                lang: Some("rust".to_string()),
+                body_hash: compute_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&class_id, file_id));
@@ -239,6 +273,11 @@ pub(crate) fn extract_rust_node(
                 docstring,
                 line_count,
                 is_test: path.contains("/tests/") || full_name.contains("Test"),
+                visibility: Some(extract_rust_visibility(node, source)),
+                lang: Some("rust".to_string()),
+                body_hash: compute_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&class_id, file_id));
@@ -271,6 +310,11 @@ pub(crate) fn extract_rust_node(
                 docstring,
                 line_count,
                 is_test: path.contains("/tests/") || full_name.contains("Test"),
+                visibility: Some(extract_rust_visibility(node, source)),
+                lang: Some("rust".to_string()),
+                body_hash: compute_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&trait_id, file_id));
@@ -417,6 +461,11 @@ pub(crate) fn extract_rust_node(
                 docstring,
                 line_count,
                 is_test,
+                visibility: Some(extract_rust_visibility(node, source)),
+                lang: Some("rust".to_string()),
+                body_hash: compute_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&func_id, file_id));
@@ -479,6 +528,11 @@ pub(crate) fn extract_rust_node(
                 docstring: None,
                 line_count,
                 is_test: false,
+                visibility: Some(extract_rust_visibility(node, source)),
+                lang: Some("rust".to_string()),
+                body_hash: compute_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&type_id, file_id));
@@ -510,6 +564,12 @@ pub(crate) fn extract_rust_node(
                 docstring: None,
                 line_count: 1,
                 is_test: false,
+                visibility: Some(extract_rust_visibility(node, source)),
+                lang: Some("rust".to_string()),
+                body_hash: None,
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
+                
             });
 
             edges.push(CodeEdge::defined_in(&const_id, file_id));
@@ -540,6 +600,11 @@ pub(crate) fn extract_rust_node(
                 docstring: extract_rust_docstring(node, source_str),
                 line_count,
                 is_test: false,
+                visibility: Some(extract_rust_visibility(node, source)),
+                lang: Some("rust".to_string()),
+                body_hash: compute_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&macro_id, file_id));
@@ -593,6 +658,11 @@ pub(crate) fn extract_rust_method(
         docstring,
         line_count,
         is_test,
+        visibility: Some(extract_rust_visibility(node, source)),
+        lang: Some("rust".to_string()),
+        body_hash: compute_body_hash(node, source),
+        end_line: Some(node.end_position().row + 1),
+        complexity: None,
     });
 
     edges.push(CodeEdge {

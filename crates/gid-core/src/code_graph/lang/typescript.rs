@@ -7,6 +7,36 @@ use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
 
+/// Determine TypeScript/JavaScript visibility based on parent context.
+fn extract_ts_visibility(node: tree_sitter::Node) -> String {
+    // If parent is export_statement, it's exported
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "export_statement" {
+            return "export".to_string();
+        }
+    }
+    "module".to_string()
+}
+
+/// Determine language from file path extension.
+fn ts_lang_from_path(path: &str) -> String {
+    if path.ends_with(".ts") || path.ends_with(".tsx") {
+        "typescript".to_string()
+    } else {
+        "javascript".to_string()
+    }
+}
+
+/// Compute body hash for change detection.
+fn compute_ts_body_hash(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let text = body.utf8_text(source).ok()?;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
 // ─── TypeScript Tree-Sitter Extraction ───
 
 /// Extract from TypeScript/JavaScript source using tree-sitter AST parsing.
@@ -146,6 +176,11 @@ pub(crate) fn extract_typescript_node(
                 docstring: extract_typescript_docstring(node, source_str),
                 line_count,
                 is_test: path.contains("/test") || name.contains("Test"),
+                visibility: Some(extract_ts_visibility(node)),
+                lang: Some(ts_lang_from_path(path)),
+                body_hash: compute_ts_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&interface_id, file_id));
@@ -178,6 +213,11 @@ pub(crate) fn extract_typescript_node(
                 docstring,
                 line_count,
                 is_test: path.contains("/test") || path.contains(".test.") || path.contains(".spec."),
+                visibility: Some(extract_ts_visibility(node)),
+                lang: Some(ts_lang_from_path(path)),
+                body_hash: compute_ts_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&func_id, file_id));
@@ -214,6 +254,11 @@ pub(crate) fn extract_typescript_node(
                                 docstring: extract_typescript_docstring(node, source_str),
                                 line_count,
                                 is_test: path.contains("/test") || path.contains(".test.") || path.contains(".spec."),
+                                visibility: Some(extract_ts_visibility(node)),
+                                lang: Some(ts_lang_from_path(path)),
+                                body_hash: compute_ts_body_hash(node, source),
+                                end_line: Some(node.end_position().row + 1),
+                                complexity: None,
                             });
 
                             edges.push(CodeEdge::defined_in(&func_id, file_id));
@@ -247,6 +292,11 @@ pub(crate) fn extract_typescript_node(
                 docstring: extract_typescript_docstring(node, source_str),
                 line_count,
                 is_test: false,
+                visibility: Some(extract_ts_visibility(node)),
+                lang: Some(ts_lang_from_path(path)),
+                body_hash: compute_ts_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&enum_id, file_id));
@@ -277,6 +327,11 @@ pub(crate) fn extract_typescript_node(
                 docstring: None,
                 line_count,
                 is_test: false,
+                visibility: Some(extract_ts_visibility(node)),
+                lang: Some(ts_lang_from_path(path)),
+                body_hash: compute_ts_body_hash(node, source),
+                end_line: Some(node.end_position().row + 1),
+                complexity: None,
             });
 
             edges.push(CodeEdge::defined_in(&type_id, file_id));
@@ -329,6 +384,11 @@ pub(crate) fn extract_typescript_node(
                     docstring: None,
                     line_count: node.end_position().row - node.start_position().row + 1,
                     is_test: false,
+                    visibility: Some(extract_ts_visibility(node)),
+                    lang: Some(ts_lang_from_path(path)),
+                    body_hash: compute_ts_body_hash(node, source),
+                    end_line: Some(node.end_position().row + 1),
+                    complexity: None,
                 });
 
                 edges.push(CodeEdge::defined_in(&module_id, file_id));
@@ -383,6 +443,11 @@ pub(crate) fn extract_typescript_class(
         docstring,
         line_count,
         is_test: path.contains("/test") || name.contains("Test"),
+        visibility: Some(extract_ts_visibility(node)),
+        lang: Some(ts_lang_from_path(path)),
+        body_hash: compute_ts_body_hash(node, source),
+        end_line: Some(node.end_position().row + 1),
+        complexity: None,
     });
 
     edges.push(CodeEdge::defined_in(&class_id, file_id));
@@ -497,6 +562,11 @@ pub(crate) fn extract_typescript_method(
         docstring,
         line_count,
         is_test: path.contains("/test") || path.contains(".test.") || path.contains(".spec."),
+        visibility: Some(extract_ts_visibility(node)),
+        lang: Some(ts_lang_from_path(path)),
+        body_hash: compute_ts_body_hash(node, source),
+        end_line: Some(node.end_position().row + 1),
+        complexity: None,
     });
 
     edges.push(CodeEdge {
@@ -1332,4 +1402,3 @@ pub(crate) fn resolve_typescript_self_method_call(
         }
     }
 }
-

@@ -371,6 +371,11 @@ mod tests {
             docstring: None,
             line_count: 0,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         });
         code_graph.nodes.push(CodeNode {
             id: "func:src/main.rs:main".into(),
@@ -383,6 +388,11 @@ mod tests {
             docstring: None,
             line_count: 10,
             is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
         });
         
         let task_graph = Graph {

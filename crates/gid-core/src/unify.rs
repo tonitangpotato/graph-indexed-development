@@ -37,25 +37,31 @@ pub fn codegraph_to_graph_nodes(cg: &CodeGraph, _project_root: &std::path::Path)
         if !cn.decorators.is_empty() {
             node.metadata.insert("decorators".to_string(), serde_json::json!(cn.decorators));
         }
+        // Copy code-graph enrichment fields
+        node.visibility = cn.visibility.clone();
+        node.lang = cn.lang.clone();
+        node.body_hash = cn.body_hash.clone();
+        node.end_line = cn.end_line;
+        // Derive is_public from visibility
+        if let Some(ref vis) = cn.visibility {
+            node.is_public = Some(vis == "pub" || vis == "export");
+        }
         nodes.push(node);
     }
 
     for ce in &cg.edges {
         let relation = ce.relation.to_string(); // "imports", "calls", "inherits", etc.
         let mut edge = Edge::new(&ce.from, &ce.to, &relation);
+        // Set confidence and weight directly on the Edge struct (stored as dedicated SQLite columns)
+        edge.confidence = Some(ce.confidence as f64);
+        edge.weight = Some(ce.weight as f64);
         let mut meta = serde_json::Map::new();
         meta.insert("source".to_string(), serde_json::json!("extract"));
-        if ce.weight != 0.5 {
-            meta.insert("weight".to_string(), serde_json::json!(ce.weight));
-        }
         if ce.call_count > 1 {
             meta.insert("call_count".to_string(), serde_json::json!(ce.call_count));
         }
         if ce.in_error_path {
             meta.insert("in_error_path".to_string(), serde_json::json!(true));
-        }
-        if ce.confidence != 1.0 {
-            meta.insert("confidence".to_string(), serde_json::json!(ce.confidence));
         }
         edge.metadata = Some(serde_json::Value::Object(meta));
         edges.push(edge);
@@ -113,7 +119,12 @@ pub fn graph_to_codegraph(graph: &Graph) -> CodeGraph {
             docstring: n.doc_comment.clone(),
             line_count,
             is_test,
-        });
+            visibility: n.visibility.clone(),
+            lang: n.lang.clone(),
+            body_hash: n.body_hash.clone(),
+            end_line: n.end_line,
+            complexity: None,
+                    });
     }
 
     for e in &code_edges_refs {
@@ -130,10 +141,15 @@ pub fn graph_to_codegraph(graph: &Graph) -> CodeGraph {
         };
 
         let meta = e.metadata.as_ref();
-        let weight = meta.and_then(|m| m.get("weight")).and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+        // Read weight/confidence from Edge struct fields first (canonical), fallback to metadata for legacy graphs
+        let weight = e.weight.map(|w| w as f32)
+            .or_else(|| meta.and_then(|m| m.get("weight")).and_then(|v| v.as_f64()).map(|v| v as f32))
+            .unwrap_or(0.5);
         let call_count = meta.and_then(|m| m.get("call_count")).and_then(|v| v.as_u64()).unwrap_or(1) as u32;
         let in_error_path = meta.and_then(|m| m.get("in_error_path")).and_then(|v| v.as_bool()).unwrap_or(false);
-        let confidence = meta.and_then(|m| m.get("confidence")).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let confidence = e.confidence.map(|c| c as f32)
+            .or_else(|| meta.and_then(|m| m.get("confidence")).and_then(|v| v.as_f64()).map(|v| v as f32))
+            .unwrap_or(1.0);
 
         edges.push(CodeEdge {
             from: e.from.clone(),
@@ -368,9 +384,17 @@ mod tests {
 
         let defined_in = edges.iter().find(|e| e.relation == "defined_in").unwrap();
         assert_eq!(defined_in.source(), Some("extract"));
+        // confidence and weight must be set on the Edge struct itself (not just metadata)
+        assert!(defined_in.confidence.is_some(), "confidence must be set on Edge");
+        assert!(defined_in.weight.is_some(), "weight must be set on Edge");
 
         let calls = edges.iter().find(|e| e.relation == "calls").unwrap();
         assert_eq!(calls.source(), Some("extract"));
+        assert!(calls.confidence.is_some(), "confidence must be set on Edge");
+        assert!(calls.weight.is_some(), "weight must be set on Edge");
+        // Default CodeEdge confidence=1.0, weight=0.5
+        assert_eq!(calls.confidence, Some(1.0));
+        assert_eq!(calls.weight, Some(0.5));
     }
 
     #[test]
@@ -471,12 +495,17 @@ mod tests {
         let (_, edges) = codegraph_to_graph_nodes(&cg, Path::new("/tmp"));
         assert_eq!(edges.len(), 1);
         let e = &edges[0];
+        // confidence and weight are now on Edge struct fields, not in metadata
+        // Use approximate comparison due to f32→f64 cast precision
+        assert!((e.confidence.unwrap() - 0.8).abs() < 1e-6, "confidence should be ~0.8");
+        assert!((e.weight.unwrap() - 0.9).abs() < 1e-6, "weight should be ~0.9");
         let meta = e.metadata.as_ref().unwrap();
         assert_eq!(meta.get("source").unwrap(), "extract");
         assert_eq!(meta.get("call_count").unwrap(), 5);
         assert_eq!(meta.get("in_error_path").unwrap(), true);
-        assert!(meta.get("confidence").is_some());
-        assert!(meta.get("weight").is_some());
+        // confidence/weight should NOT be duplicated in metadata
+        assert!(meta.get("confidence").is_none());
+        assert!(meta.get("weight").is_none());
     }
 
     #[test]
@@ -683,7 +712,12 @@ mod tests {
                     docstring: None,
                     line_count: 100,
                     is_test: false,
-                },
+                    visibility: None,
+                    lang: Some("rust".to_string()),
+                    body_hash: None,
+                    end_line: None,
+                    complexity: None,
+                                    },
                 CodeNode {
                     id: "fn:src/main.rs:main".to_string(),
                     kind: NodeKind::Function,
@@ -695,7 +729,12 @@ mod tests {
                     docstring: Some("Entry point".to_string()),
                     line_count: 50,
                     is_test: false,
-                },
+                    visibility: Some("pub".to_string()),
+                    lang: Some("rust".to_string()),
+                    body_hash: Some("abc123".to_string()),
+                    end_line: Some(60),
+                    complexity: None,
+                                    },
                 CodeNode {
                     id: "class:src/lib.rs:Config".to_string(),
                     kind: NodeKind::Class,
@@ -707,7 +746,12 @@ mod tests {
                     docstring: None,
                     line_count: 20,
                     is_test: true,
-                },
+                    visibility: Some("pub(crate)".to_string()),
+                    lang: Some("rust".to_string()),
+                    body_hash: Some("def456".to_string()),
+                    end_line: Some(20),
+                    complexity: None,
+                                    },
             ],
             edges: vec![
                 CodeEdge {
@@ -755,6 +799,7 @@ mod tests {
         assert_eq!(file_node.name, "main.rs");
         assert_eq!(file_node.line_count, 100);
         assert!(!file_node.is_test);
+        assert_eq!(file_node.lang.as_deref(), Some("rust"));
 
         let fn_node = roundtrip.nodes.iter().find(|n| n.id == "fn:src/main.rs:main").unwrap();
         assert_eq!(fn_node.kind, NodeKind::Function);
@@ -762,10 +807,16 @@ mod tests {
         assert_eq!(fn_node.docstring.as_deref(), Some("Entry point"));
         assert_eq!(fn_node.line, Some(10));
         assert_eq!(fn_node.decorators, vec!["#[tokio::main]".to_string()]);
+        assert_eq!(fn_node.visibility.as_deref(), Some("pub"));
+        assert_eq!(fn_node.lang.as_deref(), Some("rust"));
+        assert_eq!(fn_node.body_hash.as_deref(), Some("abc123"));
+        assert_eq!(fn_node.end_line, Some(60));
 
         let class_node = roundtrip.nodes.iter().find(|n| n.id == "class:src/lib.rs:Config").unwrap();
         assert_eq!(class_node.kind, NodeKind::Class);
         assert!(class_node.is_test);
+        assert_eq!(class_node.visibility.as_deref(), Some("pub(crate)"));
+        assert_eq!(class_node.body_hash.as_deref(), Some("def456"));
 
         // Verify edges
         assert_eq!(roundtrip.edges.len(), 2);
