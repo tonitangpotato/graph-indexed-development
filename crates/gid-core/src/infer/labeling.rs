@@ -126,6 +126,8 @@ pub struct ComponentContext {
     pub function_signatures: Vec<String>,
     /// Brief descriptions of key files (truncated to `max_briefs_per_component`).
     pub file_briefs: Vec<String>,
+    /// Names of child components (for hierarchical parent nodes with no direct files).
+    pub child_component_names: Vec<String>,
 }
 
 /// Project-level context to improve LLM inference quality.
@@ -358,6 +360,33 @@ pub fn assemble_contexts(
         function_signatures.sort();
         file_briefs.sort();
 
+        // For hierarchical parents with no direct files, collect child component names.
+        let child_component_names: Vec<String> = if files.is_empty() {
+            // Find child component edges (component → component "contains" edges)
+            let child_ids: Vec<&str> = cluster_result
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.relation == "contains"
+                        && e.from == comp_id
+                        && e.to.starts_with("infer:component:")
+                })
+                .map(|e| e.to.as_str())
+                .collect();
+
+            // Look up child component titles from cluster_result.nodes
+            let mut names: Vec<String> = Vec::new();
+            for child_id in child_ids {
+                if let Some(child_node) = cluster_result.nodes.iter().find(|n| n.id == child_id) {
+                    names.push(child_node.title.clone());
+                }
+            }
+            names.sort();
+            names
+        } else {
+            Vec::new()
+        };
+
         contexts.push(ComponentContext {
             component_id: comp_id.to_string(),
             auto_name,
@@ -365,6 +394,7 @@ pub fn assemble_contexts(
             class_names,
             function_signatures,
             file_briefs,
+            child_component_names,
         });
     }
 
@@ -604,6 +634,14 @@ fn build_naming_prompt(
             }
         }
 
+        if !ctx.child_component_names.is_empty() {
+            let children_str: String = ctx.child_component_names.join(", ");
+            prompt.push_str(&format!("Sub-components: {}\n", children_str));
+            if ctx.files.is_empty() {
+                prompt.push_str("(This is a parent component grouping the above sub-components; it has no direct files.)\n");
+            }
+        }
+
         prompt.push('\n');
     }
 
@@ -653,7 +691,12 @@ fn build_feature_prompt(
     }
 
     prompt.push_str(
-        "\nGroup these components into high-level business features (3-10 features).\n\
+        "\nGroup these components into high-level features.\n\n\
+         Constraints:\n\
+         - Each feature should contain 2-8 components. A feature with 1 component is too granular; more than 8 suggests it should be split.\n\
+         - Features must have specific, domain-relevant names. Generic names like \"Core\", \"Utilities\", \"Misc\", \"Common\" are banned.\n\
+         - If a component doesn't fit any feature naturally, give it its own single-component feature rather than a catch-all bucket.\n\
+         - Features at the same level should be roughly similar in scope/granularity.\n\n\
          A component may belong to multiple features if it serves multiple purposes.\n\n\
          Respond in JSON only (no explanation, no markdown outside the JSON):\n\
          [\n  {\n    \"title\": \"...\",\n    \"description\": \"...\",\n    \
@@ -810,13 +853,15 @@ pub async fn name_components(
         }
 
         // Call LLM
-        eprintln!("  📡 Calling LLM for batch {}/{}...", batch_start / config.batch_size + 1, (contexts.len() + config.batch_size - 1) / config.batch_size);
+        let batch_num = batch_start / config.batch_size + 1;
+        let total_batches = (contexts.len() + config.batch_size - 1) / config.batch_size;
+        tracing::info!(batch = batch_num, total = total_batches, "Calling LLM for naming batch");
         match llm.complete(&prompt).await {
             Ok(response) => {
-                eprintln!("  📝 Got response ({} chars)", response.len());
+                tracing::debug!(response_len = response.len(), "Got LLM response");
                 match parse_naming_response(&response) {
                     Ok(labels) => {
-                        eprintln!("  ✅ Parsed {} labels", labels.len());
+                        tracing::debug!(count = labels.len(), "Parsed labels");
                         // Match labels to batch components, fill in missing with fallback
                         let label_map: HashMap<&str, &ComponentLabel> = labels
                             .iter()
@@ -837,8 +882,8 @@ pub async fn name_components(
                         }
                     }
                     Err(ref _e) => {
-                        eprintln!("  ❌ Parse failure: {}", _e);
-                        eprintln!("  📄 Response preview: {}", &response[..response.len().min(500)]);
+                        tracing::warn!(error = %_e, "LLM naming parse failure");
+                        tracing::debug!(preview = &response[..response.len().min(500)], "Response preview");
                         // Parse failure — fall back to auto_name for entire batch
                         for ctx in &batch {
                             all_labels.push(ComponentLabel {
@@ -851,7 +896,7 @@ pub async fn name_components(
                 }
             }
             Err(ref _e) => {
-                eprintln!("  ❌ LLM call failed: {}", _e);
+                tracing::warn!(error = %_e, "LLM call failed, using fallback names");
                 // LLM call failure — fall back to auto_name for entire batch
                 for ctx in &batch {
                     all_labels.push(ComponentLabel {
@@ -904,9 +949,13 @@ pub async fn infer_features(
 
     // Check token budget
     let estimated_tokens = llm.estimate_tokens(&prompt) * 2;
-    eprintln!("  🏷️  Feature inference: prompt ~{} tokens, budget remaining: {}", estimated_tokens / 2, config.tokens_remaining());
+    tracing::debug!(
+        prompt_tokens = estimated_tokens / 2,
+        budget_remaining = config.tokens_remaining(),
+        "Feature inference token estimate"
+    );
     if !config.record_tokens(estimated_tokens) {
-        eprintln!("  ⚠️  Token budget exceeded for feature inference");
+        tracing::warn!("Token budget exceeded for feature inference, skipping");
         return Ok(Vec::new()); // Budget exceeded, graceful degradation
     }
 
@@ -932,28 +981,32 @@ pub async fn infer_features(
     }
 
     // Call LLM
-    eprintln!("  📡 Calling LLM for feature inference...");
+    tracing::info!("Calling LLM for feature inference");
     let response = match llm.complete(&prompt).await {
         Ok(r) => r,
         Err(ref _e) => {
-            eprintln!("  ❌ Feature LLM call failed: {}", _e);
+            tracing::warn!(error = %_e, "Feature LLM call failed");
             return Ok(Vec::new());
         }
     };
-    eprintln!("  📝 Feature response ({} chars)", response.len());
+    tracing::debug!(response_len = response.len(), "Feature response received");
 
     // Parse response
     let raw_features = match parse_feature_response(&response) {
         Ok(f) => {
-            eprintln!("  ✅ Parsed {} features", f.len());
+            tracing::debug!(count = f.len(), "Parsed features");
             for rf in &f {
-                eprintln!("    {} ({} components): {:?}", rf.title, rf.components.len(), &rf.components[..rf.components.len().min(3)]);
+                tracing::trace!(
+                    title = %rf.title,
+                    component_count = rf.components.len(),
+                    "Feature detail"
+                );
             }
             f
         },
         Err(ref _e) => {
-            eprintln!("  ❌ Feature parse failure: {}", _e);
-            eprintln!("  📄 Response preview: {}", &response[..response.len().min(500)]);
+            tracing::warn!(error = %_e, "Feature parse failure");
+            tracing::debug!(preview = &response[..response.len().min(500)], "Response preview");
             return Ok(Vec::new());
         }
     };
@@ -979,19 +1032,22 @@ pub async fn infer_features(
 
         let dropped = raw.components.len() - valid_component_ids.len();
         if dropped > 0 {
-            eprintln!("    ⚠️  Feature '{}': dropped {} invalid component refs (kept {})", raw.title, dropped, valid_component_ids.len());
-            // Show first few invalid ones
             let invalid: Vec<_> = raw.components.iter()
                 .filter(|id| !valid_ids.contains(id.as_str()))
                 .take(3)
                 .collect();
-            eprintln!("      Invalid refs: {:?}", invalid);
-            eprintln!("      Valid ID sample: {:?}", valid_ids.iter().take(3).collect::<Vec<_>>());
+            tracing::warn!(
+                feature = %raw.title,
+                dropped = dropped,
+                kept = valid_component_ids.len(),
+                invalid_sample = ?invalid,
+                "Feature has invalid component refs"
+            );
         }
 
         // Skip features with no valid components
         if valid_component_ids.is_empty() {
-            eprintln!("    ❌ Feature '{}' dropped: 0 valid component refs", raw.title);
+            tracing::warn!(feature = %raw.title, "Feature dropped: 0 valid component refs");
             continue;
         }
 

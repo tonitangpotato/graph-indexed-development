@@ -15,7 +15,8 @@ sqlite = ["graph", "dep:rusqlite"]
 harness = ["graph", "dep:tokio", "dep:futures", "dep:async-trait", "dep:agentctl-auth", "dep:dirs", "dep:reqwest"]
 ritual = ["harness", "dep:glob", "dep:which"]
 infomap = ["graph", "dep:infomap-rs", "dep:async-trait"]
-full = ["ritual", "sqlite", "infomap"]
+cli-llm = ["infomap", "dep:tokio"]
+full = ["ritual", "sqlite", "infomap", "cli-llm"]
 
 [dependencies]
 serde = { workspace = true }

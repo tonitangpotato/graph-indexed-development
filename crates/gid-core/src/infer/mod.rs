@@ -22,9 +22,15 @@ pub mod labeling;
 #[cfg(feature = "infomap")]
 pub mod integration;
 
+#[cfg(feature = "cli-llm")]
+mod llm;
+#[cfg(feature = "cli-llm")]
+pub use llm::CliLlm;
+
 #[cfg(feature = "infomap")]
 pub use clustering::{
-    auto_config, auto_config_with_network, auto_name, add_dir_colocation_edges,
+    auto_config, auto_config_with_network, auto_name, auto_name_hierarchical,
+    add_dir_colocation_edges,
     build_network, cluster, map_to_components, relation_weight, run_clustering,
     ClusterConfig, ClusterMetrics, ClusterResult, RawCluster,
     WEIGHT_CALLS, WEIGHT_DEPENDS_ON, WEIGHT_DIR_COLOCATION, WEIGHT_IMPORTS,
@@ -125,9 +131,9 @@ pub async fn run(
             use crate::code_graph::CodeGraph;
             use crate::unify::codegraph_to_graph_nodes;
 
-            eprintln!(
-                "ℹ No code nodes found, auto-extracting from {:?}",
-                source_dir
+            tracing::info!(
+                source_dir = ?source_dir,
+                "No code nodes found, auto-extracting"
             );
             let code_graph = CodeGraph::extract_from_dir(source_dir);
             let (code_nodes, code_edges) = codegraph_to_graph_nodes(&code_graph, source_dir);
@@ -197,15 +203,19 @@ pub async fn run(
     };
 
     // Step 3: Build InferResult from both phases
-    eprintln!("  📊 Labeling result: {} labels, {} features, {} feature_edges",
-        labeling_result.component_labels.len(),
-        labeling_result.features.len(),
-        labeling_result.feature_edges.len());
+    tracing::debug!(
+        labels = labeling_result.component_labels.len(),
+        features = labeling_result.features.len(),
+        feature_edges = labeling_result.feature_edges.len(),
+        "Labeling result"
+    );
     let result = InferResult::from_phases(&cluster_result, &labeling_result);
-    eprintln!("  📊 InferResult: {} components, {} features, {} edges",
-        result.component_nodes.len(),
-        result.feature_nodes.len(),
-        result.edges.len());
+    tracing::debug!(
+        components = result.component_nodes.len(),
+        features = result.feature_nodes.len(),
+        edges = result.edges.len(),
+        "InferResult"
+    );
     Ok(result)
 }
 

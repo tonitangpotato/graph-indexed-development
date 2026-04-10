@@ -4293,32 +4293,6 @@ fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_lsp: bool, no_semantify: bool, 
 // Infer Command
 // =============================================================================
 
-/// Bridge: SimpleLlm trait → claude CLI for the infer pipeline.
-struct CliSimpleLlm {
-    model: String,
-}
-
-#[async_trait::async_trait]
-impl gid_core::infer::SimpleLlm for CliSimpleLlm {
-    async fn complete(&self, prompt: &str) -> Result<String> {
-        let output = tokio::process::Command::new("claude")
-            .arg("-p")
-            .arg(prompt)
-            .arg("--model")
-            .arg(&self.model)
-            .output()
-            .await
-            .context("Failed to run claude CLI. Is it installed?")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("claude CLI failed: {}", stderr);
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-}
-
 async fn cmd_infer(
     ctx: &GraphContext,
     level_str: &str,
@@ -4388,10 +4362,10 @@ async fn cmd_infer(
     };
 
     // Create LLM client if needed
-    let llm_client: Option<CliSimpleLlm> = if no_llm || level == infer::InferLevel::Component {
+    let llm_client: Option<gid_core::infer::CliLlm> = if no_llm || level == infer::InferLevel::Component {
         None
     } else {
-        Some(CliSimpleLlm { model: model.to_string() })
+        Some(gid_core::infer::CliLlm::new(model))
     };
 
     // Handle --phase for step-by-step execution
