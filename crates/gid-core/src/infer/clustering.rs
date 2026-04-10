@@ -24,11 +24,17 @@ pub const WEIGHT_TYPE_REF: f64 = 0.5;
 pub const WEIGHT_STRUCTURAL: f64 = 0.2;
 /// Weight for generic "depends_on" edges.
 pub const WEIGHT_DEPENDS_ON: f64 = 0.4;
+/// Weight for synthetic co-citation edges between files imported by the same consumers.
+pub const WEIGHT_CO_CITATION: f64 = 0.4;
+/// Default minimum number of shared citers to create a co-citation edge.
+pub const CO_CITATION_MIN_SHARED: usize = 2;
 /// Weight for synthetic directory co-location edges between files in the same directory.
 pub const WEIGHT_DIR_COLOCATION: f64 = 0.3;
-/// Maximum directory size for pairwise co-location edges. Directories with more
-/// files than this skip co-location to avoid O(n²) edge explosion.
-pub const MAX_DIR_SIZE_FOR_COLOCATION: usize = 50;
+/// Legacy constant — no longer used.  Co-location edges now only apply to
+/// code-isolated files (zero edges in the network), so O(n²) explosion in
+/// large directories is structurally impossible.
+#[deprecated(note = "co-location is now isolation-gated; pairwise limit is unnecessary")]
+pub const COLOCATION_PAIRWISE_LIMIT: usize = 80;
 
 /// Map an edge relation string to its clustering weight.
 ///
@@ -40,6 +46,8 @@ pub fn relation_weight(relation: &str) -> f64 {
         "type_reference" | "inherits" | "implements" | "uses" => WEIGHT_TYPE_REF,
         "defined_in" | "contains" | "belongs_to" => WEIGHT_STRUCTURAL,
         "depends_on" => WEIGHT_DEPENDS_ON,
+        "overrides" => WEIGHT_TYPE_REF, // method override = strong type coupling
+        "tests_for" => 0.3,            // weak coupling — tests cluster with source but don't dominate
         _ => 0.0,
     }
 }
@@ -60,6 +68,12 @@ pub struct ClusterConfig {
     pub min_community_size: usize,
     /// Whether to run hierarchical decomposition (default: false).
     pub hierarchical: bool,
+    /// Weight for synthetic co-citation edges (default: 0.4).
+    /// Two files imported by the same consumers get a weighted edge.
+    /// Set to 0.0 to disable co-citation.
+    pub co_citation_weight: f64,
+    /// Minimum shared citers to create a co-citation edge (default: 2).
+    pub co_citation_min_shared: usize,
     /// Weight for synthetic directory co-location edges (default: 0.3).
     /// Set to 0.0 to disable directory co-location.
     pub dir_colocation_weight: f64,
@@ -76,6 +90,8 @@ impl Default for ClusterConfig {
             teleportation_rate: 0.05,
             num_trials: 10,
             min_community_size: 2,
+            co_citation_weight: WEIGHT_CO_CITATION,
+            co_citation_min_shared: CO_CITATION_MIN_SHARED,
             dir_colocation_weight: WEIGHT_DIR_COLOCATION,
             hierarchical: false,
             seed: 42,
@@ -249,19 +265,181 @@ pub fn build_network(graph: &Graph) -> (Network, Vec<String>) {
     (net, idx_to_id)
 }
 
-/// Add synthetic directory co-location edges to the network.
+/// Add synthetic co-citation edges to the network.
 ///
-/// Files sharing the same parent directory get bidirectional edges with the
-/// given weight. Directories with more than `MAX_DIR_SIZE_FOR_COLOCATION`
-/// files are skipped to avoid O(n²) edge explosion.
+/// Co-citation: if files A and B are both imported by file C, they share
+/// a usage context. The more shared importers, the stronger the signal.
+/// This is critical for utility/helper files that don't import each other
+/// but serve the same feature domains.
+///
+/// Algorithm:
+/// 1. Build reverse-import index: for each file, which files import it?
+/// 2. For each pair of files with >= min_shared common importers,
+///    add a bidirectional edge with weight = base_weight * shared_count (capped).
+///
+/// Performance: Only considers file nodes with >=1 incoming import-like edge.
+/// Edge weight is capped at `max_edge_weight` to prevent over-coupling.
+pub fn add_co_citation_edges(
+    net: &mut Network,
+    graph: &Graph,
+    idx_to_id: &[String],
+    weight: f64,
+    min_shared: usize,
+    max_edge_weight: f64,
+) {
+    if weight <= 0.0 || idx_to_id.is_empty() {
+        return;
+    }
+
+    // Build id → index map from idx_to_id
+    let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (idx, id) in idx_to_id.iter().enumerate() {
+        id_to_idx.insert(id.as_str(), idx);
+    }
+
+    // Map non-file nodes to their parent file index (same logic as build_network)
+    let mut node_to_file_idx: HashMap<&str, usize> = HashMap::new();
+    for node in &graph.nodes {
+        let is_file = node.node_type.as_deref() == Some("file")
+            || (node.node_type.as_deref() == Some("code")
+                && node.node_kind.as_deref() == Some("File"));
+        if is_file {
+            continue;
+        }
+        if let Some(ref fp) = node.file_path {
+            let file_id = format!("file:{}", fp);
+            if let Some(&idx) = id_to_idx.get(file_id.as_str()) {
+                node_to_file_idx.insert(&node.id, idx);
+                continue;
+            }
+        }
+        if let Some(fp_val) = node.metadata.get("file_path") {
+            if let Some(fp) = fp_val.as_str() {
+                let file_id = format!("file:{}", fp);
+                if let Some(&idx) = id_to_idx.get(file_id.as_str()) {
+                    node_to_file_idx.insert(&node.id, idx);
+                }
+            }
+        }
+    }
+
+    // Build reverse-import index: target_file_idx → set of importer_file_indices
+    // Only consider import-like edges: imports, calls, uses, type_reference, depends_on
+    let mut imported_by: HashMap<usize, HashSet<usize>> = HashMap::new();
+
+    for edge in &graph.edges {
+        let is_import_like = matches!(
+            edge.relation.as_str(),
+            "imports" | "calls" | "uses" | "type_reference" | "depends_on"
+        );
+        if !is_import_like {
+            continue;
+        }
+
+        // Resolve both endpoints to file indices
+        let from_idx = node_to_file_idx
+            .get(edge.from.as_str())
+            .or_else(|| id_to_idx.get(edge.from.as_str()))
+            .copied();
+        let to_idx = node_to_file_idx
+            .get(edge.to.as_str())
+            .or_else(|| id_to_idx.get(edge.to.as_str()))
+            .copied();
+
+        if let (Some(from), Some(to)) = (from_idx, to_idx) {
+            if from != to {
+                // `from` imports `to`, so `to` is imported_by `from`
+                imported_by.entry(to).or_default().insert(from);
+            }
+        }
+    }
+
+    // Collect files that have importers (candidates for co-citation)
+    let candidates: Vec<usize> = imported_by.keys().copied().collect();
+
+    if candidates.len() < 2 {
+        return;
+    }
+
+    // For each pair of candidates, count shared importers
+    let mut co_citation_edges = 0usize;
+    for i in 0..candidates.len() {
+        let a = candidates[i];
+        let citers_a = &imported_by[&a];
+
+        for j in (i + 1)..candidates.len() {
+            let b = candidates[j];
+            let citers_b = &imported_by[&b];
+
+            // Count shared citers (intersection)
+            let shared = citers_a.intersection(citers_b).count();
+
+            if shared >= min_shared {
+                let edge_weight = (weight * shared as f64).min(max_edge_weight);
+                net.add_edge(a, b, edge_weight);
+                net.add_edge(b, a, edge_weight);
+                co_citation_edges += 1;
+            }
+        }
+    }
+
+    if co_citation_edges > 0 {
+        eprintln!(
+            "🔗 Added {} co-citation edges ({} candidate files, min_shared={})",
+            co_citation_edges,
+            candidates.len(),
+            min_shared,
+        );
+    }
+}
+
+/// Add synthetic directory co-location edges to the network — **only for
+/// code-isolated files**.
+///
+/// A file is "code-isolated" if it has zero edges in the network at the time
+/// this function is called.  This means `build_network()` found no
+/// imports/calls/type_references, AND `add_co_citation_edges()` found no
+/// shared-importer signal.  For those files, directory proximity is the only
+/// clustering signal available, so co-location edges are genuinely useful.
+///
+/// Files that already participate in the code-level graph are **skipped** —
+/// adding O(n²) directory edges on top of real dependency signal is pure noise,
+/// and it's the root cause of mega-cluster formation in large flat directories
+/// like `utils/` or `commands/`.
+///
+/// # Why this replaces the old approach
+///
+/// The previous implementation applied co-location edges to *all* files in a
+/// directory, with heuristic mitigations for large dirs (pairwise limit,
+/// sub-directory grouping, weight decay).  Those were patches for a
+/// fundamental issue: co-location is a fallback signal that should only fire
+/// when real signals are absent.  By gating on isolation, the fix is uniform
+/// across directory sizes — no thresholds, no decay, no special cases.
 pub fn add_dir_colocation_edges(net: &mut Network, idx_to_id: &[String], weight: f64) {
     if weight <= 0.0 {
         return;
     }
 
-    // Group file indices by parent directory.
+    // 1. Identify code-isolated files: nodes with zero edges in the network.
+    //    Must snapshot before we start adding co-location edges.
+    let mut isolated: HashSet<usize> = HashSet::new();
+    for idx in 0..idx_to_id.len() {
+        if idx < net.num_nodes()
+            && net.out_neighbors(idx).is_empty()
+            && net.in_neighbors(idx).is_empty()
+        {
+            isolated.insert(idx);
+        }
+    }
+
+    if isolated.is_empty() {
+        return;
+    }
+
+    // 2. Group *isolated* file indices by parent directory.
     let mut dir_groups: HashMap<String, Vec<usize>> = HashMap::new();
-    for (idx, node_id) in idx_to_id.iter().enumerate() {
+    for &idx in &isolated {
+        let node_id = &idx_to_id[idx];
         let path = node_id.strip_prefix("file:").unwrap_or(node_id);
         let dir = match path.rsplit_once('/') {
             Some((parent, _)) if !parent.is_empty() => parent.to_string(),
@@ -270,22 +448,34 @@ pub fn add_dir_colocation_edges(net: &mut Network, idx_to_id: &[String], weight:
         dir_groups.entry(dir).or_default().push(idx);
     }
 
-    // Add pairwise bidirectional edges within each directory group.
-    for (dir, files) in &dir_groups {
-        if files.len() > MAX_DIR_SIZE_FOR_COLOCATION {
-            eprintln!(
-                "⚠ Directory '{}' has {} files — skipping co-location edges (limit: {})",
-                dir,
-                files.len(),
-                MAX_DIR_SIZE_FOR_COLOCATION
-            );
-            continue;
+    // 3. Add pairwise bidirectional edges within each directory group.
+    //    Since these are *only* isolated files, groups are typically small
+    //    and O(n²) pairwise is fine (no need for thresholds or decay).
+    let mut total_edges = 0usize;
+    for (_dir, files) in &dir_groups {
+        if files.len() < 2 {
+            continue; // single isolated file in a dir — nothing to pair with
         }
-        for i in 0..files.len() {
-            for j in (i + 1)..files.len() {
-                net.add_edge(files[i], files[j], weight);
-                net.add_edge(files[j], files[i], weight);
-            }
+        add_pairwise_edges(net, files, weight);
+        total_edges += files.len() * (files.len() - 1); // bidirectional count
+    }
+
+    if total_edges > 0 {
+        eprintln!(
+            "📂 Co-location: {} isolated files → {} edges across {} directories",
+            isolated.len(),
+            total_edges,
+            dir_groups.values().filter(|f| f.len() >= 2).count(),
+        );
+    }
+}
+
+/// Add pairwise bidirectional edges between all nodes in a group.
+fn add_pairwise_edges(net: &mut Network, files: &[usize], weight: f64) {
+    for i in 0..files.len() {
+        for j in (i + 1)..files.len() {
+            net.add_edge(files[i], files[j], weight);
+            net.add_edge(files[j], files[i], weight);
         }
     }
 }
@@ -354,7 +544,16 @@ pub fn split_mega_clusters(
     config: &ClusterConfig,
     max_cluster_size: usize,
 ) -> Vec<RawCluster> {
-    split_mega_clusters_recursive(clusters, net, idx_to_id, config, max_cluster_size, 0, 3)
+    let mut result =
+        split_mega_clusters_recursive(clusters, net, idx_to_id, config, max_cluster_size, 0, 3);
+    // Global renumbering to prevent ID collisions after recursive splits.
+    // Without this, sub-clusters from different recursion depths can share
+    // the same `id`, causing `map_to_components` to generate duplicate
+    // "infer:component:{id}" node IDs. (ISS-006)
+    for (i, c) in result.iter_mut().enumerate() {
+        c.id = i;
+    }
+    result
 }
 
 /// Recursively split oversized clusters by running Infomap on their subgraphs.
@@ -536,6 +735,75 @@ fn extract_subgraph(net: &Network, node_indices: &[usize]) -> Network {
     }
 
     subgraph
+}
+
+/// Split oversized leaf clusters using directory structure as a heuristic.
+///
+/// In hierarchical mode, Infomap already provides multi-level structure.
+/// Re-running Infomap is redundant and theoretically inferior (Kawamoto & Rosvall 2015).
+/// Instead, for any leaf cluster (no children) exceeding `max_size`, this function
+/// groups members by parent directory and creates sub-clusters per directory.
+///
+/// Non-oversized clusters and non-leaf clusters are preserved as-is.
+fn split_oversized_by_directory(clusters: Vec<RawCluster>, max_size: usize) -> Vec<RawCluster> {
+    let mut result: Vec<RawCluster> = Vec::new();
+
+    for cluster in clusters {
+        // Only split leaf clusters (no children) that exceed max_size
+        if cluster.children.is_empty() && cluster.member_ids.len() > max_size {
+            eprintln!(
+                "  📁 Splitting oversized leaf cluster {} ({} files) by directory (max: {})",
+                cluster.id,
+                cluster.member_ids.len(),
+                max_size,
+            );
+
+            // Group members by parent directory
+            let mut dir_groups: HashMap<String, Vec<String>> = HashMap::new();
+            for member_id in &cluster.member_ids {
+                let dir = extract_parent_dir(member_id);
+                dir_groups.entry(dir).or_default().push(member_id.clone());
+            }
+
+            // If directory grouping doesn't actually split (all same dir), keep as-is
+            if dir_groups.len() <= 1 {
+                eprintln!(
+                    "    ℹ All files in same directory, keeping cluster {} as-is",
+                    cluster.id,
+                );
+                result.push(cluster);
+                continue;
+            }
+
+            // Create sub-clusters per directory group
+            let base_id = result.len();
+            let mut sub_idx = 0;
+            for (_dir, members) in dir_groups {
+                result.push(RawCluster {
+                    id: base_id + sub_idx,
+                    member_ids: members,
+                    flow: 0.0,
+                    parent: cluster.parent,
+                    children: Vec::new(),
+                });
+                sub_idx += 1;
+            }
+
+            eprintln!(
+                "    ✓ Split into {} directory-based sub-clusters",
+                sub_idx,
+            );
+        } else {
+            result.push(cluster);
+        }
+    }
+
+    // Re-number cluster IDs sequentially
+    for (i, c) in result.iter_mut().enumerate() {
+        c.id = i;
+    }
+
+    result
 }
 
 /// Diagnostic counters for orphan reassignment.
@@ -861,16 +1129,13 @@ fn build_tree_clusters(
             } else {
                 format!("{}.{}", _path, ci)
             };
-            // Collect descendant leaf members into the parent as well.
             build_tree_clusters(child, idx_to_id, clusters, counter, Some(my_idx), child_path);
         }
 
-        // Propagate child members up to parent.
-        let child_indices: Vec<usize> = clusters[my_idx].children.clone();
-        for child_idx in child_indices {
-            let child_members: Vec<String> = clusters[child_idx].member_ids.clone();
-            clusters[my_idx].member_ids.extend(child_members);
-        }
+        // NOTE: We intentionally do NOT propagate child members up to the parent.
+        // Each cluster keeps only its own direct leaf node members (from tree_node.nodes).
+        // The parent→child relationship is captured via cluster.children and the
+        // "contains" edges created in map_to_components().
     }
 }
 
@@ -927,10 +1192,13 @@ pub fn map_to_components(clusters: &[RawCluster], graph: &Graph) -> ClusterResul
             })
             .collect();
 
-        let title = if file_paths.is_empty() {
-            auto_name(&[])
-        } else {
+        let title = if !file_paths.is_empty() {
             auto_name(&file_paths)
+        } else if is_hierarchical && !cluster.children.is_empty() {
+            // Will be resolved in a second pass after all child titles are known.
+            "component".to_string()
+        } else {
+            auto_name(&[])
         };
 
         // Create component node.
@@ -941,6 +1209,13 @@ pub fn map_to_components(clusters: &[RawCluster], graph: &Graph) -> ClusterResul
             .insert("flow".into(), serde_json::json!(cluster.flow));
         node.metadata
             .insert("size".into(), serde_json::json!(cluster.member_ids.len()));
+
+        // For hierarchical: compute total_size (direct files + all descendant files)
+        if is_hierarchical && !cluster.children.is_empty() {
+            let total = count_total_descendants(cluster, clusters);
+            node.metadata.insert("total_size".into(), serde_json::json!(total));
+        }
+
         nodes.push(node);
 
         // Create membership edges: component → member.
@@ -963,6 +1238,37 @@ pub fn map_to_components(clusters: &[RawCluster], graph: &Graph) -> ClusterResul
                 let mut edge = Edge::new(&component_id, &child_component_id, "contains");
                 edge.metadata = Some(infer_meta.clone());
                 edges.push(edge);
+            }
+        }
+    }
+
+    // Second pass: resolve parent titles from child titles in hierarchical mode.
+    if is_hierarchical {
+        // Build cluster_id → node index map.
+        let cluster_id_to_node_idx: HashMap<usize, usize> = clusters
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id, i))
+            .collect();
+
+        for cluster in clusters {
+            if cluster.member_ids.is_empty() && !cluster.children.is_empty() {
+                // This is a pure parent node — derive name from children.
+                let child_titles: Vec<&str> = cluster
+                    .children
+                    .iter()
+                    .filter_map(|&child_id| {
+                        cluster_id_to_node_idx
+                            .get(&child_id)
+                            .map(|&idx| nodes[idx].title.as_str())
+                    })
+                    .collect();
+
+                if !child_titles.is_empty() {
+                    if let Some(&node_idx) = cluster_id_to_node_idx.get(&cluster.id) {
+                        nodes[node_idx].title = auto_name_hierarchical(&child_titles);
+                    }
+                }
             }
         }
     }
@@ -1093,6 +1399,65 @@ pub fn auto_name(file_paths: &[&str]) -> String {
     format!("component-{}", hash % 10000)
 }
 
+/// Auto-name for hierarchical parent nodes that have no direct files.
+///
+/// Derives the name from child component titles:
+/// 1. If children share a common directory prefix, use that.
+/// 2. Otherwise, concatenate the first few child names.
+/// 3. Fallback: "group".
+pub fn auto_name_hierarchical(child_titles: &[&str]) -> String {
+    if child_titles.is_empty() {
+        return "group".to_string();
+    }
+
+    if child_titles.len() == 1 {
+        return format!("{}-group", child_titles[0]);
+    }
+
+    // Try to find a common prefix among child titles treated as path-like segments.
+    // E.g., if children are ["auth", "auth-middleware"], the common prefix is "auth".
+    let split_titles: Vec<Vec<&str>> = child_titles
+        .iter()
+        .map(|t| t.split(&['-', '_', '/'][..]).collect::<Vec<_>>())
+        .collect();
+
+    let min_len = split_titles.iter().map(|p| p.len()).min().unwrap_or(0);
+    let mut prefix_len = 0;
+    for i in 0..min_len {
+        let first = split_titles[0][i];
+        if split_titles.iter().all(|p| p[i] == first) {
+            prefix_len = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    if prefix_len > 0 {
+        let prefix: Vec<&str> = split_titles[0][..prefix_len].to_vec();
+        return prefix.join("-");
+    }
+
+    // No common prefix: concatenate top children (up to 3).
+    let top: Vec<&str> = child_titles.iter().take(3).copied().collect();
+    let joined = top.join("+");
+    if child_titles.len() > 3 {
+        format!("{}+…", joined)
+    } else {
+        joined
+    }
+}
+
+/// Count total descendant files (direct members + all children recursively).
+fn count_total_descendants(cluster: &RawCluster, all_clusters: &[RawCluster]) -> usize {
+    let mut total = cluster.member_ids.len();
+    for &child_id in &cluster.children {
+        if let Some(child) = all_clusters.iter().find(|c| c.id == child_id) {
+            total += count_total_descendants(child, all_clusters);
+        }
+    }
+    total
+}
+
 // ── Auto-configuration ─────────────────────────────────────────────────────
 
 /// Auto-select clustering parameters based on graph size and density.
@@ -1104,9 +1469,9 @@ pub fn auto_name(file_paths: &[&str]) -> String {
 pub fn auto_config(file_count: usize) -> ClusterConfig {
     let (min_community_size, hierarchical) = match file_count {
         0..=49 => (2, false),
-        50..=499 => (3, false),
-        500..=1999 => (5, false),
-        _ => (8, false),
+        50..=499 => (3, true),
+        500..=1999 => (5, true),
+        _ => (8, true),
     };
     ClusterConfig {
         min_community_size,
@@ -1220,6 +1585,18 @@ fn deduplicate_names(nodes: &mut [Node]) {
 pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
     let (mut net, idx_to_id) = build_network(graph);
 
+    // Add co-citation edges (indirect usage signal).
+    // Must come before dir_colocation so that co-citation structure
+    // influences Infomap even in large flat directories.
+    add_co_citation_edges(
+        &mut net,
+        graph,
+        &idx_to_id,
+        config.co_citation_weight,
+        config.co_citation_min_shared,
+        2.0, // max edge weight cap
+    );
+
     // Add directory co-location edges if configured.
     add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
 
@@ -1227,17 +1604,46 @@ pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
         return Ok(ClusterResult::empty());
     }
 
+    tracing::info!(
+        "Infomap input: {} nodes, {} edges (num_trials={})",
+        net.num_nodes(),
+        net.num_edges(),
+        config.num_trials,
+    );
+    let t0 = std::time::Instant::now();
     let (clusters, metrics) = run_clustering(&net, &idx_to_id, config);
+    tracing::info!("Infomap completed in {:.1}s", t0.elapsed().as_secs_f64());
 
     // Compute effective max cluster size
+    // Compute effective max cluster size.
+    // Use log-based formula: component size should be nearly constant regardless
+    // of project scale — a 2000-file project doesn't have bigger components,
+    // it has more components. ln(N) * 6 grows slowly enough to approximate this.
+    //   50 files → 23,  100 → 28,  500 → 38,  1000 → 42,  2000 → 46,  5000 → 52
+    // Clamped to [15, 60] — no component should exceed 60 files.
+    // See .gid/issues/ISS-008-max-cluster-size-formula.md for discussion.
     let total_files = idx_to_id.len();
-    let max_size = config
-        .max_cluster_size
-        .unwrap_or_else(|| total_files.max(100) / 5);
-    let max_size = max_size.max(20); // Never below 20
+    let max_size = config.max_cluster_size.unwrap_or_else(|| {
+        let auto = ((total_files as f64).ln() * 6.0).ceil() as usize;
+        auto.clamp(15, 60)
+    });
 
-    // Split mega-clusters
-    let clusters = split_mega_clusters(clusters, &net, &idx_to_id, config, max_size);
+    // Split oversized clusters:
+    // - Hierarchical mode: Infomap already provides multi-level structure.
+    //   Don't recursively re-run Infomap — it's redundant and theoretically inferior
+    //   (Kawamoto & Rosvall 2015). Instead, use directory heuristic as a fallback
+    //   for any oversized leaf clusters.
+    // - Flat mode: recursively sub-cluster via Infomap, then fall back to
+    //   directory-based splitting for any clusters that Infomap considers
+    //   monolithic (returns 1 module) but still exceed max_size.
+    let clusters = if config.hierarchical {
+        split_oversized_by_directory(clusters, max_size)
+    } else {
+        let after_infomap = split_mega_clusters(clusters, &net, &idx_to_id, config, max_size);
+        // Fallback: any cluster that Infomap couldn't split (monolithic subgraph)
+        // but still exceeds max_size → split by directory structure.
+        split_oversized_by_directory(after_infomap, max_size)
+    };
 
     let mut result = map_to_components(&clusters, graph);
     result.metrics = metrics;
@@ -1332,6 +1738,10 @@ mod tests {
         assert_eq!(relation_weight("contains"), WEIGHT_STRUCTURAL);
         assert_eq!(relation_weight("belongs_to"), WEIGHT_STRUCTURAL);
         assert_eq!(relation_weight("depends_on"), WEIGHT_DEPENDS_ON);
+        // Overrides = type-level coupling
+        assert_eq!(relation_weight("overrides"), WEIGHT_TYPE_REF);
+        // TestsFor = weak coupling (tests cluster with source but don't dominate)
+        assert_eq!(relation_weight("tests_for"), 0.3);
         // Unknown relation returns 0.0
         assert_eq!(relation_weight("foobar"), 0.0);
         assert_eq!(relation_weight(""), 0.0);
@@ -2696,6 +3106,633 @@ mod tests {
             original_sizes, no_split_sizes,
             "max_depth=0 should produce identical clusters: original={:?}, got={:?}",
             original_sizes, no_split_sizes
+        );
+    }
+
+    // ── 35. test_auto_config_hierarchical_threshold ─────────────────────
+
+    #[test]
+    fn test_auto_config_hierarchical_threshold() {
+        // 49 files → hierarchical=false
+        let config_49 = auto_config(49);
+        assert!(
+            !config_49.hierarchical,
+            "auto_config(49) should return hierarchical=false"
+        );
+        assert_eq!(config_49.min_community_size, 2);
+
+        // 50 files → hierarchical=true
+        let config_50 = auto_config(50);
+        assert!(
+            config_50.hierarchical,
+            "auto_config(50) should return hierarchical=true"
+        );
+        assert_eq!(config_50.min_community_size, 3);
+
+        // 500 files → hierarchical=true
+        let config_500 = auto_config(500);
+        assert!(
+            config_500.hierarchical,
+            "auto_config(500) should return hierarchical=true"
+        );
+        assert_eq!(config_500.min_community_size, 5);
+
+        // 2000 files → hierarchical=true
+        let config_2000 = auto_config(2000);
+        assert!(
+            config_2000.hierarchical,
+            "auto_config(2000) should return hierarchical=true"
+        );
+        assert_eq!(config_2000.min_community_size, 8);
+    }
+
+    // ── 36. test_hierarchical_skips_mega_split ─────────────────────────
+
+    #[test]
+    fn test_hierarchical_skips_mega_split() {
+        // Create a graph with 60+ files forming a dense cluster.
+        // Run with hierarchical=true. Verify that clusters_split metric is 0,
+        // meaning split_mega_clusters was NOT invoked.
+        let mut g = Graph::default();
+        let file_count = 65;
+
+        // Use multiple directories so the graph is realistic
+        let files: Vec<String> = (0..file_count)
+            .map(|i| format!("src/mod{}/f{}.rs", i / 10, i))
+            .collect();
+        for f in &files {
+            g.nodes.push(make_file_node(f));
+        }
+
+        // Create edges between files: each file connects to next 3 files
+        // (sparse enough to form communities, dense enough for meaningful clustering)
+        for i in 0..file_count {
+            for offset in 1..=3 {
+                let j = (i + offset) % file_count;
+                g.edges.push(Edge::new(
+                    &format!("file:{}", files[i]),
+                    &format!("file:{}", files[j]),
+                    "calls",
+                ));
+            }
+        }
+
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            hierarchical: true,
+            max_cluster_size: Some(10), // Small max to trigger splitting logic
+            ..Default::default()
+        };
+
+        let result = cluster(&g, &config).unwrap();
+
+        // In hierarchical mode, clusters_split should be 0
+        // because split_mega_clusters is skipped entirely.
+        assert_eq!(
+            result.metrics.clusters_split, 0,
+            "Hierarchical mode should skip split_mega_clusters (clusters_split should be 0, got {})",
+            result.metrics.clusters_split
+        );
+
+        // Verify we still get a valid result with components
+        assert!(
+            !result.nodes.is_empty(),
+            "Hierarchical clustering should still produce component nodes"
+        );
+    }
+
+    // ── 37. test_split_oversized_by_directory ──────────────────────────
+
+    #[test]
+    fn test_split_oversized_by_directory() {
+        // Create clusters where one leaf cluster is oversized with files from
+        // multiple directories — it should be split by directory.
+
+        let oversized = RawCluster {
+            id: 0,
+            member_ids: vec![
+                "file:src/auth/login.rs".to_string(),
+                "file:src/auth/logout.rs".to_string(),
+                "file:src/auth/session.rs".to_string(),
+                "file:src/db/pool.rs".to_string(),
+                "file:src/db/query.rs".to_string(),
+                "file:src/db/migrate.rs".to_string(),
+            ],
+            flow: 1.0,
+            parent: None,
+            children: Vec::new(), // leaf cluster
+        };
+
+        let small = RawCluster {
+            id: 1,
+            member_ids: vec![
+                "file:src/api/handler.rs".to_string(),
+                "file:src/api/router.rs".to_string(),
+            ],
+            flow: 0.5,
+            parent: None,
+            children: Vec::new(),
+        };
+
+        let clusters = vec![oversized, small];
+        // max_size=4: the 6-member cluster should be split, the 2-member one preserved
+        let result = split_oversized_by_directory(clusters, 4);
+
+        // The oversized cluster (6 files in 2 dirs) should split into 2 sub-clusters
+        // The small cluster (2 files) should be preserved
+        // Total: 3 clusters
+        assert_eq!(
+            result.len(),
+            3,
+            "Expected 3 clusters (2 from split + 1 preserved), got {}",
+            result.len()
+        );
+
+        // Verify all original members are preserved
+        let all_members: HashSet<String> = result
+            .iter()
+            .flat_map(|c| c.member_ids.iter().cloned())
+            .collect();
+        assert_eq!(all_members.len(), 8, "All 8 files should be preserved");
+        assert!(all_members.contains("file:src/auth/login.rs"));
+        assert!(all_members.contains("file:src/db/pool.rs"));
+        assert!(all_members.contains("file:src/api/handler.rs"));
+
+        // Verify that the split clusters each contain files from the same directory
+        let auth_cluster = result.iter().find(|c| {
+            c.member_ids.iter().any(|m| m.contains("auth"))
+        });
+        let db_cluster = result.iter().find(|c| {
+            c.member_ids.iter().any(|m| m.contains("/db/"))
+        });
+
+        assert!(auth_cluster.is_some(), "Should have an auth cluster");
+        assert!(db_cluster.is_some(), "Should have a db cluster");
+        assert_eq!(auth_cluster.unwrap().member_ids.len(), 3);
+        assert_eq!(db_cluster.unwrap().member_ids.len(), 3);
+
+        // Verify IDs are sequential
+        for (i, c) in result.iter().enumerate() {
+            assert_eq!(c.id, i, "Cluster IDs should be sequential");
+        }
+    }
+
+    // ── 38. test_split_oversized_preserves_non_leaf ────────────────────
+
+    #[test]
+    fn test_split_oversized_preserves_non_leaf() {
+        // Non-leaf clusters (with children) should NOT be split even if oversized.
+        let parent = RawCluster {
+            id: 0,
+            member_ids: (0..10)
+                .map(|i| format!("file:src/a/f{}.rs", i))
+                .collect(),
+            flow: 1.0,
+            parent: None,
+            children: vec![1, 2], // has children → not a leaf
+        };
+
+        let clusters = vec![parent];
+        let result = split_oversized_by_directory(clusters, 4);
+
+        // Should NOT be split because it has children
+        assert_eq!(
+            result.len(),
+            1,
+            "Non-leaf cluster should not be split, got {} clusters",
+            result.len()
+        );
+    }
+
+    // ── 39. test_co_citation_basic ─────────────────────────────────────
+
+    #[test]
+    fn test_co_citation_basic() {
+        // 5 "util" files in the same directory, no mutual imports.
+        // 3 "feature" files that import overlapping subsets.
+        // util a and b are both imported by f1 and f2 → co-citation edge.
+        // Other pairs share only 1 citer → below default threshold.
+        let mut g = Graph::default();
+
+        for name in &[
+            "utils/a.ts",
+            "utils/b.ts",
+            "utils/c.ts",
+            "utils/d.ts",
+            "utils/e.ts",
+        ] {
+            g.nodes.push(make_file_node(name));
+        }
+        for name in &["features/f1.ts", "features/f2.ts", "features/f3.ts"] {
+            g.nodes.push(make_file_node(name));
+        }
+
+        // f1 imports a, b
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/a.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/b.ts", "imports"));
+        // f2 imports a, b, c
+        g.edges
+            .push(Edge::new("file:features/f2.ts", "file:utils/a.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f2.ts", "file:utils/b.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f2.ts", "file:utils/c.ts", "imports"));
+        // f3 imports d, e
+        g.edges
+            .push(Edge::new("file:features/f3.ts", "file:utils/d.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f3.ts", "file:utils/e.ts", "imports"));
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+
+        let edges_after = net.num_edges();
+        // a and b share 2 citers (f1, f2) → bidirectional co-citation edges added
+        assert!(
+            edges_after > edges_before,
+            "co-citation should add edges: before={}, after={}",
+            edges_before,
+            edges_after
+        );
+
+        // Verify a↔b edge exists
+        let a_idx = idx_to_id
+            .iter()
+            .position(|id| id == "file:utils/a.ts")
+            .unwrap();
+        let b_idx = idx_to_id
+            .iter()
+            .position(|id| id == "file:utils/b.ts")
+            .unwrap();
+
+        let a_neighbors: Vec<usize> = net.out_neighbors(a_idx).iter().map(|&(t, _)| t).collect();
+        assert!(
+            a_neighbors.contains(&b_idx),
+            "a should have co-citation edge to b"
+        );
+
+        let b_neighbors: Vec<usize> = net.out_neighbors(b_idx).iter().map(|&(t, _)| t).collect();
+        assert!(
+            b_neighbors.contains(&a_idx),
+            "b should have co-citation edge to a (bidirectional)"
+        );
+    }
+
+    // ── 40. test_co_citation_min_shared_threshold ──────────────────────
+
+    #[test]
+    fn test_co_citation_min_shared_threshold() {
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        g.nodes.push(make_file_node("features/f1.ts"));
+
+        // Only 1 shared citer
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/a.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/b.ts", "imports"));
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        // min_shared=2, but only 1 shared citer → no co-citation edge
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+        assert_eq!(
+            net.num_edges(),
+            edges_before,
+            "should not add edges when below min_shared"
+        );
+
+        // min_shared=1 → should add edge
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 1, 2.0);
+        assert!(
+            net.num_edges() > edges_before,
+            "should add edges when min_shared=1"
+        );
+    }
+
+    // ── 41. test_co_citation_weight_cap ────────────────────────────────
+
+    #[test]
+    fn test_co_citation_weight_cap() {
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        // 10 feature files all importing both a and b
+        for i in 0..10 {
+            let name = format!("features/f{}.ts", i);
+            g.nodes.push(make_file_node(&name));
+            g.edges.push(Edge::new(
+                &format!("file:features/f{}.ts", i),
+                "file:utils/a.ts",
+                "imports",
+            ));
+            g.edges.push(Edge::new(
+                &format!("file:features/f{}.ts", i),
+                "file:utils/b.ts",
+                "imports",
+            ));
+        }
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+
+        let a_idx = idx_to_id
+            .iter()
+            .position(|id| id == "file:utils/a.ts")
+            .unwrap();
+        let b_idx = idx_to_id
+            .iter()
+            .position(|id| id == "file:utils/b.ts")
+            .unwrap();
+
+        // 10 shared citers × 0.4 = 4.0, but capped at 2.0
+        let weight = net
+            .out_neighbors(a_idx)
+            .iter()
+            .find(|&&(t, _)| t == b_idx)
+            .map(|&(_, w)| w)
+            .expect("should have co-citation edge");
+
+        assert!(
+            (weight - 2.0).abs() < 0.001,
+            "weight should be capped at 2.0, got {}",
+            weight
+        );
+    }
+
+    // ── 42. test_co_citation_disabled_when_zero_weight ─────────────────
+
+    #[test]
+    fn test_co_citation_disabled_when_zero_weight() {
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        g.nodes.push(make_file_node("features/f1.ts"));
+        g.nodes.push(make_file_node("features/f2.ts"));
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/a.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/b.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f2.ts", "file:utils/a.ts", "imports"));
+        g.edges
+            .push(Edge::new("file:features/f2.ts", "file:utils/b.ts", "imports"));
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        // weight = 0.0 → disabled
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.0, 2, 2.0);
+        assert_eq!(net.num_edges(), edges_before);
+    }
+
+    // ── 43. test_co_citation_splits_utils_cluster ──────────────────────
+
+    #[test]
+    fn test_co_citation_splits_utils_cluster() {
+        // Simulate the real problem: utility files in one flat directory,
+        // no mutual imports. Two groups of feature files import different subsets.
+        // Without co-citation → one monolithic hooks cluster.
+        // With co-citation → hooks split into groups matching usage patterns.
+        let mut g = Graph::default();
+
+        // Group A utils: auth-related
+        let auth_utils = [
+            "hooks/useAuth.ts",
+            "hooks/useSession.ts",
+            "hooks/usePermissions.ts",
+            "hooks/useAuthCallback.ts",
+            "hooks/useToken.ts",
+        ];
+        // Group B utils: UI-related
+        let ui_utils = [
+            "hooks/useTheme.ts",
+            "hooks/useModal.ts",
+            "hooks/useToast.ts",
+            "hooks/useAnimation.ts",
+            "hooks/useMediaQuery.ts",
+        ];
+
+        for name in auth_utils.iter().chain(ui_utils.iter()) {
+            g.nodes.push(make_file_node(name));
+        }
+
+        // Auth feature files import auth utils
+        for i in 0..4 {
+            let feat = format!("features/auth/page{}.ts", i);
+            g.nodes.push(make_file_node(&feat));
+            for util in &auth_utils {
+                g.edges.push(Edge::new(
+                    &format!("file:{}", feat),
+                    &format!("file:{}", util),
+                    "imports",
+                ));
+            }
+        }
+
+        // UI feature files import UI utils
+        for i in 0..4 {
+            let feat = format!("features/ui/page{}.ts", i);
+            g.nodes.push(make_file_node(&feat));
+            for util in &ui_utils {
+                g.edges.push(Edge::new(
+                    &format!("file:{}", feat),
+                    &format!("file:{}", util),
+                    "imports",
+                ));
+            }
+        }
+
+        // Run clustering WITH co-citation
+        let config = ClusterConfig {
+            co_citation_weight: 0.4,
+            co_citation_min_shared: 2,
+            dir_colocation_weight: 0.0, // disable to isolate co-citation effect
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            max_cluster_size: Some(8),
+            ..Default::default()
+        };
+
+        let result = cluster(&g, &config).unwrap();
+
+        // Should have multiple components (not one monolithic "hooks" cluster)
+        assert!(
+            result.nodes.len() >= 3,
+            "co-citation should produce >= 3 components (auth-hooks, ui-hooks, features), got {}",
+            result.nodes.len()
+        );
+
+        // No single component should contain ALL the hooks
+        let all_hooks: HashSet<String> = auth_utils
+            .iter()
+            .chain(ui_utils.iter())
+            .map(|s| format!("file:{}", s))
+            .collect();
+        for component in &result.nodes {
+            let hook_members: Vec<_> = result
+                .edges
+                .iter()
+                .filter(|e| e.to == component.id && e.relation == "belongs_to")
+                .filter(|e| all_hooks.contains(&e.from))
+                .collect();
+            assert!(
+                hook_members.len() < all_hooks.len(),
+                "component {} contains all {} hooks — co-citation didn't split them",
+                component.id,
+                all_hooks.len()
+            );
+        }
+    }
+
+    // ── 44. test_colocation_isolation_gating ────────────────────────
+
+    #[test]
+    fn test_colocation_isolation_gating() {
+        // Regression test for the root fix: co-location edges should ONLY be
+        // added for code-isolated files (zero edges in the network).
+        //
+        // Scenario: a flat directory with 10 files.  7 have import edges,
+        // 3 are truly isolated.  Co-location should only connect the 3 isolated
+        // files, NOT add O(n²) edges among all 10.
+
+        let mut g = Graph::default();
+
+        // 7 connected files in utils/
+        for i in 0..7 {
+            g.nodes
+                .push(make_file_node(&format!("src/utils/connected{}.ts", i)));
+        }
+        // Each connected file imports the next → chain of edges
+        for i in 0..6 {
+            g.edges.push(Edge::new(
+                &format!("file:src/utils/connected{}.ts", i),
+                &format!("file:src/utils/connected{}.ts", i + 1),
+                "imports",
+            ));
+        }
+
+        // 3 isolated files in utils/ (no imports, no calls)
+        for i in 0..3 {
+            g.nodes
+                .push(make_file_node(&format!("src/utils/orphan{}.ts", i)));
+        }
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        // edges_before should be 6 (the import chain)
+        assert_eq!(
+            edges_before, 6,
+            "import chain should produce 6 edges, got {}",
+            edges_before
+        );
+
+        add_dir_colocation_edges(&mut net, &idx_to_id, 0.3);
+
+        // Only the 3 isolated files should get co-location: 3 pairs × 2 dirs = 6 new edges
+        let edges_after = net.num_edges();
+        let colocation_edges_added = edges_after - edges_before;
+
+        assert_eq!(
+            colocation_edges_added, 6,
+            "Should add 6 co-location edges (3 isolated files × C(3,2) × 2 directions), got {}",
+            colocation_edges_added
+        );
+
+        // Verify none of the connected files got new edges
+        for i in 0..7 {
+            let file_id = format!("file:src/utils/connected{}.ts", i);
+            let idx = idx_to_id.iter().position(|id| id == &file_id).unwrap();
+            // Connected files: should only have import edges, no co-location
+            let out_count = net.out_neighbors(idx).len();
+            let in_count = net.in_neighbors(idx).len();
+            // At most 1 out-edge (import to next) + 1 in-edge (import from prev)
+            assert!(
+                out_count <= 1 && in_count <= 1,
+                "connected file {} should have ≤1 out + ≤1 in edges, got out={} in={}",
+                i, out_count, in_count
+            );
+        }
+    }
+
+    // ── 45. test_colocation_skips_when_all_connected ────────────────────
+
+    #[test]
+    fn test_colocation_skips_when_all_connected() {
+        // If every file in a directory already has code edges, co-location
+        // should add ZERO edges — regardless of directory size.
+
+        let mut g = Graph::default();
+        for i in 0..50 {
+            g.nodes
+                .push(make_file_node(&format!("src/big_flat_dir/f{}.ts", i)));
+        }
+        // Create a ring: each file imports the next (circular)
+        for i in 0..50 {
+            g.edges.push(Edge::new(
+                &format!("file:src/big_flat_dir/f{}.ts", i),
+                &format!("file:src/big_flat_dir/f{}.ts", (i + 1) % 50),
+                "imports",
+            ));
+        }
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        add_dir_colocation_edges(&mut net, &idx_to_id, 0.3);
+
+        assert_eq!(
+            net.num_edges(),
+            edges_before,
+            "all files have edges → co-location should add ZERO new edges, \
+             but added {} (was {}, now {})",
+            net.num_edges() - edges_before,
+            edges_before,
+            net.num_edges(),
+        );
+    }
+
+    // ── 46. test_co_citation_only_import_like_edges ────────────────────
+
+    #[test]
+    fn test_co_citation_only_import_like_edges() {
+        // Structural edges (defined_in, contains) should NOT count as citations
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        g.nodes.push(make_file_node("features/f1.ts"));
+        g.nodes.push(make_file_node("features/f2.ts"));
+
+        // f1 and f2 have "contains" edges to a and b — structural, not import-like
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/a.ts", "contains"));
+        g.edges
+            .push(Edge::new("file:features/f1.ts", "file:utils/b.ts", "contains"));
+        g.edges
+            .push(Edge::new("file:features/f2.ts", "file:utils/a.ts", "contains"));
+        g.edges
+            .push(Edge::new("file:features/f2.ts", "file:utils/b.ts", "contains"));
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+
+        // "contains" is not import-like, so no co-citation edges should be added
+        assert_eq!(
+            net.num_edges(),
+            edges_before,
+            "structural edges should not create co-citation"
         );
     }
 }

@@ -30,15 +30,15 @@ pub use llm::CliLlm;
 #[cfg(feature = "infomap")]
 pub use clustering::{
     auto_config, auto_config_with_network, auto_name, auto_name_hierarchical,
-    add_dir_colocation_edges,
+    add_co_citation_edges, add_dir_colocation_edges,
     build_network, cluster, map_to_components, relation_weight, run_clustering,
     ClusterConfig, ClusterMetrics, ClusterResult, RawCluster,
-    WEIGHT_CALLS, WEIGHT_DEPENDS_ON, WEIGHT_DIR_COLOCATION, WEIGHT_IMPORTS,
-    WEIGHT_STRUCTURAL, WEIGHT_TYPE_REF, MAX_DIR_SIZE_FOR_COLOCATION,
+    WEIGHT_CALLS, WEIGHT_CO_CITATION, WEIGHT_DEPENDS_ON, WEIGHT_DIR_COLOCATION, WEIGHT_IMPORTS,
+    WEIGHT_STRUCTURAL, WEIGHT_TYPE_REF, COLOCATION_PAIRWISE_LIMIT, CO_CITATION_MIN_SHARED,
 };
 
 #[cfg(feature = "infomap")]
-pub use integration::{merge_into_graph, format_output, InferResult, MergeStats, OutputFormat};
+pub use integration::{merge_into_graph, rollback_infer_batch, format_output, InferResult, MergeStats, OutputFormat};
 
 #[cfg(feature = "infomap")]
 pub use labeling::{LabelingConfig, LabelingResult, SimpleLlm};
