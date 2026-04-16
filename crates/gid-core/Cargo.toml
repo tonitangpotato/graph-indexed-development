@@ -4,7 +4,7 @@ version = "0.3.1"
 edition = "2021"
 description = "Graph-Indexed Development core library — graph-based project management and code analysis for AI agents"
 license = "MIT"
-repository = "https://github.com/tonitangpotato/graph-indexed-development"
+repository = "https://github.com/tonioyeme/graph-indexed-development"
 keywords = ["graph", "development", "ai", "agent", "code-analysis"]
 categories = ["development-tools", "data-structures"]
 
