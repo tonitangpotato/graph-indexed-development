@@ -78,8 +78,30 @@ pub enum StorageError {
         detail: String,
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
-    /// Foreign key constraint violation.
+    /// Foreign key constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY).
+    /// ISS-015: Distinguish FK from other constraints.
     ForeignKeyViolation {
+        op: StorageOp,
+        detail: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    /// Unique constraint violation (SQLITE_CONSTRAINT_UNIQUE).
+    /// ISS-015: Distinguish UNIQUE from other constraints.
+    UniqueViolation {
+        op: StorageOp,
+        detail: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    /// Check constraint violation (SQLITE_CONSTRAINT_CHECK).
+    /// ISS-015: Distinguish CHECK from other constraints.
+    CheckViolation {
+        op: StorageOp,
+        detail: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    /// Not-null constraint violation (SQLITE_CONSTRAINT_NOTNULL).
+    /// ISS-015: Distinguish NOT NULL from other constraints.
+    NotNullViolation {
         op: StorageOp,
         detail: String,
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -103,7 +125,10 @@ impl StorageError {
             | StorageError::InvalidData { op, .. }
             | StorageError::Corruption { op, .. }
             | StorageError::DatabaseLocked { op, .. }
-            | StorageError::ForeignKeyViolation { op, .. } => *op,
+            | StorageError::ForeignKeyViolation { op, .. }
+            | StorageError::UniqueViolation { op, .. }
+            | StorageError::CheckViolation { op, .. }
+            | StorageError::NotNullViolation { op, .. } => *op,
             StorageError::SchemaMismatch { .. } => StorageOp::Migrate,
         }
     }
@@ -119,7 +144,10 @@ impl StorageError {
             | StorageError::InvalidData { detail, .. }
             | StorageError::Corruption { detail, .. }
             | StorageError::DatabaseLocked { detail, .. }
-            | StorageError::ForeignKeyViolation { detail, .. } => detail,
+            | StorageError::ForeignKeyViolation { detail, .. }
+            | StorageError::UniqueViolation { detail, .. }
+            | StorageError::CheckViolation { detail, .. }
+            | StorageError::NotNullViolation { detail, .. } => detail,
             StorageError::SchemaMismatch { expected, .. } => expected,
         }
     }
@@ -155,6 +183,15 @@ impl fmt::Display for StorageError {
             StorageError::ForeignKeyViolation { op, detail, .. } => {
                 write!(f, "foreign key violation during {op}: {detail}")
             }
+            StorageError::UniqueViolation { op, detail, .. } => {
+                write!(f, "unique constraint violation during {op}: {detail}")
+            }
+            StorageError::CheckViolation { op, detail, .. } => {
+                write!(f, "check constraint violation during {op}: {detail}")
+            }
+            StorageError::NotNullViolation { op, detail, .. } => {
+                write!(f, "not-null constraint violation during {op}: {detail}")
+            }
             StorageError::SchemaMismatch { expected, found } => {
                 write!(f, "schema version mismatch: expected {expected}, found {found}")
             }
@@ -173,7 +210,10 @@ impl std::error::Error for StorageError {
             | StorageError::InvalidData { source, .. }
             | StorageError::Corruption { source, .. }
             | StorageError::DatabaseLocked { source, .. }
-            | StorageError::ForeignKeyViolation { source, .. } => source,
+            | StorageError::ForeignKeyViolation { source, .. }
+            | StorageError::UniqueViolation { source, .. }
+            | StorageError::CheckViolation { source, .. }
+            | StorageError::NotNullViolation { source, .. } => source,
             StorageError::SchemaMismatch { .. } => return None,
         };
         src.as_ref().map(|e| e.as_ref() as &(dyn std::error::Error + 'static))

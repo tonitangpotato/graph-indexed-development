@@ -30,10 +30,38 @@ impl From<rusqlite::Error> for StorageError {
                     source: Some(Box::new(err)),
                 }
             }
+            // ISS-015: Distinguish constraint types via extended_code
             rusqlite::Error::SqliteFailure(e, _)
-                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
             {
                 StorageError::ForeignKeyViolation {
+                    op: StorageOp::Write,
+                    detail: err.to_string(),
+                    source: Some(Box::new(err)),
+                }
+            }
+            rusqlite::Error::SqliteFailure(e, _)
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                StorageError::UniqueViolation {
+                    op: StorageOp::Write,
+                    detail: err.to_string(),
+                    source: Some(Box::new(err)),
+                }
+            }
+            rusqlite::Error::SqliteFailure(e, _)
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK =>
+            {
+                StorageError::CheckViolation {
+                    op: StorageOp::Write,
+                    detail: err.to_string(),
+                    source: Some(Box::new(err)),
+                }
+            }
+            rusqlite::Error::SqliteFailure(e, _)
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL =>
+            {
+                StorageError::NotNullViolation {
                     op: StorageOp::Write,
                     detail: err.to_string(),
                     source: Some(Box::new(err)),
@@ -59,6 +87,36 @@ pub enum Direction {
     Incoming,
     /// Follow edges in both directions.
     Both,
+}
+
+
+// ── RAII Foreign Key Guard (ISS-015) ──────────────────────
+
+/// RAII guard that disables foreign keys on creation and re-enables them on drop.
+/// Guarantees FK re-enablement on all exit paths (success, error, panic).
+///
+/// Holds a reference to the `RefCell<Connection>` rather than a borrow of the
+/// `Connection` itself, so that the caller can still obtain a mutable borrow
+/// for `conn.transaction()` while the guard is alive.
+struct FkGuard<'a> {
+    cell: &'a RefCell<Connection>,
+}
+
+impl<'a> FkGuard<'a> {
+    /// Disable foreign keys. Returns Err if the PRAGMA fails.
+    fn new(cell: &'a RefCell<Connection>) -> Result<Self, rusqlite::Error> {
+        cell.borrow().execute_batch("PRAGMA foreign_keys = OFF")?;
+        Ok(Self { cell })
+    }
+}
+
+impl<'a> Drop for FkGuard<'a> {
+    fn drop(&mut self) {
+        // Re-enable FK; log error on failure but don't panic in Drop
+        if let Err(e) = self.cell.borrow().execute_batch("PRAGMA foreign_keys = ON") {
+            tracing::error!("Failed to re-enable foreign_keys in FkGuard::drop: {}", e);
+        }
+    }
 }
 
 // ── SqliteStorage struct ───────────────────────────────────
@@ -175,12 +233,20 @@ impl SqliteStorage {
     /// Used by the migration pipeline to insert nodes and edges atomically,
     /// even when edges reference nodes that don't exist (dangling edges are
     /// migrated as warnings per GOAL-2.9).
+    ///
+    /// ISS-015: PRAGMA foreign_keys must be set OUTSIDE a transaction. We use
+    /// FkGuard RAII to guarantee FK re-enablement on all exit paths.
     pub fn execute_migration_batch(&self, ops: &[BatchOp]) -> Result<(), StorageError> {
+        // ISS-015: Disable FK enforcement BEFORE starting transaction.
+        // FkGuard borrows the RefCell transiently, so borrow_mut() below is fine.
+        let _fk_guard = FkGuard::new(&self.conn).map_err(|e| StorageError::Sqlite {
+            op: StorageOp::Migrate,
+            detail: format!("failed to disable foreign_keys: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+        
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
-
-        // Disable FK enforcement for migration
-        tx.execute_batch("PRAGMA foreign_keys = OFF")?;
 
         for op in ops {
             match op {
@@ -202,11 +268,9 @@ impl SqliteStorage {
             }
         }
 
-        // Re-enable FK enforcement
-        tx.execute_batch("PRAGMA foreign_keys = ON")?;
-
         tx.commit()?;
-        tracing::debug!(ops_count = ops.len(), "execute_migration_batch committed (FK-off)");
+        // FkGuard re-enables FK on drop
+        tracing::debug!(ops_count = ops.len(), "execute_migration_batch committed (FK-off via RAII guard)");
         Ok(())
     }
 
@@ -1571,7 +1635,7 @@ mod tests {
         let s = temp_storage();
         let mut n1 = Node::new("n1", "Owned");
         n1.owner = Some("potato".into());
-        let mut n2 = Node::new("n2", "Unowned");
+        let n2 = Node::new("n2", "Unowned");
         s.put_node(&n1).unwrap();
         s.put_node(&n2).unwrap();
 
@@ -1952,19 +2016,105 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_batch_fk_disabled_bug() {
-        // BUG: execute_migration_batch sets PRAGMA foreign_keys=OFF inside
-        // a transaction, but SQLite ignores FK pragma changes within transactions.
-        // This means dangling edges still cause FK violations.
-        // This test documents the current (buggy) behavior.
+    fn test_migration_batch_allows_dangling_edges() {
+        // ISS-015: After fix, execute_migration_batch correctly disables FK,
+        // allowing dangling edges (needed for migration pipeline per GOAL-2.9).
         let s = temp_storage();
         let ops = vec![
             BatchOp::PutNode(Node::new("a", "A")),
             BatchOp::AddEdge(Edge::new("a", "nonexistent", "depends_on")),
         ];
-        // Currently fails due to the PRAGMA-in-transaction bug
-        let result = s.execute_migration_batch(&ops);
-        assert!(result.is_err(), "FK violation expected — PRAGMA foreign_keys=OFF is no-op inside a transaction");
+        // Now succeeds: FK enforcement is disabled via FkGuard BEFORE transaction
+        s.execute_migration_batch(&ops).unwrap();
+        
+        // Verify edge was inserted despite dangling reference
+        assert_eq!(s.get_edge_count().unwrap(), 1);
+        let edges = s.get_edges("a").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, "nonexistent");
+    }
+
+    #[test]
+    fn test_migration_batch_fk_reenabled_after_success() {
+        // ISS-015: FK enforcement must be re-enabled after successful batch
+        let s = temp_storage();
+        let ops = vec![
+            BatchOp::PutNode(Node::new("a", "A")),
+            BatchOp::AddEdge(Edge::new("a", "phantom", "depends_on")),
+        ];
+        s.execute_migration_batch(&ops).unwrap();
+        
+        // After batch completes, normal operations should enforce FK again
+        let result = s.add_edge(&Edge::new("a", "ghost", "calls"));
+        assert!(result.is_err(), "FK should be re-enabled after migration batch");
+        
+        // Verify error is ForeignKeyViolation (ISS-015: proper error classification)
+        match result.unwrap_err() {
+            StorageError::ForeignKeyViolation { .. } => {}
+            other => panic!("expected ForeignKeyViolation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_migration_batch_fk_reenabled_after_error() {
+        // ISS-015: FK enforcement must be re-enabled even if batch fails
+        let s = temp_storage();
+        let ops = vec![
+            BatchOp::PutNode(Node::new("a", "A")),
+            // Cause an error with invalid JSON in metadata
+            BatchOp::SetMetadata("nonexistent_node".to_string(), Default::default()),
+        ];
+        let _ = s.execute_migration_batch(&ops); // may fail
+        
+        // FK should be re-enabled regardless
+        s.put_node(&Node::new("b", "B")).unwrap();
+        let result = s.add_edge(&Edge::new("b", "ghost", "calls"));
+        assert!(result.is_err(), "FK should be re-enabled even after failed batch");
+    }
+
+    #[test]
+    fn test_migration_batch_fk_guard_on_panic() {
+        // ISS-015: RAII guard must re-enable FK even on panic unwind.
+        // We cannot inject a panic into migration_batch directly, so instead
+        // we exercise FkGuard's Drop path the same way a panic would — by
+        // letting the guard go out of scope inside a panicking closure that
+        // catch_unwind absorbs — then verify FK is back ON afterwards.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let s = temp_storage();
+
+        // Sanity: FK is ON before the test.
+        let fk_before: i64 = s
+            .conn
+            .borrow()
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_before, 1, "FK should start ON");
+
+        // Run a closure that creates an FkGuard then panics. Drop must run on unwind.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = FkGuard::new(&s.conn).expect("FkGuard::new should succeed");
+            // FK should now be OFF while the guard is alive.
+            let fk_during: i64 = s
+                .conn
+                .borrow()
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(fk_during, 0, "FK should be OFF while FkGuard is alive");
+            panic!("simulated panic during batch");
+        }));
+
+        // Panic was caught; assert that Drop re-enabled FK.
+        assert!(result.is_err(), "closure should have panicked");
+        let fk_after: i64 = s
+            .conn
+            .borrow()
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            fk_after, 1,
+            "FK must be re-enabled by FkGuard::drop on panic unwind"
+        );
     }
 
     #[test]
