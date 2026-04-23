@@ -35,6 +35,7 @@ tree-sitter-javascript = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 sha2 = { workspace = true }
 deunicode = "1.6"
+thiserror = "1"
 
 # Optional: Infomap community detection for module grouping advice
 infomap-rs = { version = "0.1.1", optional = true }

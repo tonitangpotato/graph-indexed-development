@@ -23,6 +23,7 @@ pub mod composer;
 pub mod state_machine;
 pub mod v2_executor;
 pub mod gating;
+pub mod work_unit;
 
 // Re-export key types
 pub use definition::{
@@ -47,6 +48,7 @@ pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
 pub use composer::{compose_ritual, ProjectState as ComposerProjectState, ProjectLanguage};
 pub use v2_executor::{V2Executor, V2ExecutorConfig, NotifyFn, run_ritual, build_triage_prompt};
 pub use gating::{GatingConfig, GatingResult, CommandPattern, PatternType, check_gating, load_gating_config, save_gating_config};
+pub use work_unit::{WorkUnit, WorkUnitResolver, RegistryResolver, resolve_and_validate, validate_resolved_root, reject_target_root};
 pub use state_machine::{
     RitualPhase as V2Phase,
     RitualState as V2State,

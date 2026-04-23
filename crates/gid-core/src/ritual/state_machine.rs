@@ -104,8 +104,17 @@ pub struct RitualState {
     /// The target project directory for this ritual.
     /// Set at ritual start time. All file operations (detect, skill, verify) use this path.
     /// If None, falls back to the runner's workspace root.
+    ///
+    /// **Deprecated for new code** — prefer `work_unit` (ISS-029). This field
+    /// is populated as a resolved cache when `work_unit` is set, and is
+    /// maintained for state-file backwards compatibility.
     #[serde(default)]
     pub target_root: Option<String>,
+    /// ISS-029: typed work-unit specification. When set, `target_root` is
+    /// derived from this via the registry resolver. New callers MUST set this;
+    /// `target_root`-only state files are still loadable for backwards compat.
+    #[serde(default)]
+    pub work_unit: Option<super::work_unit::WorkUnit>,
     pub project: Option<ProjectState>,
     pub strategy: Option<ImplementStrategy>,
     pub verify_retries: u32,
@@ -180,6 +189,7 @@ impl RitualState {
             phase: RitualPhase::Idle,
             task: String::new(),
             target_root: None,
+            work_unit: None,
             project: None,
             strategy: None,
             verify_retries: 0,
@@ -215,6 +225,22 @@ impl RitualState {
 
     pub fn with_target_root(mut self, root: String) -> Self {
         self.target_root = Some(root);
+        self
+    }
+
+    /// ISS-029: set both the typed work unit and its resolved `target_root`.
+    ///
+    /// Prefer this over `with_target_root` for new code — it records the
+    /// explicit intent (which project + which issue/feature/task) so the
+    /// information survives state-file round-trips and can be re-resolved
+    /// if a project path changes.
+    pub fn with_work_unit(
+        mut self,
+        unit: super::work_unit::WorkUnit,
+        resolved_root: std::path::PathBuf,
+    ) -> Self {
+        self.target_root = Some(resolved_root.to_string_lossy().into_owned());
+        self.work_unit = Some(unit);
         self
     }
 
