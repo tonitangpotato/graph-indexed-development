@@ -567,6 +567,55 @@ enum Commands {
         #[arg(long)]
         max_cluster_size: Option<usize>,
     },
+
+    /// Manage the project registry (which projects exist on this machine).
+    ///
+    /// Registry file: `$XDG_CONFIG_HOME/gid/projects.yml` (or `~/.config/gid/projects.yml`).
+    /// Resolves ISS-020: eliminates project path guessing in cross-project sessions.
+    Project {
+        #[command(subcommand)]
+        action: ProjectCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    /// List all registered projects.
+    List {
+        /// Include archived projects in the output.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Resolve a project name or alias to its canonical path. Exits 1 if not found.
+    Resolve {
+        /// Project name or alias (case-insensitive).
+        ident: String,
+    },
+    /// Register a new project. Validates that <path>/.gid/ exists.
+    Add {
+        /// Canonical name (must be unique).
+        name: String,
+        /// Absolute path to the project root.
+        path: PathBuf,
+        /// Comma-separated aliases (e.g. "engram-ai,ea").
+        #[arg(long)]
+        aliases: Option<String>,
+        /// Default git branch (informational).
+        #[arg(long)]
+        default_branch: Option<String>,
+        /// Comma-separated tags.
+        #[arg(long)]
+        tags: Option<String>,
+        /// Optional free-form note.
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// Remove a project by its canonical name. Aliases are not accepted here (safety).
+    Remove {
+        name: String,
+    },
+    /// Print the path to the registry file (creates it if missing is your job, not ours).
+    Where,
 }
 
 #[derive(Subcommand)]
@@ -1020,6 +1069,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cmd_infer(&ctx, &level, phase.as_deref(), &model, no_llm, dry_run, &format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size, cli.json))
         }
+        Commands::Project { action } => cmd_project(action, cli.json),
     }
 }
 
@@ -4423,4 +4473,173 @@ async fn cmd_infer(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Project Registry Commands (ISS-028)
+// =============================================================================
+
+fn cmd_project(action: ProjectCommands, json: bool) -> Result<()> {
+    use gid_core::project_registry::{Registry, ProjectEntry, default_registry_path};
+
+    let reg_path = default_registry_path()
+        .context("could not determine registry path (no $HOME and no $XDG_CONFIG_HOME)")?;
+
+    match action {
+        ProjectCommands::Where => {
+            if json {
+                println!("{}", serde_json::json!({ "path": reg_path }));
+            } else {
+                println!("{}", reg_path.display());
+            }
+            Ok(())
+        }
+
+        ProjectCommands::List { all } => {
+            let reg = Registry::load_from(&reg_path)
+                .with_context(|| format!("loading registry at {}", reg_path.display()))?;
+            let entries: Vec<_> = reg.list(all).collect();
+            if json {
+                let items: Vec<_> = entries.iter().map(|p| {
+                    serde_json::json!({
+                        "name": p.name,
+                        "path": p.path,
+                        "aliases": p.aliases,
+                        "default_branch": p.default_branch,
+                        "tags": p.tags,
+                        "archived": p.archived,
+                        "notes": p.notes,
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+                return Ok(());
+            }
+            if entries.is_empty() {
+                eprintln!("No projects registered.");
+                eprintln!("  Registry: {}", reg_path.display());
+                eprintln!("  Add one with:  gid project add <name> <path>");
+                return Ok(());
+            }
+            println!("Registered projects ({}) at {}:",
+                     entries.len(), reg_path.display());
+            for p in entries {
+                let arch = if p.archived { " [archived]" } else { "" };
+                print!("  {}{}", p.name, arch);
+                if !p.aliases.is_empty() {
+                    print!(" (aka: {})", p.aliases.join(", "));
+                }
+                println!();
+                println!("    path: {}", p.path.display());
+                if let Some(b) = &p.default_branch {
+                    println!("    branch: {}", b);
+                }
+                if !p.tags.is_empty() {
+                    println!("    tags: {}", p.tags.join(", "));
+                }
+                if let Some(n) = &p.notes {
+                    println!("    notes: {}", n);
+                }
+            }
+            Ok(())
+        }
+
+        ProjectCommands::Resolve { ident } => {
+            let reg = Registry::load_from(&reg_path)
+                .with_context(|| format!("loading registry at {}", reg_path.display()))?;
+            match reg.resolve(&ident) {
+                Ok(entry) => {
+                    if json {
+                        println!("{}", serde_json::json!({
+                            "name": entry.name,
+                            "path": entry.path,
+                            "aliases": entry.aliases,
+                        }));
+                    } else {
+                        // Print the canonical path to stdout — this is the contract
+                        // for consumers that shell out to `gid project resolve <x>`.
+                        println!("{}", entry.path.display());
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    // Non-zero exit with a helpful message on stderr.
+                    eprintln!("Error: {}", e);
+                    if matches!(e, gid_core::project_registry::RegistryError::NotFound(_)) {
+                        eprintln!("  Registry: {}", reg_path.display());
+                        eprintln!("  Register it with:  gid project add <name> <path>");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        ProjectCommands::Add { name, path, aliases, default_branch, tags, notes } => {
+            let mut reg = Registry::load_from(&reg_path)
+                .with_context(|| format!("loading registry at {}", reg_path.display()))?;
+
+            let aliases_vec: Vec<String> = aliases
+                .map(|s| s.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect())
+                .unwrap_or_default();
+            let tags_vec: Vec<String> = tags
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+                .unwrap_or_default();
+
+            // Canonicalize path (absolute, resolve symlinks) to avoid registering
+            // the same project twice with different path forms.
+            let abs_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()?.join(&path)
+            };
+            let canon = abs_path.canonicalize()
+                .with_context(|| format!("could not canonicalize path: {}", abs_path.display()))?;
+
+            reg.add(ProjectEntry {
+                name: name.clone(),
+                path: canon.clone(),
+                aliases: aliases_vec,
+                default_branch,
+                tags: tags_vec,
+                archived: false,
+                notes,
+            }).with_context(|| format!("failed to add project '{}'", name))?;
+
+            reg.save_to(&reg_path)
+                .with_context(|| format!("saving registry to {}", reg_path.display()))?;
+
+            if json {
+                println!("{}", serde_json::json!({
+                    "ok": true,
+                    "name": name,
+                    "path": canon,
+                    "registry": reg_path,
+                }));
+            } else {
+                eprintln!("✓ Added '{}' → {}", name, canon.display());
+                eprintln!("  Registry: {}", reg_path.display());
+            }
+            Ok(())
+        }
+
+        ProjectCommands::Remove { name } => {
+            let mut reg = Registry::load_from(&reg_path)
+                .with_context(|| format!("loading registry at {}", reg_path.display()))?;
+            let removed = reg.remove(&name)
+                .with_context(|| format!("removing '{}' from registry", name))?;
+            reg.save_to(&reg_path)
+                .with_context(|| format!("saving registry to {}", reg_path.display()))?;
+            if json {
+                println!("{}", serde_json::json!({
+                    "ok": true,
+                    "removed": {
+                        "name": removed.name,
+                        "path": removed.path,
+                    },
+                }));
+            } else {
+                eprintln!("✓ Removed '{}' (was: {})", removed.name, removed.path.display());
+            }
+            Ok(())
+        }
+    }
 }
