@@ -16,7 +16,8 @@ packages/*/dist/
 .DS_Store
 
 # Internal docs (not for public repo)
-docs/
+/docs/
 .gid/code-graph.json
 .gid/extract-meta.json
+.gid/rituals/*.json
 **/execution-log.jsonl
