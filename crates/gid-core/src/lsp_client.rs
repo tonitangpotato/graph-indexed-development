@@ -90,6 +90,10 @@ pub struct LspRefinementStats {
     pub failed: usize,
     /// No LSP available for this language, kept tree-sitter edge
     pub skipped: usize,
+    /// LSP returned a definition but `find_closest_node` could not locate a
+    /// precise target within the window. The edge is left at its tree-sitter
+    /// state (not refined, not removed). See ISS-016.
+    pub refinement_skipped: usize,
     /// Language servers that were successfully used
     pub languages_used: Vec<String>,
     /// Language servers needed but not installed
@@ -1166,6 +1170,20 @@ pub fn find_closest_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ISS-016: Ensure the new `refinement_skipped` counter exists, defaults to
+    /// zero, and is surfaced in the Debug output so operators can observe it.
+    #[test]
+    fn test_refinement_stats_has_refinement_skipped_field() {
+        let stats = LspRefinementStats::default();
+        assert_eq!(stats.refinement_skipped, 0);
+        let dbg = format!("{:?}", stats);
+        assert!(
+            dbg.contains("refinement_skipped"),
+            "Debug output missing refinement_skipped: {}",
+            dbg
+        );
+    }
 
     #[test]
     fn test_extension_to_language_id() {

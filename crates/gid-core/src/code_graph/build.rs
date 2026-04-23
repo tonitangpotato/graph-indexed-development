@@ -513,12 +513,20 @@ impl CodeGraph {
                                 edges_to_update.push((idx, Some(target_id), 1.0));
                                 stats.refined += 1;
                             } else {
-                                edges_to_update.push((idx, None, edge.confidence.max(0.6)));
-                                stats.refined += 1;
+                                // ISS-016: LSP found the definition file but no
+                                // node matches the line (window too narrow, or
+                                // the def is at a position we don't index).
+                                // Don't produce a dangling `target=None` update
+                                // — leave the edge at its tree-sitter state so
+                                // a later pass (or baseline) can handle it.
+                                stats.refinement_skipped += 1;
                             }
                         } else {
-                            edges_to_update.push((idx, None, edge.confidence.max(0.6)));
-                            stats.refined += 1;
+                            // ISS-016: LSP resolved to a file we have no index
+                            // for (external crate, generated code, etc.).
+                            // Skip refinement — don't pollute the graph with
+                            // a fabricated target.
+                            stats.refinement_skipped += 1;
                         }
                     }
                     Ok(None) => {

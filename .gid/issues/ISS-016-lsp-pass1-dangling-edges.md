@@ -4,9 +4,26 @@
 **发现者**: potato + RustClaw
 **组件**: gid-core, `code_graph/build.rs` (LSP refinement Pass 1)
 **优先级**: P2 (cleanup — 不阻塞功能，但污染图质量)
-**状态**: open
+**状态**: resolved (2026-04-23)
 **类型**: cleanup / correctness
 **标签**: lsp, code-graph, dangling-edge
+
+---
+
+## 解决记录 (2026-04-23)
+
+采用 **Option A**（skip update on miss）。两条降级分支不再 push `(idx, None, ...)` update，而是增加 `stats.refinement_skipped` 计数后直接跳过。原 tree-sitter edge 保持不变，由 baseline/Pass 2 处理。
+
+**改动**:
+- `crates/gid-core/src/lsp_client.rs` — `LspRefinementStats` 新增 `refinement_skipped: usize` 字段
+- `crates/gid-core/src/code_graph/build.rs:514-527` — 两条降级分支改为 skip + stat
+- `crates/gid-cli/src/main.rs:2147` — CLI 打印加入 `refinement_skipped`
+- 新增单元测试 `test_refinement_stats_has_refinement_skipped_field`
+
+**验证** (TypeScript 项目 xinfluencer/website, typescript-language-server):
+- LSP refinement: 16 refined, 0 removed, 12 failed, 0 skipped, **0 refinement_skipped**
+- `SELECT COUNT(*) FROM edges WHERE to_node NOT IN (SELECT id FROM nodes)` → **0**
+- 全项目 `cargo test --workspace --all-features` 1028/1028 pass
 
 ---
 

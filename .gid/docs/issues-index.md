@@ -518,7 +518,7 @@ SQLite `PRAGMA foreign_keys` 只能在事务外改；事务内静默失效。现
 
 ---
 
-## ISS-016 [cleanup] [P2] [open]
+## ISS-016 [cleanup] [P2] [resolved 2026-04-23]
 **LSP Pass 1 在 `find_closest_node` miss 时主动产出 dangling edges**
 
 **发现日期**: 2026-04-20

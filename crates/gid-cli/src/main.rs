@@ -2143,11 +2143,12 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
             Ok(stats) => {
                 if !json_flag {
                     eprintln!(
-                        "LSP refinement: {} refined, {} removed, {} failed, {} skipped (languages: {})",
+                        "LSP refinement: {} refined, {} removed, {} failed, {} skipped, {} refinement_skipped (languages: {})",
                         stats.refined,
                         stats.removed,
                         stats.failed,
                         stats.skipped,
+                        stats.refinement_skipped,
                         if stats.languages_used.is_empty() {
                             "none".to_string()
                         } else {
