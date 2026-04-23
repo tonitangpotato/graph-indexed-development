@@ -138,6 +138,12 @@ pub struct RitualState {
     pub transitions: Vec<TransitionRecord>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// OS process ID of the ritual adapter/runner that last wrote this state.
+    /// Consumers (e.g. `RitualRegistry` in downstream apps) use this to detect
+    /// whether the current process is the executor of a SingleLlm ritual.
+    /// Populated by the runner on every `save_state` via `std::process::id()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_pid: Option<u32>,
 }
 
 fn default_ritual_id() -> String {
@@ -203,6 +209,7 @@ impl RitualState {
             started_at: now,
             triage_size: None,
             updated_at: now,
+            adapter_pid: None,
         }
     }
 
@@ -241,6 +248,14 @@ impl RitualState {
     ) -> Self {
         self.target_root = Some(resolved_root.to_string_lossy().into_owned());
         self.work_unit = Some(unit);
+        self
+    }
+
+    /// Set the adapter PID to the current process.
+    /// Called by runners so downstream consumers can detect
+    /// whether they are executing the ritual themselves.
+    pub fn with_current_adapter_pid(mut self) -> Self {
+        self.adapter_pid = Some(std::process::id());
         self
     }
 
