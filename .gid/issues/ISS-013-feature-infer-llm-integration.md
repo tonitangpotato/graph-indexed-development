@@ -1,5 +1,9 @@
 # ISS-013: Feature Infer LLM Integration (CliLlm Deadlock)
 
+**Status:** open
+**Reported:** ~2026-04-10
+**Note**: ISS-013 number was previously used for SQLite backend extract issue (closed in commit a78b49b 2026-04-09, see issues-index.md). This file describes a separate later issue with the same number.
+
 ## Problem
 
 `gid infer --level feature` hangs when called from RustClaw. The `CliLlm` implementation shells out to `claude` CLI in a detached subprocess — this deadlocks in non-tty environments (no stdin, no interactive prompt).

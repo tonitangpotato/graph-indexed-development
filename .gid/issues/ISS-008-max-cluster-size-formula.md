@@ -1,6 +1,6 @@
 # ISS-008: max_cluster_size auto-formula too lenient for large projects
 
-**Status**: ✅ Fixed  
+**Status:** closed
 **Severity**: Design  
 **Discovered**: 2026-04-10, during Claude Code validation (1902 files → 102 components)  
 **Fixed**: 2026-04-10  

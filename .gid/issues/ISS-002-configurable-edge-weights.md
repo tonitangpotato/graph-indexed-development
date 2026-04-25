@@ -1,5 +1,8 @@
 # ISS-002: Clustering Edge Weights Should Be Configurable
 
+**Status:** open
+**Reported:** 2026-04-05
+
 ## Problem
 
 `build_network()` in `infer/clustering.rs` hardcodes edge type weights:

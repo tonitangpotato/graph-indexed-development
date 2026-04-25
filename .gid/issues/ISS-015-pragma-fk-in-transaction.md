@@ -4,8 +4,10 @@
 **发现者**: potato + RustClaw
 **组件**: gid-core, `storage/sqlite.rs` (`execute_migration_batch`)
 **优先级**: P0 (blocker)
-**状态**: open
+**Status:** closed
 **类型**: bug
+**Fix commit**: 941c132 — `fix(storage): ISS-015 — move PRAGMA foreign_keys out of transaction + distinguish constraint types`
+**Closed**: 2026-04-25 (status sync — fix shipped earlier, index was stale)
 **标签**: sqlite, storage, lsp, migration, root-fix
 
 ---

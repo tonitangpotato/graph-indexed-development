@@ -1,5 +1,7 @@
 # ISS-005: Directory Co-location Signal Absent from Clustering Network
 
+**Status:** done
+
 ## Problem
 
 Files in the same directory have a strong prior probability of belonging to the same module, but this signal is completely absent from the network that Infomap clusters. When import/call edges are sparse, Infomap has no fallback signal — files with few explicit dependencies become orphans even when their directory placement clearly indicates module membership.

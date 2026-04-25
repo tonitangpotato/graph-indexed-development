@@ -1,6 +1,6 @@
 # ISS-029: gid-core ritual launcher accepts `work_unit` only, rejects `target_root`
 
-**Status**: done
+**Status:** done
 **Created**: 2026-04-23
 **Reporter**: potato
 **Severity**: medium

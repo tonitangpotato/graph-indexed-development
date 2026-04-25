@@ -1,5 +1,8 @@
 # ISS-003 Investigation: Root Cause Analysis
 
+**Status:** companion-doc (parent: ISS-003, status: done — see ISS-003-clustering-fragmentation.md)
+**Type:** investigation report (not a separate issue)
+
 ## Executive Summary
 
 The 69% single-file fragmentation has **three interacting root causes**, not one. The current orphan reassignment logic is fundamentally flawed — it only checks outgoing edges, creates singleton "misc" clusters, and processes orphans sequentially without propagation. But even fixing the reassignment won't help if Infomap itself over-fragments because of teleportation and edge weight calibration issues.

@@ -1,8 +1,7 @@
 # ISS-012: Edge Confidence Ignored in Clustering — LSP and Heuristic Edges Weighted Identically
 
-## Priority: P0
-
-## Status: ✅ Fixed (uncommitted)
+**Status:** open (fix in stash@{1} — needs review/commit, see 2026-04-25 sweep notes)
+**Priority:** P0
 
 ## Problem
 

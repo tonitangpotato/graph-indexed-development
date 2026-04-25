@@ -1,6 +1,6 @@
 # ISS-009: Clustering input graph lacks co-citation edges — root cause of monolithic utility clusters
 
-**Status**: 🔴 Open  
+**Status:** open
 **Severity**: Architecture (root cause)  
 **Discovered**: 2026-04-10, after 6+ rounds of debugging clustering quality  
 **Supersedes**: ISS-006 (split_mega fallback), ISS-008 (max_cluster_size formula) — these were symptom-level fixes

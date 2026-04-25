@@ -1,5 +1,8 @@
 # ISS-001: CodeNode Test Helper / Builder Pattern Refactor
 
+**Status:** open
+**Reported:** 2026-04-02
+
 ## Problem
 
 CodeNode struct literal is used directly in ~50+ places across test files. Adding a new field requires updating every single instantiation manually. This happened when adding `visibility`, `lang`, `body_hash`, `end_line`, `complexity` — required touching 4-5 test files with dozens of changes each.

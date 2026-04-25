@@ -1,8 +1,10 @@
 # ISS-007: Hardcoded co-location threshold skips large directories
 
+**Status:** likely-superseded
 **Severity**: Important  
 **Component**: `crates/gid-core/src/infer/clustering.rs`  
 **Reported**: 2026-04-10  
+**Note**: Original number reused — see issues-index.md ISS-007 (closed 2026-04-06, ghost nodes) for earlier issue with same ID. The hardcoded `MAX_DIR_SIZE_FOR_COLOCATION = 50` constant referenced below appears to have been replaced/removed during co-location refactor (see `WEIGHT_DIR_COLOCATION` + isolation gating). Needs verification before close.
 
 ## Problem
 

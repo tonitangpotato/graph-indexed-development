@@ -1,6 +1,6 @@
 # ISS-028: gid CLI `project` subcommand + `~/.config/gid/projects.yml`
 
-**Status**: open
+**Status:** open
 **Created**: 2026-04-23
 **Reporter**: potato
 **Severity**: medium

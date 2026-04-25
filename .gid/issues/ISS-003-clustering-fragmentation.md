@@ -1,5 +1,7 @@
 # ISS-003: Orphan Reassignment Logic Has Four Bugs → 69% Single-File Components
 
+**Status:** done
+
 ## Problem
 
 Running `gid infer` on a 1,902-file codebase (Claude Code) produced 339 components with 236 single-file clusters (69%). The **direct cause** is four bugs in the orphan reassignment logic in `clustering.rs:315-365` — small communities filtered by `min_community_size` are supposed to be merged into neighboring clusters, but the reassignment code is fundamentally broken.

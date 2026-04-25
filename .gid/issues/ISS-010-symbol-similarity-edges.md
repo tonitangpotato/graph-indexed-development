@@ -1,6 +1,6 @@
 # ISS-010: Symbol Name Similarity Edges — Semantic Signal Missing from Clustering Input
 
-**Status**: 🔴 Open  
+**Status:** open
 **Severity**: Architecture (missing signal dimension)  
 **Discovered**: 2026-04-10  
 **Related**: ISS-009 (co-citation edges), ISS-005 (directory co-location)

@@ -1,8 +1,10 @@
 # ISS-006: ID Collision in split_mega_clusters
 
+**Status:** open
 **Severity**: Critical  
 **Component**: `crates/gid-core/src/infer/clustering.rs`  
 **Reported**: 2026-04-10  
+**Note**: This number was reused — see issues-index.md ISS-006 (closed 2026-04-05) for the earlier issue with the same ID.
 
 ## Problem
 

@@ -1,5 +1,7 @@
 # ISS-004: Infomap Teleportation Rate Too High for Code Graphs
 
+**Status:** done
+
 ## Problem
 
 The default teleportation rate `tau=0.15` in Infomap causes over-fragmentation on code dependency graphs. The random walker escapes communities too easily, reducing Infomap's ability to detect module structure.

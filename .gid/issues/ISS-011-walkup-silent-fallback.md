@@ -1,8 +1,7 @@
 # ISS-011: Walk-up 机制在 explicit project path 不存在时应报错而非静默回退
 
-## Priority: P1
-
-## Status: Open
+**Status:** open
+**Priority:** P1
 
 ## Problem
 

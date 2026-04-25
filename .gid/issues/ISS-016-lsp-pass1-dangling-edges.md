@@ -4,7 +4,7 @@
 **发现者**: potato + RustClaw
 **组件**: gid-core, `code_graph/build.rs` (LSP refinement Pass 1)
 **优先级**: P2 (cleanup — 不阻塞功能，但污染图质量)
-**状态**: resolved (2026-04-23)
+**Status:** closed (2026-04-23)
 **类型**: cleanup / correctness
 **标签**: lsp, code-graph, dangling-edge
 
