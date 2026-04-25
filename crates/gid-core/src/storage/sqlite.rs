@@ -252,6 +252,13 @@ impl SqliteStorage {
             match op {
                 BatchOp::PutNode(node) => put_node_on(&tx, node)?,
                 BatchOp::DeleteNode(id) => {
+                    // ISS-037: DeleteNode must remove incident edges at the op level.
+                    // FkGuard disables FK enforcement here, so the engine cannot cascade.
+                    // A graph delete = remove vertex AND every incident edge.
+                    tx.execute(
+                        "DELETE FROM edges WHERE from_node = ? OR to_node = ?",
+                        params![id, id],
+                    )?;
                     tx.execute("DELETE FROM nodes WHERE id = ?", params![id])?;
                 }
                 BatchOp::AddEdge(edge) => add_edge_on(&tx, edge)?,
@@ -916,6 +923,13 @@ impl GraphStorage for SqliteStorage {
                     put_node_on(&tx, node)?;
                 }
                 BatchOp::DeleteNode(id) => {
+                    // ISS-037: DeleteNode is responsible for V *and* E.
+                    // ISS-033 showed FK cascade is unreliable across schema/connection
+                    // setups; explicit edge cleanup is the correct semantic contract.
+                    tx.execute(
+                        "DELETE FROM edges WHERE from_node = ? OR to_node = ?",
+                        params![id, id],
+                    )?;
                     tx.execute("DELETE FROM nodes WHERE id = ?", params![id])?;
                 }
                 BatchOp::AddEdge(edge) => {
@@ -2130,6 +2144,84 @@ mod tests {
         assert!(result.is_err());
         // No edge should have been inserted (transaction rolled back)
         assert_eq!(s.get_edge_count().unwrap(), 0);
+    }
+
+    // ── ISS-037: DeleteNode must remove incident edges ──────────────────
+
+    /// Helper: count orphan edges (edges referencing a missing node).
+    fn count_orphan_edges(s: &SqliteStorage) -> i64 {
+        let conn = s.conn.borrow();
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges
+             WHERE from_node NOT IN (SELECT id FROM nodes)
+                OR to_node   NOT IN (SELECT id FROM nodes)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_iss037_delete_node_in_execute_batch_removes_incident_edges() {
+        // Setup: A→B, B→C. Delete B. Both edges must be gone, no orphans.
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.put_node(&Node::new("c", "C")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("b", "c", "depends_on")).unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 2);
+
+        s.execute_batch(&[BatchOp::DeleteNode("b".into())]).unwrap();
+
+        // B is gone, A and C remain
+        assert!(s.get_node("b").unwrap().is_none());
+        assert!(s.get_node("a").unwrap().is_some());
+        assert!(s.get_node("c").unwrap().is_some());
+        // Both edges referencing B must be gone
+        assert_eq!(s.get_edge_count().unwrap(), 0,
+            "all edges incident to deleted node B must be removed");
+        // No orphans
+        assert_eq!(count_orphan_edges(&s), 0,
+            "no edge may reference a non-existent node");
+    }
+
+    #[test]
+    fn test_iss037_delete_node_in_migration_batch_removes_incident_edges() {
+        // FK-disabled path (FkGuard). Engine cannot cascade — op must clean up.
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.put_node(&Node::new("c", "C")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("b", "c", "depends_on")).unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 2);
+
+        s.execute_migration_batch(&[BatchOp::DeleteNode("b".into())]).unwrap();
+
+        assert!(s.get_node("b").unwrap().is_none());
+        assert_eq!(s.get_edge_count().unwrap(), 0,
+            "migration_batch DeleteNode must remove edges (FK disabled — no cascade)");
+        assert_eq!(count_orphan_edges(&s), 0);
+    }
+
+    #[test]
+    fn test_iss037_delete_node_self_loop_removed() {
+        // Self-edge A→A must also be cleaned up.
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        // Self-loops are allowed in some graph models; insert via migration batch
+        // to bypass any FK constraint differences.
+        s.execute_migration_batch(&[
+            BatchOp::AddEdge(Edge::new("a", "a", "self_ref")),
+        ]).unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 1);
+
+        s.execute_batch(&[BatchOp::DeleteNode("a".into())]).unwrap();
+
+        assert!(s.get_node("a").unwrap().is_none());
+        assert_eq!(s.get_edge_count().unwrap(), 0);
+        assert_eq!(count_orphan_edges(&s), 0);
     }
 
     // ── Node extras roundtrip via put_node ──────────────────
