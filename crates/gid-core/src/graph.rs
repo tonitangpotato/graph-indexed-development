@@ -803,11 +803,17 @@ impl Graph {
         self.nodes.iter().filter(|n| &n.status == status).collect()
     }
 
-    /// Summary statistics (counts only project nodes, not code nodes).
+    /// Summary statistics. Project-layer counts (status/ready) come from
+    /// `project_nodes()`; `code_nodes` count is surfaced separately so callers
+    /// (CLI, ritual UI) can report both populations honestly.
+    /// ISS-034: previously only counted project nodes, which made
+    /// `gid tasks --node-type all|code` say "0 nodes" while listing dozens.
     pub fn summary(&self) -> GraphSummary {
         let project_nodes = self.project_nodes();
+        let code_nodes = self.code_nodes();
         let mut s = GraphSummary {
             total_nodes: project_nodes.len(),
+            code_nodes: code_nodes.len(),
             total_edges: self.edges.len(),
             ..Default::default()
         };
@@ -827,11 +833,17 @@ impl Graph {
     }
 
     /// Get a human-readable text summary of the graph state.
+    /// ISS-034: includes code-node count when present so `--node-type all|code`
+    /// doesn't claim 0 nodes while listing many.
     pub fn summary_text(&self) -> String {
         let s = self.summary();
-        let mut lines = vec![
-            format!("Graph: {} nodes, {} edges", s.total_nodes, s.total_edges),
-        ];
+        let header = if s.code_nodes > 0 {
+            format!("Graph: {} project nodes, {} code nodes, {} edges",
+                s.total_nodes, s.code_nodes, s.total_edges)
+        } else {
+            format!("Graph: {} nodes, {} edges", s.total_nodes, s.total_edges)
+        };
+        let mut lines = vec![header];
 
         if s.total_nodes > 0 {
             lines.push(format!(
@@ -926,7 +938,13 @@ pub struct Task {
 
 #[derive(Debug, Default)]
 pub struct GraphSummary {
+    /// Project-layer node count (source == "project" or legacy None).
+    /// This is what status counts (todo/done/etc.) are computed from.
     pub total_nodes: usize,
+    /// Code-layer node count (source == "extract"). ISS-034: surfaced
+    /// separately so `gid tasks --node-type all|code` can show both
+    /// populations without lying about node counts.
+    pub code_nodes: usize,
     pub total_edges: usize,
     pub todo: usize,
     pub in_progress: usize,
@@ -964,14 +982,28 @@ impl KnowledgeGraph for Graph {
 impl KnowledgeManagement for Graph {}
 
 impl std::fmt::Display for GraphSummary {
+    /// Render summary. ISS-034: when code_nodes > 0, surface them in the header
+    /// so that `gid tasks --node-type all|code` doesn't claim "0 nodes" while
+    /// listing dozens of code nodes in the body. Status counts always reflect
+    /// project-layer nodes only — code nodes have no task status.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} nodes, {} edges | todo={} progress={} done={} blocked={} failed={} cancelled={} | ready={}",
-            self.total_nodes, self.total_edges,
-            self.todo, self.in_progress, self.done, self.blocked, self.failed, self.cancelled,
-            self.ready,
-        )
+        if self.code_nodes > 0 {
+            write!(
+                f,
+                "{} project nodes, {} code nodes, {} edges | todo={} progress={} done={} blocked={} failed={} cancelled={} | ready={}",
+                self.total_nodes, self.code_nodes, self.total_edges,
+                self.todo, self.in_progress, self.done, self.blocked, self.failed, self.cancelled,
+                self.ready,
+            )
+        } else {
+            write!(
+                f,
+                "{} nodes, {} edges | todo={} progress={} done={} blocked={} failed={} cancelled={} | ready={}",
+                self.total_nodes, self.total_edges,
+                self.todo, self.in_progress, self.done, self.blocked, self.failed, self.cancelled,
+                self.ready,
+            )
+        }
     }
 }
 
@@ -1102,6 +1134,88 @@ mod layer_filter_tests {
         let s = g.summary();
         // Summary should count only project nodes (2), not code nodes (2)
         assert_eq!(s.total_nodes, 2);
+    }
+
+    // ── ISS-034: summary surfaces both project and code populations ──
+
+    #[test]
+    fn test_iss034_summary_reports_code_nodes_separately() {
+        let g = mixed_graph();
+        let s = g.summary();
+        // total_nodes = project nodes (backward-compat semantics)
+        assert_eq!(s.total_nodes, 2);
+        // code_nodes is a new field that surfaces the code-layer count
+        assert_eq!(s.code_nodes, 2);
+        // Status counts come from project nodes only — code nodes have no
+        // task status semantics
+        assert_eq!(s.done, 0); // legacy-1 + task-1 are both Todo
+        assert_eq!(s.todo, 2);
+    }
+
+    #[test]
+    fn test_iss034_summary_display_includes_code_nodes_when_present() {
+        let g = mixed_graph();
+        let s = g.summary();
+        let rendered = format!("{}", s);
+        // Header must mention both populations so user isn't misled
+        assert!(rendered.contains("project nodes"),
+            "expected 'project nodes' in {}", rendered);
+        assert!(rendered.contains("code nodes"),
+            "expected 'code nodes' in {}", rendered);
+        assert!(rendered.contains("2 project nodes"));
+        assert!(rendered.contains("2 code nodes"));
+    }
+
+    #[test]
+    fn test_iss034_summary_display_omits_code_nodes_when_zero() {
+        // Project-only graph keeps the original compact format (backward compat)
+        let mut g = Graph::new();
+        let mut t = Node::new("task-1", "Only project task");
+        t.source = Some("project".to_string());
+        g.add_node(t);
+        let s = g.summary();
+        assert_eq!(s.code_nodes, 0);
+        let rendered = format!("{}", s);
+        assert!(!rendered.contains("code nodes"),
+            "should not mention code nodes when there are none: {}", rendered);
+        assert!(rendered.starts_with("1 nodes"),
+            "expected legacy compact format, got: {}", rendered);
+    }
+
+    #[test]
+    fn test_iss034_summary_text_includes_code_nodes() {
+        let g = mixed_graph();
+        let txt = g.summary_text();
+        assert!(txt.contains("2 project nodes"),
+            "expected '2 project nodes' in:\n{}", txt);
+        assert!(txt.contains("2 code nodes"),
+            "expected '2 code nodes' in:\n{}", txt);
+    }
+
+    #[test]
+    fn test_iss034_code_only_graph_does_not_lie_about_zero_nodes() {
+        // Reproduces the original ISS-034 scenario: a v03-style db with
+        // only code nodes. Before fix, summary said "0 nodes" while body
+        // listed dozens. Now: summary header surfaces the code-node count.
+        let mut g = Graph::new();
+        let mut c1 = Node::new("fn:foo", "foo");
+        c1.source = Some("extract".to_string());
+        c1.node_type = Some("code".to_string());
+        g.add_node(c1);
+        let mut c2 = Node::new("fn:bar", "bar");
+        c2.source = Some("extract".to_string());
+        c2.node_type = Some("code".to_string());
+        g.add_node(c2);
+
+        let s = g.summary();
+        assert_eq!(s.total_nodes, 0, "no project nodes");
+        assert_eq!(s.code_nodes, 2, "two code nodes");
+
+        let rendered = format!("{}", s);
+        // Must NOT claim "0 nodes" when there are 2 code nodes — the
+        // whole point of ISS-034
+        assert!(rendered.contains("2 code nodes"),
+            "expected '2 code nodes' in: {}", rendered);
     }
 
     #[test]

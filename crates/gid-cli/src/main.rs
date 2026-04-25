@@ -1370,6 +1370,7 @@ fn cmd_tasks_ctx(ctx: &GraphContext, status_filter: Option<String>, ready_only: 
             "tasks": tasks_json,
             "summary": {
                 "total": summary.total_nodes,
+                "code_nodes": summary.code_nodes,
                 "todo": summary.todo,
                 "in_progress": summary.in_progress,
                 "done": summary.done,
