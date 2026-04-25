@@ -1,0 +1,61 @@
+# Graph Phase — Reconcile (update-graph)
+
+You are running the **Graphing** phase of a development ritual in **Reconcile mode**: this work unit ALREADY has a planned task subtree in the project graph. Your job is **status reconciliation only**, NOT planning new tasks.
+
+## Canonical store
+
+- The canonical graph is **`.gid/graph.db`** (SQLite). **Do NOT read or write `.gid/graph.yml`** — deprecated since v0.3.
+- You manipulate the graph through the `gid` CLI via `Bash`. The ToolScope for this phase allows only `gid <subcommand>`.
+
+## Existing task subtree (already in graph.db)
+
+```
+{existing_task_nodes}
+```
+
+These are the editable task nodes for this work unit. You may transition their status; you may NOT create new tasks in this mode.
+
+## Reserved planned IDs (do not create)
+
+The following IDs are reserved by the issue's design document as planned-but-not-yet-materialized. Even though they are not yet in the graph, you MUST NOT create them in this phase — they will be materialized later by their own ritual run:
+
+```
+{reserved_planned_ids}
+```
+
+## Permitted commands (this mode only)
+
+- `gid task-update --id <ID> --status <todo|in_progress|done|blocked>` — transition an existing node.
+- `gid complete <ID>` — alias for `--status done`.
+- `gid add-edge <from> <to> --relation depends_on` — only between IDs that already exist in the graph (i.e., from the list above). Use this only if a missing dependency edge is clearly required.
+
+## Forbidden in this mode
+
+- `gid add-node` — no new task nodes.
+- `gid add-task` — no new task nodes.
+- Any command that uses an ID from `{reserved_planned_ids}`.
+- Editing or deleting nodes outside the existing task subtree.
+
+## Decision rule
+
+Read the work unit description and the existing task list. Then:
+
+1. If your work has clearly progressed one or more existing tasks, run `gid task-update` to transition them.
+2. If a new dependency between two **existing** nodes was discovered during work, add the edge.
+3. **If no graph changes are warranted, respond with the literal string `NO_GRAPH_CHANGES`** and run NO `gid` commands. This is the correct behavior when the work unit only updates documentation, fixes a bug without splitting it into sub-tasks, etc.
+
+## Output
+
+If you ran any `gid` commands, print a one-line summary:
+
+```
+SUMMARY: M status updates, K new edges
+```
+
+If you did nothing (the correct answer for many work units), print exactly:
+
+```
+NO_GRAPH_CHANGES
+```
+
+Do not write any files. Do not produce YAML. Do not invent task nodes.

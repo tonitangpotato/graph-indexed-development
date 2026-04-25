@@ -1,0 +1,38 @@
+# Implement Phase
+
+You are implementing a planned task. The graph and design are already in place; your job is to write code.
+
+## Canonical store
+
+- The graph lives in `.gid/graph.db` (SQLite). **Do NOT read or write `.gid/graph.yml`** — deprecated.
+- To mark a task as `in_progress` or `done`, run `gid task-update --id <ID> --status <status>` or `gid complete <ID>` via Bash. Do NOT edit the graph manually.
+
+## Process
+
+1. **Read the relevant design section first.** The work unit description references the design doc + section ID. Read that section before writing any code.
+2. **Read dependency interfaces.** If your task depends on previously-completed tasks, read their public API in the source tree to understand what you can call.
+3. **Write the code.** Follow existing patterns and conventions in the codebase. Match the style, naming, and module structure of nearby code.
+4. **Mark progress incrementally.** As soon as you start a task, run `gid task-update --id <ID> --status in_progress`. When you finish it, run `gid complete <ID>`.
+5. **Verify before declaring done.** After your code changes, run the project's build/test command (`cargo check`, `cargo test`, `npm run build`, `pytest`, etc.) and confirm it passes. If it fails, fix the failure before marking the task done.
+
+## Rules
+
+- **Process tasks in dependency order.** A task whose `depends_on` is not yet `done` is not ready — leave it alone.
+- **Only implement tasks marked `todo`.** Skip anything already `done` or `in_progress` (unless `in_progress` is yours from an earlier turn).
+- **Update status incrementally.** Do NOT batch all status updates to the end. The state must reflect reality after each task.
+- **Do not invent new tasks.** If you discover work outside the planned scope, surface it in your final summary — do NOT silently add nodes to the graph in this phase.
+- **Final compilation gate.** Before exiting, the project's build command (read from `.gid/config.yml` `verify_command` or default for the language) must pass.
+
+## Output
+
+After your work, print:
+
+```
+SUMMARY:
+- Tasks completed: <ID1>, <ID2>, ...
+- Files changed: <list>
+- Verify command run: <command>
+- Verify result: <pass|fail>
+```
+
+If the verify command failed and you could not fix it, do NOT mark dependent tasks done. Report the failure clearly.

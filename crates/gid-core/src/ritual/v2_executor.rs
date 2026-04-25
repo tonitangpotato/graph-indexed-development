@@ -618,26 +618,20 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     }
 
     fn update_graph(&self, description: &str) {
-        use crate::graph::{Graph, NodeStatus};
+        use crate::graph::NodeStatus;
+        use crate::storage::{load_graph_auto, save_graph_auto};
 
-        let graph_path = self.config.project_root.join(".gid").join("graph.yml");
-        if !graph_path.exists() {
-            info!("No graph.yml found, skipping graph update");
+        // ISS-039 Fix 2: SQLite-canonical (.gid/graph.db). load_graph_auto auto-detects
+        // backend (sqlite if graph.db exists, yaml fallback for legacy projects).
+        let gid_dir = self.config.project_root.join(".gid");
+        if !gid_dir.exists() {
+            info!("No .gid/ directory found, skipping graph update");
             return;
         }
-
-        // Load graph
-        let content = match std::fs::read_to_string(&graph_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to read graph.yml: {}", e);
-                return;
-            }
-        };
-        let mut graph: Graph = match serde_yaml::from_str(&content) {
+        let mut graph = match load_graph_auto(&gid_dir, None) {
             Ok(g) => g,
             Err(e) => {
-                warn!("Failed to parse graph.yml: {}", e);
+                warn!("Failed to load graph: {}", e);
                 return;
             }
         };
@@ -645,35 +639,28 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         // Find matching node by fuzzy description match
         // Strategy: check if any node's title or description contains the task text (or vice versa)
         let desc_lower = description.to_lowercase();
-        let matched_id = graph.nodes.iter()
-            .filter(|n| {
-                matches!(n.status, NodeStatus::Todo | NodeStatus::InProgress)
-            })
+        let matched_id = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.status, NodeStatus::Todo | NodeStatus::InProgress))
             .find(|n| {
                 let title_lower = n.title.to_lowercase();
                 let node_desc_lower = n.description.as_deref().unwrap_or("").to_lowercase();
                 // Match if task description contains node title or vice versa
                 desc_lower.contains(&title_lower)
                     || title_lower.contains(&desc_lower)
-                    || (!node_desc_lower.is_empty() && (
-                        desc_lower.contains(&node_desc_lower)
-                        || node_desc_lower.contains(&desc_lower)
-                    ))
+                    || (!node_desc_lower.is_empty()
+                        && (desc_lower.contains(&node_desc_lower)
+                            || node_desc_lower.contains(&desc_lower)))
             })
             .map(|n| n.id.clone());
 
         if let Some(id) = matched_id {
             if graph.mark_task_done(&id) {
-                // Save back
-                match serde_yaml::to_string(&graph) {
-                    Ok(yaml) => {
-                        if let Err(e) = std::fs::write(&graph_path, &yaml) {
-                            warn!("Failed to write graph.yml: {}", e);
-                        } else {
-                            info!(node_id = %id, "Marked graph node as done");
-                        }
-                    }
-                    Err(e) => warn!("Failed to serialize graph: {}", e),
+                if let Err(e) = save_graph_auto(&graph, &gid_dir, None) {
+                    warn!("Failed to save graph: {}", e);
+                } else {
+                    info!(node_id = %id, "Marked graph node as done");
                 }
             }
         } else {
@@ -750,101 +737,15 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
             }
         }
 
-        // Built-in fallback prompts
+        // Built-in fallback prompts (extracted to prompts/*.txt — ISS-039 Fix 1)
         match skill_name {
             "draft-design" => Ok(include_str!("prompts/draft_design.txt").to_string()),
-            "update-design" => Ok(
-                "Read the existing DESIGN.md and the user's task. Update the design document \
-                 to incorporate the new requirements. Write the updated DESIGN.md."
-                    .to_string(),
-            ),
-            "generate-graph" | "design-to-graph" => Ok(
-                "Read DESIGN.md from the project root. Generate a GID graph in YAML format \
-                 and write it to .gid/graph.yml.\n\n\
-                 The graph has multiple node types:\n\
-                 ```yaml\n\
-                 nodes:\n\
-                   # Feature/module nodes (semantic — the architecture)\n\
-                   - id: feat-dashboard\n\
-                     title: \"Dashboard Module\"\n\
-                     type: feature\n\
-                     status: todo\n\
-                     tags: [module]\n\
-                     description: \"HTTP dashboard server\"\n\
-                   # File nodes (what gets changed)\n\
-                   - id: file-dashboard-rs\n\
-                     title: \"src/dashboard.rs\"\n\
-                     type: file\n\
-                     status: todo\n\
-                   # Task nodes (concrete work items)\n\
-                   - id: task-add-health-endpoint\n\
-                     title: \"Add health check endpoint\"\n\
-                     type: task\n\
-                     status: todo\n\
-                     tags: [implementation]\n\
-                     description: \"Add health check endpoint returning uptime and stats\"\n\
-                 edges:\n\
-                   - from: task-add-health-endpoint\n\
-                     to: feat-dashboard\n\
-                     relation: implements\n\
-                   - from: feat-dashboard\n\
-                     to: file-dashboard-rs\n\
-                     relation: contains\n\
-                   - from: task-a\n\
-                     to: task-b\n\
-                     relation: depends_on\n\
-                 ```\n\n\
-                 Node types: feature, component, file, task, layer, doc\n\
-                 Edge relations: depends_on, implements, modifies, contains, tests, related_to\n\n\
-                 Rules:\n\
-                 - Create feature/component nodes for modules and architectural units\n\
-                 - Create file nodes for files being created/modified\n\
-                 - Create task nodes for concrete work items (status: todo)\n\
-                 - Link tasks to features they implement (relation: implements)\n\
-                 - Link features to files they contain (relation: contains)\n\
-                 - Link tasks to tasks they depend on (relation: depends_on)\n\
-                 - Include metadata (design_ref, goals, file_path) on task nodes\n\
-                 Use the Read tool to read DESIGN.md, then Write tool to create .gid/graph.yml."
-                    .to_string(),
-            ),
-            "update-graph" => Ok(
-                "Read the existing .gid/graph.yml and DESIGN.md. Update the graph to reflect \
-                 any new tasks or changes from the design.\n\n\
-                 CRITICAL RULES:\n\
-                 - Read the existing graph FIRST\n\
-                 - PRESERVE all existing nodes and edges — do NOT delete or modify them\n\
-                 - Only ADD new nodes (task, feature, component, file) and edges for the new work\n\
-                 - New task nodes should have status: todo\n\
-                 - Link new tasks to features they implement (relation: implements)\n\
-                 - Link tasks to tasks they depend on (relation: depends_on)\n\n\
-                 Node types: feature, component, file, task, layer, doc\n\
-                 Edge relations: depends_on, implements, modifies, contains, tests, related_to\n\n\
-                 Use Read to load existing graph and DESIGN.md, then Write to update .gid/graph.yml."
-                    .to_string(),
-            ),
-            "implement" => Ok(
-                "Implement the described changes following the graph-driven layer approach:\n\n\
-                 PROCESS:\n\
-                 1. Read .gid/graph.yml to find all task nodes and their layer assignments\n\
-                 2. Process layers in order (Layer 0 first, then Layer 1, etc.)\n\
-                 3. Within each layer, implement each task node sequentially:\n\
-                    a. Read the design doc section relevant to this task\n\
-                    b. Read any dependency modules (from prior layers) to understand their public API\n\
-                    c. Write the code for this task\n\
-                    d. Update the task node's status to 'done' in graph.yml\n\
-                 4. After completing ALL tasks in a layer, run the project's build/check command\n\
-                    to verify compilation before proceeding to the next layer\n\
-                 5. If build fails, fix the issues within the current layer before moving on\n\n\
-                 RULES:\n\
-                 - Follow existing patterns and conventions in the codebase\n\
-                 - Only implement tasks that are status: todo — skip tasks already marked done\n\
-                 - Layer order is mandatory: never implement a task before its dependencies are done\n\
-                 - Update graph.yml status incrementally, not all at once at the end\n\
-                 - FINAL STEP: After ALL layers are done, run `cargo check` (Rust), `npm run build` (TS),\n\
-                   or `python -m py_compile` (Python) as a final compilation gate. If it fails, fix before exiting.\n\
-                   Do NOT mark the implementation complete until the final check passes."
-                    .to_string(),
-            ),
+            "update-design" => Ok(include_str!("prompts/update_design.txt").to_string()),
+            "generate-graph" | "design-to-graph" => {
+                Ok(include_str!("prompts/generate_graph.txt").to_string())
+            }
+            "update-graph" => Ok(include_str!("prompts/update_graph.txt").to_string()),
+            "implement" => Ok(include_str!("prompts/implement.txt").to_string()),
             _ => anyhow::bail!("Unknown skill: {}", skill_name),
         }
     }
@@ -968,15 +869,19 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
 
     /// Load graph and assemble context for all pending task nodes.
     /// Returns None if graph doesn't exist or has no task nodes.
+    ///
+    /// ISS-039 Fix 2: reads from canonical `.gid/graph.db` via load_graph_auto
+    /// (auto-falls back to graph.yml for legacy projects).
     fn build_graph_context(&self, state: &RitualState) -> Option<String> {
-        let gid_root = self.resolve_gid_root(state);
-        let graph_path = gid_root.join("graph.yml");
+        use crate::storage::load_graph_auto;
 
-        let content = std::fs::read_to_string(&graph_path)
-            .map_err(|e| tracing::debug!("No graph.yml found: {}", e))
-            .ok()?;
-        let graph: Graph = serde_yaml::from_str(&content)
-            .map_err(|e| tracing::warn!("Failed to parse graph: {}", e))
+        let gid_root = self.resolve_gid_root(state);
+        if !gid_root.exists() {
+            tracing::debug!("No .gid/ directory at {}", gid_root.display());
+            return None;
+        }
+        let graph: Graph = load_graph_auto(&gid_root, None)
+            .map_err(|e| tracing::warn!("Failed to load graph for context: {}", e))
             .ok()?;
 
         let task_ids: Vec<&str> = graph

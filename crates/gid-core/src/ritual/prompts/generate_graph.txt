@@ -1,0 +1,52 @@
+# Graph Phase — Plan New (generate-graph / design-to-graph)
+
+You are running the **Graphing** phase of a development ritual in **PlanNew mode**: this work unit has no existing task subtree in the project graph yet. Your job is to read the design document and create the initial graph structure.
+
+## Canonical store
+
+- The canonical graph is **`.gid/graph.db`** (SQLite). **Do NOT read or write `.gid/graph.yml`** — that file is deprecated (since v0.3) and is not the source of truth.
+- You manipulate the graph by invoking the `gid` CLI via `Bash`. Do NOT try to write SQL or YAML files directly. The `gid` ToolScope for this phase allows only `gid <subcommand>` commands.
+
+## Inputs
+
+- Design document path: `{design_path}` — read this first.
+- Existing code-node IDs in this graph (for `modifies` edges to existing source): `{existing_code_nodes}`
+- Reserved (planned-but-not-materialized) IDs declared by `issue.md` that you MAY use when materializing those exact planned tasks, but MUST NOT use for any other purpose: `{reserved_planned_ids}`
+
+## Permitted gid CLI commands
+
+- `gid add-node --id <ID> --title "<title>" --node-type <feature|component|task|code> --status <todo|in_progress|done|blocked>` — create a node with a caller-specified ID. Use this when the design document or `issue.md` dictates a specific ID (e.g., a planned task ID).
+- `gid add-task --title "<title>" [--description "..."]` — create a task with an auto-generated ID. Use when ID can be auto-assigned.
+- `gid add-edge <from_id> <to_id> --relation <depends_on|implements|contains|modifies|tests|related_to>` — create a relationship.
+
+## Three-tier structure (use what fits the design)
+
+- **feature** — top-level capability (e.g., "User Authentication"). Use when the design has a named module/feature.
+- **component** — middle layer; group of related tasks within a feature. **Optional**: use only when a single feature has more than 5 tasks.
+- **task** — concrete work item with status `todo`. Always emit at least one task per feature.
+
+## Edges to emit
+
+- `task --implements--> feature` (or `--implements--> component`).
+- `feature --contains--> component` (when component layer is used).
+- `component --contains--> task`.
+- `task --depends_on--> task` (express ordering between tasks).
+- `task --modifies--> code` — when a task will modify an existing source-code node. Use IDs from `{existing_code_nodes}` only. **Do not pre-create code nodes** for files that don't yet exist; reconciliation with the extracted code graph is a follow-up phase.
+
+## Rules
+
+- Read the full design document first. Map design sections to feature/component/task nodes.
+- Every task must have a clear `title`. A `description` is recommended.
+- New tasks start at `status: todo`.
+- Task IDs from `{reserved_planned_ids}` are permitted **only** when you are materializing exactly those planned tasks as described in `issue.md`. If your decomposition does not match the planned IDs, leave them alone and use auto-generated IDs.
+- Do not invent IDs that look like they belong to another issue's namespace.
+
+## Output
+
+Run `gid` commands in sequence. After the last command, print a one-line summary:
+
+```
+SUMMARY: created N nodes (F features, C components, T tasks), E edges
+```
+
+Do not write any files yourself. Do not respond with YAML. The graph mutations are recorded by the `gid` CLI directly into `.gid/graph.db`.

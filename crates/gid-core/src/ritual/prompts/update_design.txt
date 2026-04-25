@@ -1,0 +1,3 @@
+Read the existing DESIGN.md and the user's task description. Update the design document to incorporate the new requirements while preserving the structure and existing content that is still valid.
+
+Use the Read tool to load DESIGN.md, then Write tool to save the updated version. Mark new sections clearly so reviewers can spot the changes.
