@@ -1,10 +1,13 @@
 # ISS-007: Hardcoded co-location threshold skips large directories
 
-**Status:** likely-superseded
+**Status:** closed (2026-04-25 — superseded by isolation-gated co-location)
 **Severity**: Important  
 **Component**: `crates/gid-core/src/infer/clustering.rs`  
 **Reported**: 2026-04-10  
-**Note**: Original number reused — see issues-index.md ISS-007 (closed 2026-04-06, ghost nodes) for earlier issue with same ID. The hardcoded `MAX_DIR_SIZE_FOR_COLOCATION = 50` constant referenced below appears to have been replaced/removed during co-location refactor (see `WEIGHT_DIR_COLOCATION` + isolation gating). Needs verification before close.
+**Note**: Verified 2026-04-25 — hardcoded `MAX_DIR_SIZE_FOR_COLOCATION = 50` is gone. Replaced by `add_dir_colocation_edges` (clustering.rs:531) which only fires for files that are otherwise isolated (no other clustering signal). The threshold-skip problem described below no longer applies because:
+- Large directories with sub-structure get clustering signal from co-citation, symbol-similarity, and import edges (no co-location needed).
+- Truly isolated files in large flat directories still get co-location applied.
+- The "skip all >50 files" cliff is gone.
 
 ## Problem
 

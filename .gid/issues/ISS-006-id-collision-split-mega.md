@@ -1,10 +1,10 @@
 # ISS-006: ID Collision in split_mega_clusters
 
-**Status:** open
+**Status:** closed (2026-04-25 — global renumbering fix verified)
 **Severity**: Critical  
 **Component**: `crates/gid-core/src/infer/clustering.rs`  
 **Reported**: 2026-04-10  
-**Note**: This number was reused — see issues-index.md ISS-006 (closed 2026-04-05) for the earlier issue with the same ID.
+**Closed**: 2026-04-25 — fix verified in `split_mega_clusters` wrapper (clustering.rs:872–878): after recursive splitting completes, all clusters get globally renumbered `c.id = i` over the final flat list. Inner `split_mega_clusters_recursive` doesn't renumber but never returns to user-facing code without going through the wrapper. Comment at line 875 explicitly references ISS-006. Production code path (`cluster()` at line 2200) goes through the wrapper. ⚠️ Follow-up nice-to-have: add a dedicated regression test that constructs a deeply-nested split scenario and asserts all final cluster IDs are unique — currently relies on the renumbering being correct rather than testing it directly.
 
 ## Problem
 

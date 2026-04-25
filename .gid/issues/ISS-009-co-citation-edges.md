@@ -1,8 +1,9 @@
 # ISS-009: Clustering input graph lacks co-citation edges — root cause of monolithic utility clusters
 
-**Status:** open
+**Status:** closed (2026-04-25 — co-citation edges fully implemented)
 **Severity**: Architecture (root cause)  
 **Discovered**: 2026-04-10, after 6+ rounds of debugging clustering quality  
+**Closed**: 2026-04-25 — `add_co_citation_edges` (clustering.rs:323) implemented with `co_citation_weight` + `co_citation_min_shared` config knobs. Verified by 10 unit tests in `infer::clustering::tests::test_co_citation_*` covering basic functionality, threshold gating, weight cap, only-import-like edges, disabled-when-zero, low-confidence skip, high-confidence-pair-suppression, weight-scaling-by-confidence, and the utils-cluster split scenario. Confidence integration came in via ISS-012 (2026-04-25).
 **Supersedes**: ISS-006 (split_mega fallback), ISS-008 (max_cluster_size formula) — these were symptom-level fixes
 
 ## Problem

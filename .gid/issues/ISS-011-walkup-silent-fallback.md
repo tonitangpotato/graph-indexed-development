@@ -1,9 +1,28 @@
 # ISS-011: Walk-up 机制在 explicit project path 不存在时应报错而非静默回退
 
-**Status:** open
+**Status:** resolved (2026-04-25)
 **Priority:** P1
 
-## Problem
+## Resolution
+
+Fixed in rustclaw `src/tools.rs` (commits forthcoming). Two functions hardened:
+
+- `GraphManager::resolve_external` — explicit `project` path that does not exist now bails with `"project path does not exist: ... (no walk-up fallback for explicit paths)"` instead of silently walking up to an ancestor `.gid/`.
+- `GraphManager::resolve_gid_dir` — same check on the `project` field of tool input.
+
+**Preserved behavior:** when an explicit path *exists* but has no local `.gid/` (e.g. caller passes `src/foo/`), upward walk still runs. This is the legitimate "find enclosing project from a subdirectory" pattern used by ritual and similar tools, covered by `test_resolve_external_falls_back_to_upward_walk_without_gid`.
+
+**Tests added:**
+- `test_resolve_external_nonexistent_path_errors` — basic error case
+- `test_resolve_external_nonexistent_does_not_walk_up_to_ancestor` — regression for the original bug case (typo path under an ancestor with `.gid/`)
+- `test_resolve_gid_dir_nonexistent_project_errors` — same coverage for `resolve_gid_dir`
+
+**Note on scope:** gid-rs CLI does not expose a `--project` flag (only `--graph`, which already errors on nonexistent paths via `resolve_by_graph_path`). The bug surface was exclusively the rustclaw tool layer.
+
+---
+
+## Original Problem
+
 
 当用户通过 `--project` 参数或 API 的 `project` 字段**显式指定**一个项目路径时，如果该路径不存在，gid 当前行为是**静默 walk-up**——向上遍历目录树寻找最近的 `.gid/` 目录，然后操作那个（错误的）graph。
 

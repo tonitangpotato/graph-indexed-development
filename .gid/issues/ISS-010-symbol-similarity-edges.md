@@ -1,8 +1,9 @@
 # ISS-010: Symbol Name Similarity Edges — Semantic Signal Missing from Clustering Input
 
-**Status:** open
+**Status:** closed (2026-04-25 — symbol similarity edges fully implemented)
 **Severity**: Architecture (missing signal dimension)  
 **Discovered**: 2026-04-10  
+**Closed**: 2026-04-25 — `add_symbol_similarity_edges` (clustering.rs:686) implemented with `symbol_similarity_weight` config knob. 5 unit tests in `infer::clustering::tests::test_symbol_similarity_*` covering basic edge creation, disabled mode, empty files, similarity threshold, and weight scaling. Wired into `cluster()` pipeline at line 2149.
 **Related**: ISS-009 (co-citation edges), ISS-005 (directory co-location)
 
 ## Context: Why Previous Fixes Haven't Solved the Mega-Cluster Problem
