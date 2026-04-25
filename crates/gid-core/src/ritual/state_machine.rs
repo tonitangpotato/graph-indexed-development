@@ -83,10 +83,58 @@ impl RitualPhase {
         matches!(self, Self::Done | Self::Escalated | Self::Cancelled)
     }
 
+    /// Map a terminal phase to its `RitualV2Status` value.
+    /// Returns `None` for non-terminal phases (caller should keep `Active`).
+    pub fn terminal_status(&self) -> Option<RitualV2Status> {
+        match self {
+            Self::Done => Some(RitualV2Status::Done),
+            Self::Cancelled => Some(RitualV2Status::Cancelled),
+            Self::Escalated => Some(RitualV2Status::Failed),
+            _ => None,
+        }
+    }
+
     /// Whether this is a pause state (waiting for user input, no EP actions expected).
     pub fn is_paused(&self) -> bool {
         matches!(self, Self::WaitingClarification | Self::WaitingApproval)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Status (terminal disposition)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Top-level disposition of a v2 ritual.
+///
+/// Distinct from [`RitualPhase`]: phase is the FSM position; status is the
+/// terminal classification. While the ritual is in flight, status is `Active`.
+/// On entry to a terminal phase (`Done`/`Cancelled`/`Escalated`), `with_phase`
+/// updates this to the corresponding terminal value.
+///
+/// Readers (CLI, dashboards, the `RitualRegistry` in rustclaw, external tools)
+/// can branch on this single field instead of inspecting the transitions array.
+///
+/// **Backwards compat**: state files written before this field existed
+/// deserialize with `status: Active` via `#[serde(default)]`. Operationally
+/// such files are *zombies* — phase is non-terminal, no adapter is alive.
+/// The orphan-sweep pass on runner startup is responsible for repairing them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RitualV2Status {
+    /// Ritual is in flight. Phase may be any non-terminal value.
+    #[default]
+    Active,
+    /// Ritual completed successfully (phase = Done).
+    Done,
+    /// Ritual was cancelled — by user, adapter shutdown, or orphan sweep.
+    /// `phase = Cancelled`. The latest transition's `event` field carries the
+    /// reason (e.g. `"Implementing → Cancelled"`, `"adapter_shutdown"`,
+    /// `"orphaned"`).
+    Cancelled,
+    /// Ritual reached a terminal failure (phase = Escalated, no retry path
+    /// taken). Distinct from "in retry": status is only `Failed` once the
+    /// ritual stops moving.
+    Failed,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -144,6 +192,14 @@ pub struct RitualState {
     /// Populated by the runner on every `save_state` via `std::process::id()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter_pid: Option<u32>,
+    /// Top-level disposition (in flight / done / cancelled / failed).
+    ///
+    /// Maintained automatically by `with_phase` based on the destination
+    /// phase. Older state files without this field deserialize as `Active`.
+    /// See [`RitualV2Status`] for the semantics and the orphan-sweep
+    /// remediation for zombie files.
+    #[serde(default)]
+    pub status: RitualV2Status,
 }
 
 fn default_ritual_id() -> String {
@@ -210,6 +266,7 @@ impl RitualState {
             triage_size: None,
             updated_at: now,
             adapter_pid: None,
+            status: RitualV2Status::Active,
         }
     }
 
@@ -220,6 +277,14 @@ impl RitualState {
             event: format!("{:?} → {:?}", self.phase, phase),
             timestamp: Utc::now(),
         });
+        // Maintain `status` invariant: terminal phases set the matching
+        // terminal status; non-terminal phases imply `Active` (handles the
+        // unusual case of re-entering the FSM, e.g. WaitingApproval ↔
+        // Reviewing cycles, without leaving stale terminal status from a
+        // prior path that never happened).
+        self.status = phase
+            .terminal_status()
+            .unwrap_or(RitualV2Status::Active);
         self.phase = phase;
         self.updated_at = Utc::now();
         self
@@ -2031,5 +2096,144 @@ mod tests {
         let (s, a) = transition(&state, RitualEvent::ShellFailed { stderr: "still broken".into(), exit_code: 1 });
         assert_eq!(s.phase, RitualPhase::Escalated);
         assert_invariant(&s, &a);
+    }
+
+    // ── ISS-019: status field invariants ──────────────────────────────────
+
+    #[test]
+    fn test_status_default_is_active_for_new_state() {
+        let s = RitualState::new();
+        assert_eq!(s.status, RitualV2Status::Active);
+        assert!(!s.phase.is_terminal());
+    }
+
+    #[test]
+    fn test_status_active_for_in_flight_phases() {
+        // Walking through the normal happy path, status must remain Active
+        // until a terminal phase is entered.
+        let s = idle_state()
+            .with_phase(RitualPhase::Initializing)
+            .with_phase(RitualPhase::Triaging)
+            .with_phase(RitualPhase::Designing)
+            .with_phase(RitualPhase::Reviewing)
+            .with_phase(RitualPhase::WaitingApproval)
+            .with_phase(RitualPhase::Planning)
+            .with_phase(RitualPhase::Graphing)
+            .with_phase(RitualPhase::Implementing)
+            .with_phase(RitualPhase::Verifying);
+        assert_eq!(s.status, RitualV2Status::Active);
+    }
+
+    #[test]
+    fn test_status_done_when_phase_done() {
+        let s = idle_state()
+            .with_phase(RitualPhase::Verifying)
+            .with_phase(RitualPhase::Done);
+        assert_eq!(s.phase, RitualPhase::Done);
+        assert_eq!(s.status, RitualV2Status::Done);
+    }
+
+    #[test]
+    fn test_status_cancelled_when_phase_cancelled() {
+        let state = idle_state().with_phase(RitualPhase::Implementing);
+        let (s, _a) = transition(&state, RitualEvent::UserCancel);
+        assert_eq!(s.phase, RitualPhase::Cancelled);
+        assert_eq!(s.status, RitualV2Status::Cancelled);
+    }
+
+    #[test]
+    fn test_status_failed_when_phase_escalated() {
+        // Designing allows 2 retries before escalating (state_machine.rs:1051).
+        // Hammer it 3× to reach the catch-all → Escalated arm at line 1108.
+        let mut state = idle_state().with_phase(RitualPhase::Designing);
+        for i in 0..3 {
+            let (s, _a) = transition(&state, RitualEvent::SkillFailed {
+                phase: "design".into(),
+                error: format!("fatal {}", i),
+            });
+            state = s;
+        }
+        assert_eq!(state.phase, RitualPhase::Escalated,
+            "expected escalation after 3 failures, got {:?}", state.phase);
+        assert_eq!(state.status, RitualV2Status::Failed);
+    }
+
+    #[test]
+    fn test_status_idempotent_double_cancel() {
+        // Cancelling a Cancelled ritual must not corrupt status (it should
+        // remain Cancelled — no upgrade to Active, no spurious change).
+        let state = idle_state().with_phase(RitualPhase::Implementing);
+        let (s1, _) = transition(&state, RitualEvent::UserCancel);
+        assert_eq!(s1.status, RitualV2Status::Cancelled);
+        let (s2, _) = transition(&s1, RitualEvent::UserCancel);
+        assert_eq!(s2.phase, RitualPhase::Cancelled);
+        assert_eq!(s2.status, RitualV2Status::Cancelled);
+    }
+
+    #[test]
+    fn test_status_recovers_to_active_on_re_entry() {
+        // If, hypothetically, with_phase is called with a non-terminal phase
+        // after a terminal one (e.g. via UserRetry from Escalated), status
+        // must follow the new phase. UserRetry is the real-world trigger.
+        let state = idle_state()
+            .with_phase(RitualPhase::Designing)
+            .with_failed_phase(RitualPhase::Designing)
+            .with_phase(RitualPhase::Escalated);
+        assert_eq!(state.status, RitualV2Status::Failed);
+
+        let (s, _a) = transition(&state, RitualEvent::UserRetry);
+        // Retry from Escalated brings us back to a non-terminal phase.
+        assert!(!s.phase.is_terminal(),
+            "retry should leave terminal phase, was {:?}", s.phase);
+        assert_eq!(s.status, RitualV2Status::Active,
+            "status must revert to Active when re-entering non-terminal phase");
+    }
+
+    #[test]
+    fn test_status_serde_default_for_legacy_state_files() {
+        // A state file written before `status` existed (no field in JSON)
+        // must deserialize as `Active`. This is the contract that protects
+        // backwards compat for in-flight rituals across an upgrade boundary.
+        let json = serde_json::json!({
+            "id": "r-legacy",
+            "phase": "Implementing",
+            "task": "old ritual",
+            "verify_retries": 0,
+            "phase_retries": {},
+            "phase_tokens": {},
+            "transitions": [],
+            "started_at": "2026-04-25T00:00:00Z",
+            "updated_at": "2026-04-25T00:00:00Z",
+            "project": null,
+            "strategy": null,
+            "failed_phase": null,
+            "error_context": null,
+        });
+        let s: RitualState = serde_json::from_value(json).unwrap();
+        assert_eq!(s.status, RitualV2Status::Active);
+        assert_eq!(s.phase, RitualPhase::Implementing);
+    }
+
+    #[test]
+    fn test_status_serde_roundtrip_preserves_terminal() {
+        // A Done ritual serialized and reloaded must keep `Done` status.
+        let s = idle_state()
+            .with_phase(RitualPhase::Verifying)
+            .with_phase(RitualPhase::Done);
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: RitualState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.status, RitualV2Status::Done);
+        assert_eq!(s2.phase, RitualPhase::Done);
+    }
+
+    #[test]
+    fn test_terminal_status_mapping() {
+        // The mapping is a contract — codify it.
+        assert_eq!(RitualPhase::Done.terminal_status(), Some(RitualV2Status::Done));
+        assert_eq!(RitualPhase::Cancelled.terminal_status(), Some(RitualV2Status::Cancelled));
+        assert_eq!(RitualPhase::Escalated.terminal_status(), Some(RitualV2Status::Failed));
+        assert_eq!(RitualPhase::Idle.terminal_status(), None);
+        assert_eq!(RitualPhase::Implementing.terminal_status(), None);
+        assert_eq!(RitualPhase::WaitingApproval.terminal_status(), None);
     }
 }

@@ -55,6 +55,7 @@ pub use state_machine::{
     RitualEvent as V2Event,
     RitualAction as V2Action,
     ProjectState as V2ProjectState,
+    RitualV2Status,
     ImplementStrategy,
     TriageResult,
     generate_ritual_id,
