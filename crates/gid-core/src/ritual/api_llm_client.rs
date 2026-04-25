@@ -180,7 +180,13 @@ impl LlmClient for ApiLlmClient {
 
         Ok(SkillResult {
             output: result.final_text,
-            artifacts_created: vec![], // Artifacts tracked by engine via glob
+            // ISS-025: Artifacts are populated by the v2 executor via
+            // before/after filesystem snapshots — see
+            // v2_executor::run_skill. Returning an empty vec here is the
+            // intended contract: the executor layer has authoritative
+            // knowledge of which paths are writable for the phase, and
+            // re-walking from inside this client would be redundant.
+            artifacts_created: vec![],
             tool_calls_made: result.tool_calls.len(),
             tokens_used: result.total_input_tokens + result.total_output_tokens,
         })

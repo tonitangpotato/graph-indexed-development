@@ -16,6 +16,7 @@ use anyhow::Result;
 use tracing::{info, warn, error};
 
 use super::composer::ProjectState as ComposerProjectState;
+use super::file_snapshot::{diff_snapshots, snapshot_dir, FsDiff};
 use super::llm::{LlmClient, ToolDefinition};
 use super::scope::default_scope_for_phase;
 use super::state_machine::{
@@ -359,6 +360,32 @@ impl V2Executor {
         let scope = default_scope_for_phase(name);
         let tools = self.scope_to_tool_definitions(&scope);
 
+        // ISS-025: For phases that are expected to mutate the filesystem
+        // (currently: implement), snapshot the target tree before invoking
+        // the LLM so we can verify post-conditions. Without this, an LLM
+        // that produces only commentary (zero Write/Edit calls) is
+        // indistinguishable from a successful implement phase, and the
+        // downstream verify phase trivially passes against an unchanged
+        // tree.
+        let mutation_root = self.resolve_mutation_root(state);
+        if mutation_root != self.config.project_root {
+            // ISS-025 #4: cross-workspace ritual. The LLM will be invoked
+            // with project_root as cwd, but file writes must land in
+            // target_root. Surface this as a one-line warning so it shows
+            // up in logs/notifications without flooding the channel.
+            warn!(
+                project_root = %self.config.project_root.display(),
+                mutation_root = %mutation_root.display(),
+                skill = name,
+                "Cross-workspace ritual: LLM cwd != target. Verify post-conditions still apply at target_root."
+            );
+        }
+        let snapshot_before = if Self::phase_requires_file_changes(name) {
+            Some(snapshot_dir(&mutation_root))
+        } else {
+            None
+        };
+
         match llm
             .run_skill(
                 &full_prompt,
@@ -370,10 +397,58 @@ impl V2Executor {
             .await
         {
             Ok(result) => {
+                // ISS-025 #1+#2: For phases that must produce file changes,
+                // diff the tree and override the SkillResult's empty
+                // `artifacts_created` (the api_llm_client returns vec![]
+                // because tracking was deferred to the engine layer — this
+                // is that layer). If no files changed in an `implement`
+                // phase, treat it as failure regardless of LLM exit status.
+                if let Some(before) = snapshot_before {
+                    let after = snapshot_dir(&mutation_root);
+                    let diff = diff_snapshots(&before, &after);
+                    info!(
+                        skill = name,
+                        added = diff.added.len(),
+                        modified = diff.modified.len(),
+                        deleted = diff.deleted.len(),
+                        "Phase file-change diff"
+                    );
+
+                    if name == "implement" && diff.is_empty() {
+                        warn!(
+                            skill = name,
+                            tokens = result.tokens_used,
+                            tool_calls = result.tool_calls_made,
+                            "implement phase produced no file changes (ISS-025 post-condition violation)"
+                        );
+                        return RitualEvent::SkillFailed {
+                            phase: name.to_string(),
+                            error: format!(
+                                "implement phase produced no file changes — \
+                                 LLM consumed {} tokens across {} tool calls but did not call Write/Edit. \
+                                 This usually means the prompt was too vague (missing design.md) \
+                                 or the LLM degenerated into analysis mode. See ISS-025.",
+                                result.tokens_used, result.tool_calls_made
+                            ),
+                        };
+                    }
+
+                    info!(skill = name, "Skill completed successfully");
+                    let artifacts = artifact_strings(&diff);
+                    return RitualEvent::SkillCompleted {
+                        phase: name.to_string(),
+                        artifacts,
+                    };
+                }
+
                 info!(skill = name, "Skill completed successfully");
                 RitualEvent::SkillCompleted {
                     phase: name.to_string(),
-                    artifacts: result.artifacts_created.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+                    artifacts: result
+                        .artifacts_created
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect(),
                 }
             }
             Err(e) => {
@@ -867,6 +942,30 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         }
     }
 
+    /// Resolve the directory that file-mutating phases will actually write
+    /// into. Prefers the ritual's `target_root` (ISS-029 work-unit binding)
+    /// and falls back to `config.project_root`. This is the root that
+    /// snapshot/diff post-conditions are taken against.
+    fn resolve_mutation_root(&self, state: &RitualState) -> PathBuf {
+        if let Some(ref target_root) = state.target_root {
+            PathBuf::from(target_root)
+        } else {
+            self.config.project_root.clone()
+        }
+    }
+
+    /// Phases whose success is defined as "the filesystem changed."
+    ///
+    /// Currently only `implement` qualifies — design/requirements skills
+    /// also write files but their failure modes are different (and they
+    /// already have artifact-existence checks elsewhere). Keeping this
+    /// list narrow avoids false positives on phases that are *allowed*
+    /// to be no-ops (e.g. review skills that may legitimately conclude
+    /// "no changes needed").
+    fn phase_requires_file_changes(name: &str) -> bool {
+        matches!(name, "implement")
+    }
+
     /// Load graph and assemble context for all pending task nodes.
     /// Returns None if graph doesn't exist or has no task nodes.
     fn build_graph_context(&self, state: &RitualState) -> Option<String> {
@@ -931,6 +1030,17 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
             })
             .collect()
     }
+}
+
+/// Convert an [`FsDiff`] into the string-path representation used by the
+/// `SkillCompleted.artifacts` event. Order is stable (sorted by path) and
+/// includes both added and modified files. Deleted paths are omitted —
+/// downstream consumers expect "what exists now."
+fn artifact_strings(diff: &FsDiff) -> Vec<String> {
+    diff.artifact_paths()
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Extract JSON from LLM output (handles markdown code fences).
@@ -1454,5 +1564,174 @@ mod tests {
             "full review should inject full depth label");
         assert!(!full_injected.contains("REVIEW SCOPE: LIGHT"),
             "full review should NOT inject scope restriction");
+    }
+
+    // ── ISS-025: implement-phase post-condition tests ──
+
+    use super::super::llm::SkillResult;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Test double for `LlmClient` that runs a caller-supplied closure
+    /// inside `run_skill`. The closure receives the working_dir so it can
+    /// optionally write files (simulating a real LLM that called Write/Edit)
+    /// or do nothing (simulating commentary-only output, the ISS-025 bug).
+    struct ScriptedLlm {
+        action: Mutex<Box<dyn FnMut(&Path) + Send>>,
+        tokens: u64,
+        tool_calls: usize,
+        invocations: AtomicUsize,
+    }
+
+    impl ScriptedLlm {
+        fn new<F>(action: F, tokens: u64, tool_calls: usize) -> Self
+        where
+            F: FnMut(&Path) + Send + 'static,
+        {
+            Self {
+                action: Mutex::new(Box::new(action)),
+                tokens,
+                tool_calls,
+                invocations: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ScriptedLlm {
+        async fn run_skill(
+            &self,
+            _skill_prompt: &str,
+            _tools: Vec<ToolDefinition>,
+            _model: &str,
+            working_dir: &Path,
+            _max_iterations: usize,
+        ) -> Result<SkillResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            (self.action.lock().unwrap())(working_dir);
+            Ok(SkillResult {
+                output: "ok".into(),
+                artifacts_created: vec![],
+                tool_calls_made: self.tool_calls,
+                tokens_used: self.tokens,
+            })
+        }
+    }
+
+    fn make_executor_with_llm(root: &Path, llm: Arc<dyn LlmClient>) -> V2Executor {
+        let mut cfg = V2ExecutorConfig::default();
+        cfg.project_root = root.to_path_buf();
+        cfg.llm_client = Some(llm);
+        // Ensure the implement skill prompt loader can find *something*.
+        // run_skill calls load_skill_prompt; for the implement phase the
+        // executor falls back to a built-in prompt template, so no extra
+        // file setup is needed here.
+        V2Executor::new(cfg)
+    }
+
+    #[tokio::test]
+    async fn implement_phase_with_zero_changes_emits_skill_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pre-existing source so the snapshot isn't empty — this is the
+        // realistic case (LLM was asked to fix a bug in real code).
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        // LLM returns successfully but writes nothing — exactly the
+        // ISS-025 bug pattern.
+        let llm = Arc::new(ScriptedLlm::new(|_root: &Path| {}, 19_000, 0));
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("implement", "fix the bug", &state).await;
+
+        match event {
+            RitualEvent::SkillFailed { phase, error } => {
+                assert_eq!(phase, "implement");
+                assert!(
+                    error.contains("no file changes"),
+                    "error should explain post-condition violation, got: {}",
+                    error
+                );
+                assert!(
+                    error.contains("19000") || error.contains("ISS-025"),
+                    "error should cite token waste / issue, got: {}",
+                    error
+                );
+            }
+            other => panic!("expected SkillFailed, got {:?}", other),
+        }
+        assert_eq!(llm.invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn implement_phase_with_file_writes_emits_skill_completed_with_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        // LLM "writes" two files during the run — simulates real Write
+        // tool calls inside the agent loop.
+        let llm = Arc::new(ScriptedLlm::new(
+            |root: &Path| {
+                std::fs::write(root.join("src/lib.rs"), b"fn main() { println!(); }").unwrap();
+                std::fs::write(root.join("src/new.rs"), b"// new file").unwrap();
+            },
+            5_000,
+            3,
+        ));
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("implement", "fix the bug", &state).await;
+
+        match event {
+            RitualEvent::SkillCompleted { phase, artifacts } => {
+                assert_eq!(phase, "implement");
+                let mut sorted = artifacts.clone();
+                sorted.sort();
+                assert_eq!(
+                    sorted,
+                    vec!["src/lib.rs".to_string(), "src/new.rs".to_string()],
+                    "artifacts should reflect actual filesystem diff"
+                );
+            }
+            other => panic!("expected SkillCompleted, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_implement_phase_does_not_enforce_file_change_postcondition() {
+        // Review phases are allowed to be no-ops (e.g. "no findings"). The
+        // post-condition must NOT fire for them.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        let llm = Arc::new(ScriptedLlm::new(|_: &Path| {}, 1_000, 0));
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("review-design", "review", &state).await;
+
+        match event {
+            RitualEvent::SkillCompleted { phase, .. } => {
+                assert_eq!(phase, "review-design");
+            }
+            other => panic!(
+                "non-implement phase with zero file changes must still complete; got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn phase_requires_file_changes_only_implement() {
+        assert!(V2Executor::phase_requires_file_changes("implement"));
+        assert!(!V2Executor::phase_requires_file_changes("review-design"));
+        assert!(!V2Executor::phase_requires_file_changes("draft-design"));
+        assert!(!V2Executor::phase_requires_file_changes("triage"));
+        assert!(!V2Executor::phase_requires_file_changes("verify"));
     }
 }

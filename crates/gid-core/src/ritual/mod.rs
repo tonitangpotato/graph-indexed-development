@@ -21,6 +21,7 @@ pub mod notifier;
 pub mod api_llm_client;
 pub mod composer;
 pub mod state_machine;
+pub mod file_snapshot;
 pub mod v2_executor;
 pub mod gating;
 pub mod work_unit;
