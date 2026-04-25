@@ -48,13 +48,21 @@ impl ProjectState {
     /// Scan the project directory and detect state.
     pub fn detect(project_root: &Path) -> Self {
         let gid_dir = project_root.join(".gid");
-        let graph_path = gid_dir.join("graph.yml");
+        let graph_yml = gid_dir.join("graph.yml");
+        let graph_db = gid_dir.join("graph.db");
         let design_path = project_root.join("DESIGN.md");
 
-        let has_graph = graph_path.exists()
-            && std::fs::metadata(&graph_path)
+        // ISS-039: graph.db (SQLite) is canonical since v0.3; graph.yml is legacy.
+        // Either presence (with content) means a graph exists.
+        let has_graph_db = graph_db.exists()
+            && std::fs::metadata(&graph_db)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+        let has_graph_yml = graph_yml.exists()
+            && std::fs::metadata(&graph_yml)
                 .map(|m| m.len() > 10)
                 .unwrap_or(false);
+        let has_graph = has_graph_db || has_graph_yml;
 
         // Check for requirements files: .gid/requirements-*.md or REQUIREMENTS.md
         let has_requirements = project_root.join("REQUIREMENTS.md").exists()

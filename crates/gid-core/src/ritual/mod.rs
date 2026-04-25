@@ -25,6 +25,7 @@ pub mod file_snapshot;
 pub mod v2_executor;
 pub mod gating;
 pub mod work_unit;
+pub mod graph_phase_mode;
 
 // Re-export key types
 pub use definition::{
