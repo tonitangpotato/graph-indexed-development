@@ -251,6 +251,12 @@ pub fn build_network(graph: &Graph) -> (Network, Vec<String>) {
     }
 
     // 3. Accumulate edge weights between file pairs.
+    //
+    // Weight = relation_weight(relation) × confidence.
+    // This ensures LSP-confirmed edges (confidence ≥ 0.95) dominate over
+    // tree-sitter heuristic edges (confidence 0.3–0.7). Edges without an
+    // explicit confidence field are treated as confidence = 1.0 (legacy/manual
+    // edges are assumed reliable).
     let mut edge_weights: HashMap<(usize, usize), f64> = HashMap::new();
 
     for edge in &graph.edges {
@@ -258,6 +264,11 @@ pub fn build_network(graph: &Graph) -> (Network, Vec<String>) {
         if w == 0.0 {
             continue;
         }
+
+        // Scale by confidence: high-confidence (LSP) edges get full weight,
+        // low-confidence (heuristic) edges are proportionally downweighted.
+        let confidence = edge.confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+        let effective_weight = w * confidence;
 
         // Resolve endpoints to file indices.
         let from_idx = node_to_file_idx
@@ -273,7 +284,7 @@ pub fn build_network(graph: &Graph) -> (Network, Vec<String>) {
             if f == t {
                 continue; // skip self-loops
             }
-            *edge_weights.entry((f, t)).or_insert(0.0) += w;
+            *edge_weights.entry((f, t)).or_insert(0.0) += effective_weight;
         }
     }
 
@@ -353,9 +364,16 @@ pub fn add_co_citation_edges(
         }
     }
 
-    // Build reverse-import index: target_file_idx → set of importer_file_indices
-    // Only consider import-like edges: imports, calls, uses, type_reference, depends_on
-    let mut imported_by: HashMap<usize, HashSet<usize>> = HashMap::new();
+    // Build reverse-import index: target_file_idx → map of (importer_file_idx → max_confidence)
+    //
+    // Only edges with confidence ≥ CO_CITATION_CONFIDENCE_THRESHOLD qualify as
+    // citers. This prevents low-quality heuristic edges (tree-sitter guesses with
+    // confidence 0.3–0.5) from inflating co-citation counts. LSP-confirmed edges
+    // (confidence ≥ 0.95) and reliable static edges (imports, confidence = 1.0)
+    // are the primary contributors.
+    const CO_CITATION_CONFIDENCE_THRESHOLD: f64 = 0.7;
+
+    let mut imported_by: HashMap<usize, HashMap<usize, f64>> = HashMap::new();
 
     for edge in &graph.edges {
         let is_import_like = matches!(
@@ -364,6 +382,11 @@ pub fn add_co_citation_edges(
         );
         if !is_import_like {
             continue;
+        }
+
+        let confidence = edge.confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+        if confidence < CO_CITATION_CONFIDENCE_THRESHOLD {
+            continue; // Skip low-confidence heuristic edges
         }
 
         // Resolve both endpoints to file indices
@@ -378,8 +401,43 @@ pub fn add_co_citation_edges(
 
         if let (Some(from), Some(to)) = (from_idx, to_idx) {
             if from != to {
-                // `from` imports `to`, so `to` is imported_by `from`
-                imported_by.entry(to).or_default().insert(from);
+                // `from` imports `to`, so `to` is imported_by `from` with this confidence.
+                // Keep the max confidence per (target, citer) pair.
+                let entry = imported_by.entry(to).or_default().entry(from).or_insert(0.0);
+                if confidence > *entry {
+                    *entry = confidence;
+                }
+            }
+        }
+    }
+
+    // Build a set of file pairs that already have a direct high-confidence edge.
+    // Co-citation should NOT add signal between pairs where LSP already confirmed
+    // a direct relationship — that would be double-counting the same coupling.
+    let mut direct_high_confidence_pairs: HashSet<(usize, usize)> = HashSet::new();
+    for edge in &graph.edges {
+        let confidence = edge.confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+        if confidence < 0.9 {
+            continue; // Only suppress co-citation for very high confidence direct edges
+        }
+        let is_coupling = matches!(
+            edge.relation.as_str(),
+            "calls" | "imports" | "uses" | "type_reference"
+        );
+        if !is_coupling {
+            continue;
+        }
+        let from_idx = node_to_file_idx
+            .get(edge.from.as_str())
+            .or_else(|| id_to_idx.get(edge.from.as_str()))
+            .copied();
+        let to_idx = node_to_file_idx
+            .get(edge.to.as_str())
+            .or_else(|| id_to_idx.get(edge.to.as_str()))
+            .copied();
+        if let (Some(f), Some(t)) = (from_idx, to_idx) {
+            if f != t {
+                direct_high_confidence_pairs.insert((f.min(t), f.max(t)));
             }
         }
     }
@@ -391,7 +449,8 @@ pub fn add_co_citation_edges(
         return;
     }
 
-    // For each pair of candidates, count shared importers
+    // For each pair of candidates, count shared importers and weight by
+    // the mean confidence of the citing edges.
     let mut co_citation_edges = 0usize;
     for i in 0..candidates.len() {
         let a = candidates[i];
@@ -399,13 +458,36 @@ pub fn add_co_citation_edges(
 
         for j in (i + 1)..candidates.len() {
             let b = candidates[j];
+
+            // Skip pairs already connected by high-confidence direct edges —
+            // co-citation would just redundantly echo what LSP already told us.
+            let pair_key = (a.min(b), a.max(b));
+            if direct_high_confidence_pairs.contains(&pair_key) {
+                continue;
+            }
+
             let citers_b = &imported_by[&b];
 
-            // Count shared citers (intersection)
-            let shared = citers_a.intersection(citers_b).count();
+            // Count shared citers and accumulate their confidence scores
+            let mut shared_count = 0usize;
+            let mut confidence_sum = 0.0f64;
+            for (citer, conf_a) in citers_a {
+                if let Some(conf_b) = citers_b.get(citer) {
+                    shared_count += 1;
+                    // Use the geometric mean of the two confidence values:
+                    // both the A-citation and B-citation from this citer must
+                    // be reliable for the co-citation signal to be trustworthy.
+                    confidence_sum += (conf_a * conf_b).sqrt();
+                }
+            }
 
-            if shared >= min_shared {
-                let edge_weight = (weight * shared as f64).min(max_edge_weight);
+            if shared_count >= min_shared {
+                // Weight = base_weight × shared_count × (avg_confidence_factor)
+                // The confidence factor ensures that co-citation from all-1.0
+                // edges gets full weight, while mixed-confidence sources get
+                // proportionally less.
+                let avg_confidence = confidence_sum / shared_count as f64;
+                let edge_weight = (weight * shared_count as f64 * avg_confidence).min(max_edge_weight);
                 net.add_edge(a, b, edge_weight);
                 net.add_edge(b, a, edge_weight);
                 co_citation_edges += 1;
@@ -415,10 +497,11 @@ pub fn add_co_citation_edges(
 
     if co_citation_edges > 0 {
         eprintln!(
-            "🔗 Added {} co-citation edges ({} candidate files, min_shared={})",
+            "🔗 Added {} co-citation edges ({} candidate files, min_shared={}, confidence_threshold={})",
             co_citation_edges,
             candidates.len(),
             min_shared,
+            CO_CITATION_CONFIDENCE_THRESHOLD,
         );
     }
 }
@@ -4751,5 +4834,268 @@ mod tests {
         let edge_targets: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
         assert!(edge_targets.contains(&"file:src/utils/ink.ts"));
         assert!(edge_targets.contains(&"file:src/utils/debug.ts"));
+    }
+
+    // ── Confidence-aware weighting tests ───────────────────────────────
+
+    #[test]
+    fn test_build_network_confidence_scales_weight() {
+        // Two edges of same relation type but different confidence.
+        // LSP-confirmed (1.0) should get full weight, heuristic (0.3) should be scaled down.
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("a.rs"));
+        g.nodes.push(make_file_node("b.rs"));
+        g.nodes.push(make_file_node("c.rs"));
+
+        let mut edge_high = Edge::new("file:a.rs", "file:b.rs", "calls");
+        edge_high.confidence = Some(1.0); // LSP confirmed
+        g.edges.push(edge_high);
+
+        let mut edge_low = Edge::new("file:a.rs", "file:c.rs", "calls");
+        edge_low.confidence = Some(0.3); // tree-sitter heuristic
+        g.edges.push(edge_low);
+
+        let (net, idx_to_id) = build_network(&g);
+
+        let a = idx_to_id.iter().position(|id| id == "file:a.rs").unwrap();
+        let b = idx_to_id.iter().position(|id| id == "file:b.rs").unwrap();
+        let c = idx_to_id.iter().position(|id| id == "file:c.rs").unwrap();
+
+        let out = net.out_neighbors(a);
+        let weight_ab = out.iter().find(|&&(t, _)| t == b).map(|&(_, w)| w).unwrap();
+        let weight_ac = out.iter().find(|&&(t, _)| t == c).map(|&(_, w)| w).unwrap();
+
+        // Both are "calls" (base weight 1.0), but:
+        // a→b: 1.0 * 1.0 = 1.0
+        // a→c: 1.0 * 0.3 = 0.3
+        assert!(
+            (weight_ab - 1.0).abs() < 1e-9,
+            "full confidence edge should have weight 1.0, got {}",
+            weight_ab
+        );
+        assert!(
+            (weight_ac - 0.3).abs() < 1e-9,
+            "low confidence edge should have weight 0.3, got {}",
+            weight_ac
+        );
+    }
+
+    #[test]
+    fn test_build_network_no_confidence_defaults_to_one() {
+        // Edges without confidence field (legacy/manual) should behave as confidence=1.0
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("x.rs"));
+        g.nodes.push(make_file_node("y.rs"));
+        g.edges.push(Edge::new("file:x.rs", "file:y.rs", "imports")); // confidence = None
+
+        let (net, idx_to_id) = build_network(&g);
+
+        let x = idx_to_id.iter().position(|id| id == "file:x.rs").unwrap();
+        let y = idx_to_id.iter().position(|id| id == "file:y.rs").unwrap();
+
+        let out = net.out_neighbors(x);
+        let weight = out.iter().find(|&&(t, _)| t == y).map(|&(_, w)| w).unwrap();
+
+        // "imports" base weight = 0.8, confidence = 1.0 (default) → 0.8
+        assert!(
+            (weight - WEIGHT_IMPORTS).abs() < 1e-9,
+            "no-confidence edge should use default 1.0, got weight {}",
+            weight
+        );
+    }
+
+    #[test]
+    fn test_co_citation_ignores_low_confidence_citers() {
+        // If citing edges have low confidence (<0.7), they shouldn't count as citers.
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        g.nodes.push(make_file_node("features/f1.ts"));
+        g.nodes.push(make_file_node("features/f2.ts"));
+
+        // f1 and f2 both "import" a and b, but with low confidence (0.3)
+        for from in &["file:features/f1.ts", "file:features/f2.ts"] {
+            for to in &["file:utils/a.ts", "file:utils/b.ts"] {
+                let mut edge = Edge::new(from, to, "imports");
+                edge.confidence = Some(0.3); // heuristic guess
+                g.edges.push(edge);
+            }
+        }
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+
+        // Low-confidence citers (0.3 < 0.7 threshold) should NOT generate co-citation edges
+        assert_eq!(
+            net.num_edges(),
+            edges_before,
+            "low-confidence citers should not create co-citation edges"
+        );
+    }
+
+    #[test]
+    fn test_co_citation_uses_high_confidence_citers() {
+        // High confidence (≥0.7) citing edges SHOULD produce co-citation.
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        g.nodes.push(make_file_node("features/f1.ts"));
+        g.nodes.push(make_file_node("features/f2.ts"));
+
+        // f1 and f2 both import a and b with high confidence (LSP confirmed)
+        for from in &["file:features/f1.ts", "file:features/f2.ts"] {
+            for to in &["file:utils/a.ts", "file:utils/b.ts"] {
+                let mut edge = Edge::new(from, to, "imports");
+                edge.confidence = Some(0.95);
+                g.edges.push(edge);
+            }
+        }
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let edges_before = net.num_edges();
+
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+
+        // High-confidence citers should create co-citation edges
+        assert!(
+            net.num_edges() > edges_before,
+            "high-confidence citers should create co-citation: before={}, after={}",
+            edges_before,
+            net.num_edges()
+        );
+    }
+
+    #[test]
+    fn test_co_citation_skips_pairs_with_direct_high_confidence_edge() {
+        // If A and B already have a direct high-confidence edge (LSP confirmed),
+        // co-citation should NOT add a redundant synthetic edge.
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        g.nodes.push(make_file_node("features/f1.ts"));
+        g.nodes.push(make_file_node("features/f2.ts"));
+
+        // Direct high-confidence edge: a→b (LSP confirmed call)
+        let mut direct = Edge::new("file:utils/a.ts", "file:utils/b.ts", "calls");
+        direct.confidence = Some(1.0);
+        g.edges.push(direct);
+
+        // f1 and f2 both import a and b with high confidence
+        for from in &["file:features/f1.ts", "file:features/f2.ts"] {
+            for to in &["file:utils/a.ts", "file:utils/b.ts"] {
+                let mut edge = Edge::new(from, to, "imports");
+                edge.confidence = Some(1.0);
+                g.edges.push(edge);
+            }
+        }
+
+        let (mut net, idx_to_id) = build_network(&g);
+
+        // Record a→b weight before co-citation
+        let a_idx = idx_to_id.iter().position(|id| id == "file:utils/a.ts").unwrap();
+        let b_idx = idx_to_id.iter().position(|id| id == "file:utils/b.ts").unwrap();
+        let edges_before = net.num_edges();
+
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+
+        // The a↔b co-citation should be suppressed because they have a direct
+        // high-confidence edge already. The network should NOT gain a↔b edges.
+        let a_out_to_b: Vec<f64> = net
+            .out_neighbors(a_idx)
+            .iter()
+            .filter(|&&(t, _)| t == b_idx)
+            .map(|&(_, w)| w)
+            .collect();
+
+        // There should be exactly 1 edge a→b (the direct one from build_network),
+        // not 2 (direct + co-citation).
+        assert_eq!(
+            a_out_to_b.len(),
+            1,
+            "should have exactly 1 a→b edge (direct), not {} (co-citation would add another)",
+            a_out_to_b.len()
+        );
+    }
+
+    #[test]
+    fn test_co_citation_weight_scales_by_confidence() {
+        // Co-citation weight should be scaled by the mean confidence of citing edges.
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("utils/a.ts"));
+        g.nodes.push(make_file_node("utils/b.ts"));
+        g.nodes.push(make_file_node("utils/c.ts"));
+        g.nodes.push(make_file_node("features/f1.ts"));
+        g.nodes.push(make_file_node("features/f2.ts"));
+        g.nodes.push(make_file_node("features/f3.ts"));
+
+        // f1, f2 import a and b with confidence 1.0 (perfect)
+        for from in &["file:features/f1.ts", "file:features/f2.ts"] {
+            for to in &["file:utils/a.ts", "file:utils/b.ts"] {
+                let mut edge = Edge::new(from, to, "imports");
+                edge.confidence = Some(1.0);
+                g.edges.push(edge);
+            }
+        }
+
+        // f1, f2 import c with confidence 0.7 (barely above threshold)
+        // f3 imports a and c with confidence 1.0
+        // So a↔c: shared citers = {f1(a:1.0, c:0.7), f2(a:1.0, c:0.7)} → 2 shared
+        for from in &["file:features/f1.ts", "file:features/f2.ts"] {
+            let mut edge = Edge::new(from, "file:utils/c.ts", "imports");
+            edge.confidence = Some(0.7);
+            g.edges.push(edge);
+        }
+
+        let (mut net, idx_to_id) = build_network(&g);
+
+        add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
+
+        let a_idx = idx_to_id.iter().position(|id| id == "file:utils/a.ts").unwrap();
+        let b_idx = idx_to_id.iter().position(|id| id == "file:utils/b.ts").unwrap();
+        let c_idx = idx_to_id.iter().position(|id| id == "file:utils/c.ts").unwrap();
+
+        // a↔b: shared citers {f1, f2}, each with confidence 1.0 for both.
+        // avg_confidence = sqrt(1.0*1.0) = 1.0 per citer → avg = 1.0
+        // weight = 0.4 * 2 * 1.0 = 0.8
+        let weight_ab: f64 = net
+            .out_neighbors(a_idx)
+            .iter()
+            .filter(|&&(t, _)| t == b_idx)
+            .map(|&(_, w)| w)
+            .sum();
+
+        // a↔c: shared citers {f1, f2}, each with conf_a=1.0, conf_c=0.7
+        // geometric mean per citer = sqrt(1.0 * 0.7) ≈ 0.8367
+        // avg_confidence ≈ 0.8367
+        // weight = 0.4 * 2 * 0.8367 ≈ 0.6693
+        let weight_ac: f64 = net
+            .out_neighbors(a_idx)
+            .iter()
+            .filter(|&&(t, _)| t == c_idx)
+            .map(|&(_, w)| w)
+            .sum();
+
+        assert!(
+            weight_ab > weight_ac,
+            "a↔b (all conf=1.0) should be stronger than a↔c (mixed conf): {} vs {}",
+            weight_ab,
+            weight_ac
+        );
+
+        // Verify approximate values
+        assert!(
+            (weight_ab - 0.8).abs() < 0.01,
+            "a↔b should be ~0.8, got {}",
+            weight_ab
+        );
+        let expected_ac = 0.4 * 2.0 * (1.0_f64 * 0.7).sqrt();
+        assert!(
+            (weight_ac - expected_ac).abs() < 0.01,
+            "a↔c should be ~{:.4}, got {}",
+            expected_ac,
+            weight_ac
+        );
     }
 }

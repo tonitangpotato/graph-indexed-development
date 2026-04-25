@@ -69,8 +69,12 @@ pub struct LabelingConfig {
     pub max_briefs_per_component: usize,
     /// Maximum chars for truncated context fields (default: 2000).
     pub max_context_chars: usize,
-    /// Total token budget for all LLM calls (GUARD-4, default: 50_000).
+    /// Total token budget for all LLM calls (GUARD-4, default: 200_000).
     pub token_budget: usize,
+    /// Minimum files in a component to justify LLM naming (default: 3).
+    /// Components with fewer files use their auto-generated name directly,
+    /// saving token budget for feature inference on large repos.
+    pub min_naming_size: usize,
     /// Tokens consumed so far (tracked internally).
     tokens_used: usize,
 }
@@ -82,7 +86,8 @@ impl Default for LabelingConfig {
             max_functions_per_component: 20,
             max_briefs_per_component: 10,
             max_context_chars: 2000,
-            token_budget: 50_000,
+            token_budget: 200_000,
+            min_naming_size: 3,
             tokens_used: 0,
         }
     }
@@ -831,10 +836,35 @@ pub async fn name_components(
 ) -> Result<Vec<ComponentLabel>> {
     let mut all_labels: Vec<ComponentLabel> = Vec::new();
 
-    // Process in batches
-    for batch_start in (0..contexts.len()).step_by(config.batch_size) {
-        let batch_end = (batch_start + config.batch_size).min(contexts.len());
-        let batch: Vec<&ComponentContext> = contexts[batch_start..batch_end].iter().collect();
+    // Separate components into those worth LLM-naming vs auto-name fallback.
+    // Small components (fewer files than min_naming_size) use auto_name directly,
+    // saving token budget for feature inference on large repos.
+    let mut llm_contexts: Vec<&ComponentContext> = Vec::new();
+    for ctx in contexts {
+        if ctx.files.len() < config.min_naming_size && ctx.child_component_names.is_empty() {
+            // Too small for LLM — use auto_name
+            all_labels.push(ComponentLabel {
+                component_id: ctx.component_id.clone(),
+                title: ctx.auto_name.clone(),
+                description: String::new(),
+            });
+        } else {
+            llm_contexts.push(ctx);
+        }
+    }
+
+    tracing::info!(
+        total = contexts.len(),
+        llm_named = llm_contexts.len(),
+        auto_named = contexts.len() - llm_contexts.len(),
+        min_naming_size = config.min_naming_size,
+        "Component naming: skipping small components to preserve token budget"
+    );
+
+    // Process LLM-worthy components in batches
+    for batch_start in (0..llm_contexts.len()).step_by(config.batch_size) {
+        let batch_end = (batch_start + config.batch_size).min(llm_contexts.len());
+        let batch: Vec<&ComponentContext> = llm_contexts[batch_start..batch_end].to_vec();
 
         let prompt = build_naming_prompt(&batch, project_ctx);
 
@@ -854,7 +884,7 @@ pub async fn name_components(
 
         // Call LLM
         let batch_num = batch_start / config.batch_size + 1;
-        let total_batches = (contexts.len() + config.batch_size - 1) / config.batch_size;
+        let total_batches = (llm_contexts.len() + config.batch_size - 1) / config.batch_size;
         tracing::info!(batch = batch_num, total = total_batches, "Calling LLM for naming batch");
         match llm.complete(&prompt).await {
             Ok(response) => {
@@ -1661,7 +1691,10 @@ mod tests {
         ]"#;
 
         let llm = MockLlm::new(vec![naming_json.to_string(), feature_json.to_string()]);
-        let config = LabelingConfig::default();
+        let config = LabelingConfig {
+            min_naming_size: 1,  // test needs all components to go through LLM
+            ..LabelingConfig::default()
+        };
 
         let result = label(&graph, &cluster, Some(&llm), config).await.unwrap();
 
@@ -1751,6 +1784,7 @@ mod tests {
         let project_ctx = ProjectContext::default();
         let mut config = LabelingConfig {
             batch_size: 5,
+            min_naming_size: 1,  // disable filtering to test pure batching
             ..LabelingConfig::default()
         };
 
