@@ -369,18 +369,19 @@ fn extract_calls_for_file(
                 let source = content.as_bytes();
                 let root = tree.root_node();
 
-                extract_calls_rust(
-                    root,
+                let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+                let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
                     source,
                     rel_path,
-                    &state.func_map,
-                    &state.method_to_class,
-                    &file_func_ids,
+                    package_dir,
+                    func_name_map: &state.func_map,
+                    method_to_class: &state.method_to_class,
+                    file_func_ids: &file_func_ids,
                     node_pkg_map,
-                    &state.file_imported_names,
-                    &state.all_struct_field_types,
-                    edges,
-                );
+                    file_imported_names: &state.file_imported_names,
+                    struct_field_types: &state.all_struct_field_types,
+                };
+                extract_calls_rust(root, &call_ctx, edges);
             }
         }
         Language::TypeScript => {

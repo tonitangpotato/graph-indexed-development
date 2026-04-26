@@ -445,18 +445,18 @@ pub fn create_and_use() {
         let tree = parser.parse(content, None).unwrap();
         let root = tree.root_node();
         
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "calc.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "calc.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &HashMap::new(),
+            struct_field_types: &HashMap::new(),
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
@@ -1047,18 +1047,18 @@ mod tests {
         let file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
         let struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "test.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &file_imported_names,
-            &struct_field_types,
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "test.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &file_imported_names,
+            struct_field_types: &struct_field_types,
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
@@ -1131,18 +1131,18 @@ fn main() {
         let file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
         let struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "test.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &file_imported_names,
-            &struct_field_types,
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "test.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &file_imported_names,
+            struct_field_types: &struct_field_types,
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
@@ -1332,18 +1332,18 @@ mod tests {
         let tree = parser.parse(content, None).unwrap();
         let root = tree.root_node();
 
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "safety.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &file_imported_names,
-            &struct_field_types,
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "safety.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &file_imported_names,
+            struct_field_types: &struct_field_types,
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
