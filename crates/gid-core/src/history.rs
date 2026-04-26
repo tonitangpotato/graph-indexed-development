@@ -292,7 +292,7 @@ impl HistoryManager {
             .collect();
         
         // Sort by filename (which includes timestamp) in descending order
-        files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
         
         for entry in files {
             let filepath = entry.path();

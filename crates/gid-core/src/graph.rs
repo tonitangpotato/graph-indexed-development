@@ -741,11 +741,7 @@ impl Graph {
     pub fn project_nodes(&self) -> Vec<&Node> {
         // TODO: after T4.1 migration backfills source on all nodes, remove the None branch
         self.nodes.iter().filter(|n| {
-            match n.source.as_deref() {
-                None => true,
-                Some("project") | Some("manual") => true,
-                _ => false,
-            }
+            matches!(n.source.as_deref(), None | Some("project") | Some("manual"))
         }).collect()
     }
 
@@ -760,11 +756,10 @@ impl Graph {
     /// ISS-047: catch-all so the summary always sums to total node count.
     pub fn other_source_nodes(&self) -> Vec<&Node> {
         self.nodes.iter().filter(|n| {
-            match n.source.as_deref() {
-                None => false,
-                Some("project") | Some("manual") | Some("extract") | Some("infer") => false,
-                _ => true,
-            }
+            !matches!(
+                n.source.as_deref(),
+                None | Some("project") | Some("manual") | Some("extract") | Some("infer")
+            )
         }).collect()
     }
 

@@ -1691,7 +1691,6 @@ pub(crate) fn extract_rust_call_target(node: tree_sitter::Node, source: &[u8]) -
 /// For `impl Type` (no trait), returns None.
 pub(crate) fn extract_impl_trait_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut first_type: Option<String> = None;
-    let mut seen_for = false;
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1710,15 +1709,18 @@ pub(crate) fn extract_impl_trait_name(node: tree_sitter::Node, source: &[u8]) ->
 
                 if first_type.is_none() {
                     first_type = name;
-                } else if !seen_for {
-                    // Second type without 'for' — shouldn't happen normally
+                } else {
+                    // Second type without an intervening `for` keyword —
+                    // we already would have returned early in the `for` branch
+                    // below. This means malformed `impl A B`; treat as no trait.
                     return None;
                 }
             }
             _ => {
                 if child.utf8_text(source).ok() == Some("for") {
-                    seen_for = true;
-                    // first_type was the trait
+                    // first_type was the trait; the next type ident will be
+                    // the impl target. We can return early here since the
+                    // caller only needs the trait name.
                     return first_type;
                 }
             }
