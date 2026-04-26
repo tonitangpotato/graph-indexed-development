@@ -736,11 +736,38 @@ impl Graph {
         self.nodes.iter().filter(|n| n.source.as_deref() == Some("extract")).collect()
     }
 
-    /// Get all project nodes (source == "project" or legacy None)
+    /// Get all project nodes (source == "project", "manual", or legacy None).
+    /// ISS-047: `manual` is treated as project layer because `gid_add_task`
+    /// (rustclaw's preferred way to file issues/tasks) writes nodes with
+    /// source="manual". Excluding them caused `gid tasks` to report "0 nodes"
+    /// on graphs full of manually-filed issues.
     pub fn project_nodes(&self) -> Vec<&Node> {
         // TODO: after T4.1 migration backfills source on all nodes, remove the None branch
         self.nodes.iter().filter(|n| {
-            n.source.as_deref().map_or(true, |s| s == "project")
+            match n.source.as_deref() {
+                None => true,
+                Some("project") | Some("manual") => true,
+                _ => false,
+            }
+        }).collect()
+    }
+
+    /// Get all inferred nodes (source == "infer"). ISS-047: surfaced in
+    /// `summary()` so `gid tasks` can report inferred component/feature
+    /// counts without lying about totals.
+    pub fn inferred_nodes(&self) -> Vec<&Node> {
+        self.nodes.iter().filter(|n| n.source.as_deref() == Some("infer")).collect()
+    }
+
+    /// Get nodes whose source doesn't fit project/code/infer buckets.
+    /// ISS-047: catch-all so the summary always sums to total node count.
+    pub fn other_source_nodes(&self) -> Vec<&Node> {
+        self.nodes.iter().filter(|n| {
+            match n.source.as_deref() {
+                None => false,
+                Some("project") | Some("manual") | Some("extract") | Some("infer") => false,
+                _ => true,
+            }
         }).collect()
     }
 
@@ -811,9 +838,13 @@ impl Graph {
     pub fn summary(&self) -> GraphSummary {
         let project_nodes = self.project_nodes();
         let code_nodes = self.code_nodes();
+        let inferred_nodes = self.inferred_nodes();
+        let other_nodes = self.other_source_nodes();
         let mut s = GraphSummary {
             total_nodes: project_nodes.len(),
             code_nodes: code_nodes.len(),
+            inferred_nodes: inferred_nodes.len(),
+            other_nodes: other_nodes.len(),
             total_edges: self.edges.len(),
             ..Default::default()
         };
@@ -837,12 +868,21 @@ impl Graph {
     /// doesn't claim 0 nodes while listing many.
     pub fn summary_text(&self) -> String {
         let s = self.summary();
-        let header = if s.code_nodes > 0 {
-            format!("Graph: {} project nodes, {} code nodes, {} edges",
-                s.total_nodes, s.code_nodes, s.total_edges)
-        } else {
-            format!("Graph: {} nodes, {} edges", s.total_nodes, s.total_edges)
-        };
+        // ISS-047: build header from all non-zero buckets so manual/inferred
+        // nodes don't vanish from the count.
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("{} project nodes", s.total_nodes));
+        if s.code_nodes > 0 {
+            parts.push(format!("{} code nodes", s.code_nodes));
+        }
+        if s.inferred_nodes > 0 {
+            parts.push(format!("{} inferred nodes", s.inferred_nodes));
+        }
+        if s.other_nodes > 0 {
+            parts.push(format!("{} other nodes", s.other_nodes));
+        }
+        parts.push(format!("{} edges", s.total_edges));
+        let header = format!("Graph: {}", parts.join(", "));
         let mut lines = vec![header];
 
         if s.total_nodes > 0 {
@@ -938,13 +978,20 @@ pub struct Task {
 
 #[derive(Debug, Default)]
 pub struct GraphSummary {
-    /// Project-layer node count (source == "project" or legacy None).
+    /// Project-layer node count (source == "project", "manual", or legacy None).
     /// This is what status counts (todo/done/etc.) are computed from.
+    /// ISS-047: includes "manual" source so manually-filed issues are counted.
     pub total_nodes: usize,
     /// Code-layer node count (source == "extract"). ISS-034: surfaced
     /// separately so `gid tasks --node-type all|code` can show both
     /// populations without lying about node counts.
     pub code_nodes: usize,
+    /// Inferred node count (source == "infer"). ISS-047: surfaced separately
+    /// so component/feature inference results don't vanish from the summary.
+    pub inferred_nodes: usize,
+    /// Catch-all for any source value not in {project, manual, extract, infer, None}.
+    /// ISS-047: ensures total node count = sum of all buckets, no silent drops.
+    pub other_nodes: usize,
     pub total_edges: usize,
     pub todo: usize,
     pub in_progress: usize,
@@ -987,11 +1034,25 @@ impl std::fmt::Display for GraphSummary {
     /// listing dozens of code nodes in the body. Status counts always reflect
     /// project-layer nodes only — code nodes have no task status.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.code_nodes > 0 {
+        // ISS-047: emit each non-zero bucket so manual/inferred populations
+        // don't get silently dropped from the header line.
+        let has_extras = self.code_nodes > 0 || self.inferred_nodes > 0 || self.other_nodes > 0;
+        if has_extras {
+            let mut parts: Vec<String> = vec![format!("{} project nodes", self.total_nodes)];
+            if self.code_nodes > 0 {
+                parts.push(format!("{} code nodes", self.code_nodes));
+            }
+            if self.inferred_nodes > 0 {
+                parts.push(format!("{} inferred nodes", self.inferred_nodes));
+            }
+            if self.other_nodes > 0 {
+                parts.push(format!("{} other nodes", self.other_nodes));
+            }
+            parts.push(format!("{} edges", self.total_edges));
             write!(
                 f,
-                "{} project nodes, {} code nodes, {} edges | todo={} progress={} done={} blocked={} failed={} cancelled={} | ready={}",
-                self.total_nodes, self.code_nodes, self.total_edges,
+                "{} | todo={} progress={} done={} blocked={} failed={} cancelled={} | ready={}",
+                parts.join(", "),
                 self.todo, self.in_progress, self.done, self.blocked, self.failed, self.cancelled,
                 self.ready,
             )
@@ -1227,6 +1288,172 @@ mod layer_filter_tests {
         // task-1 should be ready, code nodes should NOT appear
         assert!(ready.iter().any(|n| n.id == "task-1"));
         assert!(!ready.iter().any(|n| n.source.as_deref() == Some("extract")));
+    }
+
+    // ── ISS-047: summary surfaces manual + inferred + other source nodes ──
+
+    /// Helper: build a graph mixing every source bucket the summary tracks.
+    fn multi_source_graph() -> Graph {
+        let mut g = Graph::new();
+
+        // 2 project nodes (one explicit, one legacy/None)
+        let mut t = Node::new("task-1", "Project task");
+        t.source = Some("project".to_string());
+        g.add_node(t);
+        g.add_node(Node::new("legacy-1", "Legacy task"));
+
+        // 3 manual nodes (gid_add_task default — what rustclaw files issues as)
+        for i in 1..=3 {
+            let id = format!("iss-{:03}", i);
+            let title = format!("Filed issue {}", i);
+            let mut m = Node::new(&id, &title);
+            m.source = Some("manual".to_string());
+            g.add_node(m);
+        }
+
+        // 2 code nodes
+        let mut c1 = Node::new("fn:foo", "foo");
+        c1.source = Some("extract".to_string());
+        c1.node_type = Some("code".to_string());
+        g.add_node(c1);
+        let mut c2 = Node::new("fn:bar", "bar");
+        c2.source = Some("extract".to_string());
+        c2.node_type = Some("code".to_string());
+        g.add_node(c2);
+
+        // 4 inferred nodes (from `gid infer`)
+        for i in 1..=4 {
+            let id = format!("comp-{}", i);
+            let title = format!("Component {}", i);
+            let mut inf = Node::new(&id, &title);
+            inf.source = Some("infer".to_string());
+            g.add_node(inf);
+        }
+
+        // 1 unknown-source node — should land in `other_nodes` bucket
+        let mut o = Node::new("import-1", "Imported node");
+        o.source = Some("imported".to_string());
+        g.add_node(o);
+
+        g
+    }
+
+    #[test]
+    fn test_iss047_project_nodes_includes_manual_source() {
+        // Root cause of ISS-047: manual nodes (default for gid_add_task) were
+        // dropped from project_nodes(), so `gid tasks` reported 0 nodes on
+        // graphs full of manually-filed issues.
+        let g = multi_source_graph();
+        let pn = g.project_nodes();
+        // 1 project + 1 legacy + 3 manual = 5
+        assert_eq!(pn.len(), 5, "project bucket must include manual + legacy nodes");
+        assert!(pn.iter().any(|n| n.source.as_deref() == Some("manual")),
+            "manual nodes must appear in project_nodes()");
+        assert!(pn.iter().any(|n| n.source.is_none()),
+            "legacy (None) nodes must appear in project_nodes()");
+        // Code/infer/other must NOT leak in
+        assert!(!pn.iter().any(|n| n.source.as_deref() == Some("extract")));
+        assert!(!pn.iter().any(|n| n.source.as_deref() == Some("infer")));
+        assert!(!pn.iter().any(|n| n.source.as_deref() == Some("imported")));
+    }
+
+    #[test]
+    fn test_iss047_inferred_nodes_bucket() {
+        let g = multi_source_graph();
+        let inf = g.inferred_nodes();
+        assert_eq!(inf.len(), 4);
+        assert!(inf.iter().all(|n| n.source.as_deref() == Some("infer")));
+    }
+
+    #[test]
+    fn test_iss047_other_source_nodes_bucket() {
+        let g = multi_source_graph();
+        let other = g.other_source_nodes();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].id, "import-1");
+    }
+
+    #[test]
+    fn test_iss047_summary_buckets_sum_to_total_nodes() {
+        // Acceptance criterion: no node is silently dropped from the summary.
+        let g = multi_source_graph();
+        let s = g.summary();
+        let bucket_sum = s.total_nodes + s.code_nodes + s.inferred_nodes + s.other_nodes;
+        assert_eq!(
+            bucket_sum,
+            g.nodes.len(),
+            "summary buckets ({} project + {} code + {} inferred + {} other) \
+             must sum to total node count ({}) — no silent drops",
+            s.total_nodes, s.code_nodes, s.inferred_nodes, s.other_nodes, g.nodes.len()
+        );
+        // Specifically: 5 project, 2 code, 4 inferred, 1 other = 12 total
+        assert_eq!(s.total_nodes, 5);
+        assert_eq!(s.code_nodes, 2);
+        assert_eq!(s.inferred_nodes, 4);
+        assert_eq!(s.other_nodes, 1);
+        assert_eq!(g.nodes.len(), 12);
+    }
+
+    #[test]
+    fn test_iss047_summary_display_lists_all_non_zero_buckets() {
+        let g = multi_source_graph();
+        let s = g.summary();
+        let rendered = format!("{}", s);
+        assert!(rendered.contains("5 project nodes"), "got: {}", rendered);
+        assert!(rendered.contains("2 code nodes"), "got: {}", rendered);
+        assert!(rendered.contains("4 inferred nodes"), "got: {}", rendered);
+        assert!(rendered.contains("1 other nodes"), "got: {}", rendered);
+    }
+
+    #[test]
+    fn test_iss047_summary_text_lists_all_non_zero_buckets() {
+        let g = multi_source_graph();
+        let txt = g.summary_text();
+        assert!(txt.contains("5 project nodes"), "got:\n{}", txt);
+        assert!(txt.contains("2 code nodes"), "got:\n{}", txt);
+        assert!(txt.contains("4 inferred nodes"), "got:\n{}", txt);
+        assert!(txt.contains("1 other nodes"), "got:\n{}", txt);
+    }
+
+    #[test]
+    fn test_iss047_manual_only_graph_is_not_reported_as_empty() {
+        // Reproduces the original ISS-047 scenario: a graph with only
+        // gid_add_task-filed issues. Before fix: "0 project nodes" while
+        // listing many. After fix: count matches reality.
+        let mut g = Graph::new();
+        for i in 1..=5 {
+            let id = format!("iss-0{:02}", i);
+            let title = format!("Issue {}", i);
+            let mut n = Node::new(&id, &title);
+            n.source = Some("manual".to_string());
+            g.add_node(n);
+        }
+        let s = g.summary();
+        assert_eq!(s.total_nodes, 5,
+            "manual-only graph must report 5 project nodes, not 0 (ISS-047 regression)");
+        assert_eq!(s.code_nodes, 0);
+        assert_eq!(s.inferred_nodes, 0);
+        assert_eq!(s.other_nodes, 0);
+    }
+
+    #[test]
+    fn test_iss047_inferred_only_graph_surfaces_count() {
+        // After `gid infer` on a fresh graph, only infer-source nodes exist.
+        // They must appear in the summary header.
+        let mut g = Graph::new();
+        for i in 1..=3 {
+            let id = format!("comp-{}", i);
+            let title = format!("Component {}", i);
+            let mut n = Node::new(&id, &title);
+            n.source = Some("infer".to_string());
+            g.add_node(n);
+        }
+        let s = g.summary();
+        let rendered = format!("{}", s);
+        assert_eq!(s.total_nodes, 0);
+        assert_eq!(s.inferred_nodes, 3);
+        assert!(rendered.contains("3 inferred nodes"),
+            "expected '3 inferred nodes' in: {}", rendered);
     }
 }
 

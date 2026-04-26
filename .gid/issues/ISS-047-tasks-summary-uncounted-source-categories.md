@@ -1,7 +1,8 @@
 # ISS-047: `gid tasks` summary still misleading — `manual` and `infer` source nodes are uncounted (regression of ISS-034 fix)
 
-**Status:** open
+**Status:** closed (2026-04-26)
 **Priority:** P2 (UX correctness; same trust impact as ISS-034 — agents and humans see "0 nodes" in a populated graph)
+**Resolution:** Phase 1 (summary buckets) + Phase 2 option (b) (project_nodes accepts "manual") implemented. 7 regression tests added in `graph::layer_filter_tests`. All 1122 lib tests green with --all-features.
 **Component:** `crates/gid-core/src/graph.rs` (`summary()`, `summary_text()`, Display impl)
 **Filed:** 2026-04-26
 **Discovered by:** RustClaw (after adding ISS-042..046 task nodes via `gid_add_task` to gid-rs's own graph)
