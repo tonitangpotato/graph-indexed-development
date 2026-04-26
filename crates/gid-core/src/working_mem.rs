@@ -238,7 +238,7 @@ pub fn find_low_risk_alternatives(
     // Find packages containing failed files
     let packages: HashSet<String> = failed_files.iter()
         .filter_map(|f| {
-            f.rsplitn(2, '/').nth(1).map(|s| s.to_string())
+            f.rsplit_once('/').map(|x| x.0).map(|s| s.to_string())
         })
         .collect();
 
@@ -832,9 +832,7 @@ impl WorkingMemory {
                 let t = test_a.test_outcome.as_ref().unwrap();
 
                 // Find the last EDIT before this TEST
-                let edit_info = self.attempts.iter()
-                    .filter(|a| a.round < test_a.round && matches!(a.action, Action::Edit { .. }))
-                    .last();
+                let edit_info = self.attempts.iter().rfind(|a| a.round < test_a.round && matches!(a.action, Action::Edit { .. }));
 
                 let (target, callers) = if let Some(edit) = edit_info {
                     let target_str = match &edit.action {

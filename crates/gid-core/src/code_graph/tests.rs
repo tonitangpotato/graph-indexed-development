@@ -657,7 +657,7 @@ class Helper {
             .filter(|n| n.kind == NodeKind::File)
             .collect();
 
-        let actual_files = vec!["Tool.ts", "components/Tool.ts", "main.ts"];
+        let actual_files = ["Tool.ts", "components/Tool.ts", "main.ts"];
 
         // There should be exactly 3 file nodes — no ghosts
         assert_eq!(

@@ -121,7 +121,7 @@ pub fn assess_complexity(
     test_count: usize,
 ) -> ComplexityReport {
     let keywords = CodeGraph::extract_keywords(problem_statement);
-    let keyword_refs: Vec<&str> = keywords.iter().map(|s| *s).collect();
+    let keyword_refs: Vec<&str> = keywords.to_vec();
     assess_complexity_from_graph(code_graph, &keyword_refs, test_count)
 }
 

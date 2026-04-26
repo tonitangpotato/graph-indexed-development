@@ -1,7 +1,7 @@
 //! Integration tests for the approval gate system.
 
 use gid_core::ritual::approval::ApprovalGate;
-use gid_core::ritual::definition::{RitualDefinition, PhaseKind};
+use gid_core::ritual::definition::RitualDefinition;
 use std::path::PathBuf;
 
 fn make_ritual(approval_mode: &str, phase_approval: &str) -> RitualDefinition {

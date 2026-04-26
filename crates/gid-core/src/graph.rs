@@ -224,7 +224,9 @@ impl Node {
 /// Status of a node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum NodeStatus {
+    #[default]
     Todo,
     #[serde(alias = "in_progress", alias = "in-progress")]
     InProgress,
@@ -238,11 +240,6 @@ pub enum NodeStatus {
     NeedsResolution,
 }
 
-impl Default for NodeStatus {
-    fn default() -> Self {
-        Self::Todo
-    }
-}
 
 impl std::fmt::Display for NodeStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -417,7 +414,7 @@ impl Graph {
 
     pub fn remove_edge(&mut self, from: &str, to: &str, relation: Option<&str>) {
         self.edges.retain(|e| {
-            !(e.from == from && e.to == to && relation.map_or(true, |r| e.relation == r))
+            !(e.from == from && e.to == to && relation.is_none_or(|r| e.relation == r))
         });
     }
 
@@ -818,7 +815,7 @@ impl Graph {
                     Some(deps) => deps.iter().all(|e| {
                         status_map
                             .get(e.to.as_str())
-                            .map_or(true, |s| **s == NodeStatus::Done)
+                            .is_none_or(|s| **s == NodeStatus::Done)
                     }),
                 }
             })

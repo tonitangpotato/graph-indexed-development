@@ -10,7 +10,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::code_graph::CodeGraph;
-use crate::graph::Graph;
 use crate::ignore::IgnoreList;
 use crate::storage::{load_graph_auto, save_graph_auto, StorageBackend};
 use crate::unify::{codegraph_to_graph_nodes, merge_code_layer, generate_bridge_edges};

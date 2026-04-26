@@ -63,7 +63,7 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             metadata,
             file_path: Some(code_node.file_path.clone()),
             lang: None,
-            start_line: code_node.line.map(|l| l as usize),
+            start_line: code_node.line.map(|l| l),
             end_line: None,
             signature: code_node.signature.clone(),
             visibility: None,
@@ -204,7 +204,7 @@ pub fn merge_relevant_code(
             metadata,
             file_path: Some(code_node.file_path.clone()),
             lang: None,
-            start_line: code_node.line.map(|l| l as usize),
+            start_line: code_node.line.map(|l| l),
             end_line: None,
             signature: code_node.signature.clone(),
             visibility: None,
@@ -285,8 +285,7 @@ fn code_node_to_task_id(code_id: &str) -> String {
         .replace("func:", "code:")
         .replace("method:", "code:")
         .replace("module_ref:", "code:")
-        .replace('/', "_")
-        .replace(':', "_")
+        .replace(['/', ':'], "_")
 }
 
 /// Statistics about the unified graph.

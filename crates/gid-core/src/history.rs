@@ -287,7 +287,7 @@ impl HistoryManager {
         let mut files: Vec<_> = fs::read_dir(&self.history_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.path().extension().map_or(false, |ext| ext == "yml" || ext == "yaml")
+                e.path().extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
             })
             .collect();
         
@@ -460,12 +460,12 @@ impl HistoryManager {
         let mut files: Vec<_> = fs::read_dir(&self.history_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.path().extension().map_or(false, |ext| ext == "yml" || ext == "yaml")
+                e.path().extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
             })
             .collect();
         
         // Sort by filename in ascending order (oldest first)
-        files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        files.sort_by_key(|a| a.file_name());
         
         // Remove oldest files if we have too many
         while files.len() > MAX_HISTORY_ENTRIES {
@@ -547,7 +547,7 @@ mod tests {
         let count = fs::read_dir(&mgr.history_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "yml"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "yml"))
             .count();
 
         assert!(
@@ -873,7 +873,7 @@ mod tests {
         let count = fs::read_dir(&history_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "yml"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "yml"))
             .count();
         assert_eq!(count, total, "list_snapshots should not prune files");
     }
@@ -1263,7 +1263,7 @@ mod tests {
         // Count before
         let count_before: usize = fs::read_dir(&history_dir).unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "yml"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "yml"))
             .count();
         assert_eq!(count_before, MAX_HISTORY_ENTRIES);
 
@@ -1272,7 +1272,7 @@ mod tests {
 
         let count_after: usize = fs::read_dir(&history_dir).unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "yml"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "yml"))
             .count();
         assert!(count_after <= MAX_HISTORY_ENTRIES);
     }
@@ -1298,7 +1298,7 @@ mod tests {
 
         let remaining: Vec<String> = fs::read_dir(&history_dir).unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "yml"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "yml"))
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
 

@@ -50,20 +50,17 @@ pub use labeling::{LabelingConfig, LabelingResult, SimpleLlm};
 
 /// Inference depth level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum InferLevel {
     /// Only Infomap clustering → component layer.
     Component,
     /// Clustering + LLM → component + feature layers.
     Feature,
     /// Same as Feature (alias for completeness).
+    #[default]
     All,
 }
 
-impl Default for InferLevel {
-    fn default() -> Self {
-        Self::All
-    }
-}
 
 // ── InferConfig ────────────────────────────────────────────────────────────
 

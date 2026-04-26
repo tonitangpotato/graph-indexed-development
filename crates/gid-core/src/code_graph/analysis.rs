@@ -86,11 +86,10 @@ impl CodeGraph {
             for edge in self.incoming_edges(source_id) {
                 if edge.relation == EdgeRelation::Calls {
                     if let Some(caller) = self.node_by_id(&edge.from) {
-                        if caller.file_path.contains("/tests/") || caller.file_path.contains("/test_") {
-                            if seen.insert(caller.id.clone()) {
+                        if (caller.file_path.contains("/tests/") || caller.file_path.contains("/test_"))
+                            && seen.insert(caller.id.clone()) {
                                 test_nodes.push(caller);
                             }
-                        }
                     }
                 }
             }

@@ -1949,7 +1949,7 @@ mod tests {
         std::fs::create_dir_all(gid_dir).unwrap();
         let mut graph = Graph::new();
         for (id, title, status) in tasks {
-            let mut n = crate::graph::Node::new(*id, *title);
+            let mut n = crate::graph::Node::new(id, title);
             n.node_type = Some("task".into());
             n.status = status.clone();
             graph.add_node(n);

@@ -31,10 +31,7 @@ impl CodeGraph {
                 if start_line > 0 && start_line <= lines.len() {
                     let start_idx = start_line - 1;
                     let end_idx = (start_idx + 15).min(lines.len());
-                    let preview: String = lines[start_idx..end_idx]
-                        .iter()
-                        .map(|l| *l)
-                        .collect::<Vec<_>>()
+                    let preview: String = lines[start_idx..end_idx].to_vec()
                         .join("\n");
                     result.push('\n');
                     result.push_str(&preview);
@@ -474,7 +471,7 @@ impl CodeGraph {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = &source[name_node.byte_range()];
                     let matched =
-                        target_names.map_or(true, |targets| targets.iter().any(|t| t == name));
+                        target_names.is_none_or(|targets| targets.iter().any(|t| t == name));
                     if matched {
                         let line = name_node.start_position().row + 1;
                         let id = format!("func:{}:{}", file_path, name);
@@ -501,7 +498,7 @@ impl CodeGraph {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = &source[name_node.byte_range()];
                     let matched =
-                        target_names.map_or(true, |targets| targets.iter().any(|t| t == name));
+                        target_names.is_none_or(|targets| targets.iter().any(|t| t == name));
                     if matched {
                         let line = name_node.start_position().row + 1;
                         let id = format!("class:{}:{}", file_path, name);

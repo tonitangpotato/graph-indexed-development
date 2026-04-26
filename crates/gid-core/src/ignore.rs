@@ -158,11 +158,7 @@ impl IgnoreList {
         
         for pattern in &self.patterns {
             if pattern.matches(path, is_dir) {
-                if pattern.negated {
-                    ignored = false;
-                } else {
-                    ignored = true;
-                }
+                ignored = !pattern.negated;
             }
         }
         

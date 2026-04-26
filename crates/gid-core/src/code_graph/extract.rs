@@ -215,15 +215,14 @@ fn integrate_file_results(
 
     // Track method→class and class→methods relationships
     for edge in &result.edges {
-        if edge.relation == EdgeRelation::DefinedIn {
-            if edge.from.starts_with("method:") && edge.to.starts_with("class:") {
+        if edge.relation == EdgeRelation::DefinedIn
+            && edge.from.starts_with("method:") && edge.to.starts_with("class:") {
                 state.method_to_class.insert(edge.from.clone(), edge.to.clone());
                 state.class_methods
                     .entry(edge.to.clone())
                     .or_default()
                     .push(edge.from.clone());
             }
-        }
         if edge.relation == EdgeRelation::Inherits {
             if let Some(parent_id) = state.class_map.get(
                 edge.to.strip_prefix("class_ref:").unwrap_or(&edge.to),
@@ -282,7 +281,7 @@ fn build_call_extraction_maps(state: &ExtractState) -> (
     let node_pkg_map: HashMap<String, String> = state.nodes
         .iter()
         .map(|n| {
-            let pkg = n.file_path.rsplitn(2, '/').nth(1).unwrap_or("").to_string();
+            let pkg = n.file_path.rsplit_once('/').map(|x| x.0).unwrap_or("").to_string();
             (n.id.clone(), pkg)
         })
         .collect();
@@ -308,7 +307,7 @@ fn extract_calls_for_file(
         .map(|n| n.id.clone())
         .collect();
 
-    let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
+    let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
 
     match lang {
         Language::Python => {
@@ -671,13 +670,13 @@ fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> (Vec<Co
 
     // Collect all directories that contain source files
     for (rel_path, _, _) in file_entries {
-        if let Some(dir) = rel_path.rsplitn(2, '/').nth(1) {
+        if let Some(dir) = rel_path.rsplit_once('/').map(|x| x.0) {
             if !dir.is_empty() {
                 // Add this directory and all ancestors
                 let mut current = dir.to_string();
                 loop {
                     dir_set.insert(current.clone());
-                    match current.rsplitn(2, '/').nth(1) {
+                    match current.rsplit_once('/').map(|x| x.0) {
                         Some(parent) if !parent.is_empty() => current = parent.to_string(),
                         _ => break,
                     }
@@ -693,7 +692,7 @@ fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> (Vec<Co
         nodes.push(CodeNode::new_module(dir));
 
         // Module → parent module (belongs_to)
-        if let Some(parent) = dir.rsplitn(2, '/').nth(1) {
+        if let Some(parent) = dir.rsplit_once('/').map(|x| x.0) {
             if !parent.is_empty() && dir_set.contains(parent) {
                 edges.push(CodeEdge::new(
                     &format!("module:{}", dir),
@@ -711,7 +710,7 @@ fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> (Vec<Co
 fn generate_file_to_module_edges(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
     let mut edges = Vec::new();
     for (rel_path, _, _) in file_entries {
-        if let Some(dir) = rel_path.rsplitn(2, '/').nth(1) {
+        if let Some(dir) = rel_path.rsplit_once('/').map(|x| x.0) {
             if !dir.is_empty() {
                 edges.push(CodeEdge::new(
                     &format!("file:{}", rel_path),
@@ -1233,15 +1232,14 @@ impl CodeGraph {
 
         // Populate method_to_class and class_methods from existing edges
         for edge in &graph.edges {
-            if edge.relation == EdgeRelation::DefinedIn {
-                if edge.from.starts_with("method:") && edge.to.starts_with("class:") {
+            if edge.relation == EdgeRelation::DefinedIn
+                && edge.from.starts_with("method:") && edge.to.starts_with("class:") {
                     state.method_to_class.insert(edge.from.clone(), edge.to.clone());
                     state.class_methods
                         .entry(edge.to.clone())
                         .or_default()
                         .push(edge.from.clone());
                 }
-            }
             if edge.relation == EdgeRelation::Inherits {
                 if let Some(parent_id) = state.class_map.get(
                     edge.to.strip_prefix("class_ref:").unwrap_or(&edge.to),
@@ -1289,7 +1287,7 @@ impl CodeGraph {
         }
 
         // Merge new nodes into graph
-        graph.nodes.extend(state.nodes.drain(..));
+        graph.nodes.append(&mut state.nodes);
 
         // Re-populate maps from ALL nodes (existing + new) for reference resolution
         state.class_map.clear();
@@ -1315,15 +1313,14 @@ impl CodeGraph {
             .collect();
 
         for edge in &all_edges_for_maps {
-            if edge.relation == EdgeRelation::DefinedIn {
-                if edge.from.starts_with("method:") && edge.to.starts_with("class:") {
+            if edge.relation == EdgeRelation::DefinedIn
+                && edge.from.starts_with("method:") && edge.to.starts_with("class:") {
                     state.method_to_class.insert(edge.from.clone(), edge.to.clone());
                     state.class_methods
                         .entry(edge.to.clone())
                         .or_default()
                         .push(edge.from.clone());
                 }
-            }
             if edge.relation == EdgeRelation::Inherits {
                 if let Some(parent_id) = state.class_map.get(
                     edge.to.strip_prefix("class_ref:").unwrap_or(&edge.to),

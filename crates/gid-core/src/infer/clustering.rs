@@ -613,7 +613,7 @@ pub fn add_dir_colocation_edges(net: &mut Network, idx_to_id: &[String], weight:
     //    Since these are *only* isolated files, groups are typically small
     //    and O(n²) pairwise is fine (no need for thresholds or decay).
     let mut total_edges = 0usize;
-    for (_dir, files) in &dir_groups {
+    for files in dir_groups.values() {
         if files.len() < 2 {
             continue; // single isolated file in a dir — nothing to pair with
         }
@@ -797,7 +797,7 @@ pub fn add_symbol_similarity_edges(
 
     // Step 3: Count shared tokens per file pair using inverted index
     let mut shared_counts: HashMap<(usize, usize), usize> = HashMap::new();
-    for (_token, files) in &inverted_index {
+    for files in inverted_index.values() {
         if files.len() < 2 || files.len() > 200 {
             // Skip tokens appearing in too many files — they're effectively stop words
             continue;
@@ -3373,7 +3373,7 @@ mod tests {
         g.nodes.push(make_file_node("src/utils/errors.ts"));
 
         // Internal cluster edges (strong coupling within clusters)
-        let cluster_a = vec!["src/auth/login.ts", "src/auth/register.ts", "src/auth/session.ts"];
+        let cluster_a = ["src/auth/login.ts", "src/auth/register.ts", "src/auth/session.ts"];
         for i in 0..cluster_a.len() {
             for j in (i + 1)..cluster_a.len() {
                 g.edges.push(Edge::new(
@@ -3383,12 +3383,10 @@ mod tests {
                 ));
             }
         }
-        let cluster_b = vec![
-            "src/commands/run.ts",
+        let cluster_b = ["src/commands/run.ts",
             "src/commands/build.ts",
             "src/commands/test.ts",
-            "src/commands/deploy.ts",
-        ];
+            "src/commands/deploy.ts"];
         for i in 0..cluster_b.len() {
             for j in (i + 1)..cluster_b.len() {
                 g.edges.push(Edge::new(
@@ -3398,7 +3396,7 @@ mod tests {
                 ));
             }
         }
-        let cluster_c = vec!["src/ui/render.ts", "src/ui/layout.ts", "src/ui/theme.ts"];
+        let cluster_c = ["src/ui/render.ts", "src/ui/layout.ts", "src/ui/theme.ts"];
         for i in 0..cluster_c.len() {
             for j in (i + 1)..cluster_c.len() {
                 g.edges.push(Edge::new(
@@ -5120,7 +5118,7 @@ mod tests {
         // Record a→b weight before co-citation
         let a_idx = idx_to_id.iter().position(|id| id == "file:utils/a.ts").unwrap();
         let b_idx = idx_to_id.iter().position(|id| id == "file:utils/b.ts").unwrap();
-        let edges_before = net.num_edges();
+        let _edges_before = net.num_edges();
 
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
 

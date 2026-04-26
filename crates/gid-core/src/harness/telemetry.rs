@@ -262,7 +262,7 @@ mod tests {
             timestamp: Utc::now(),
         }).unwrap();
 
-        assert!(std::fs::read_to_string(&log_path).unwrap().len() > 0);
+        assert!(!std::fs::read_to_string(&log_path).unwrap().is_empty());
 
         logger.clear().unwrap();
         assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");

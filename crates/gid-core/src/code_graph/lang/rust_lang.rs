@@ -876,8 +876,8 @@ pub(crate) fn infer_receiver_type(
     // "self.client" → "client"
     // "self.client.inner" → "client" (use first field only)
     // "foo" → "foo" (non-self receiver, try as-is)
-    let field_name = if receiver.starts_with("self.") {
-        let after_self = &receiver[5..]; // skip "self."
+    let field_name = if let Some(after_self) = receiver.strip_prefix("self.") {
+        // skip "self."
         after_self.split('.').next().unwrap_or(after_self)
     } else {
         // Direct variable name — can't resolve type without local variable analysis
@@ -1194,7 +1194,7 @@ pub(crate) fn extract_calls_rust(
     let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
     build_scope_map_rust(root, source, rel_path, &mut scope_map);
 
-    let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
+    let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
 
     // Walk tree looking for calls
     let mut stack = vec![root];

@@ -2422,7 +2422,7 @@ mod tests {
         // Build a small graph: 5 "code" nodes + 1 "task" node, fully connected
         // among the code nodes (4 edges) plus 1 task→code edge.
         for id in &["c1", "c2", "c3", "c4", "c5"] {
-            let mut n = Node::new(*id, *id);
+            let mut n = Node::new(id, id);
             n.metadata.insert("node_type".into(), serde_json::json!("code"));
             s.put_node(&n).unwrap();
         }

@@ -17,8 +17,7 @@ use gid_core::{
     parser::find_graph_file_walk_up,
     query::QueryEngine,
     validator::Validator,
-    CodeGraph, CodeNode, NodeKind,
-    analyze_impact, analyze_impact_filtered, analyze_impact_with_filters, format_impact_for_llm,
+    CodeGraph, CodeNode, NodeKind, analyze_impact_with_filters, format_impact_for_llm,
     assess_complexity_from_graph, assess_risk_level,
     unify::{codegraph_to_graph_nodes, merge_code_layer, graph_to_codegraph},
     // New modules

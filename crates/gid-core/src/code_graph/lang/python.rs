@@ -65,8 +65,8 @@ pub(crate) fn extract_docstring(node: tree_sitter::Node, source: &str) -> Option
         }
         if child.kind() == "expression_statement" {
             if let Some(str_node) = child.child(0) {
-                if str_node.kind() == "string" || str_node.kind() == "concatenated_string" {
-                    if str_node.start_byte() < source.len() && str_node.end_byte() <= source.len() {
+                if (str_node.kind() == "string" || str_node.kind() == "concatenated_string")
+                    && str_node.start_byte() < source.len() && str_node.end_byte() <= source.len() {
                         let doc_text = &source[str_node.start_byte()..str_node.end_byte()];
                         let doc_clean = doc_text
                             .trim_start_matches("\"\"\"")
@@ -93,7 +93,6 @@ pub(crate) fn extract_docstring(node: tree_sitter::Node, source: &str) -> Option
                         };
                         return Some(truncated.to_string());
                     }
-                }
             }
         }
         break;
@@ -360,7 +359,7 @@ pub(crate) fn extract_class_node(
             let kind = sc_child.kind();
             if kind == "identifier" || kind == "attribute" {
                 let parent_text = sc_child.utf8_text(source).unwrap_or("");
-                let parent_name = parent_text.split('.').last().unwrap_or("").trim();
+                let parent_name = parent_text.split('.').next_back().unwrap_or("").trim();
                 if !parent_name.is_empty() && parent_name != "object" {
                     edges.push(CodeEdge {
                         from: class_id.clone(),
@@ -935,7 +934,7 @@ pub(crate) fn resolve_and_add_call_edge(
             };
             let same_pkg: Vec<&str> = init_entries
                 .iter()
-                .filter(|(fp, _)| fp.rsplitn(2, '/').nth(1).unwrap_or("") == package_dir)
+                .filter(|(fp, _)| fp.rsplit_once('/').map(|x| x.0).unwrap_or("") == package_dir)
                 .map(|(_, id)| id.as_str())
                 .collect();
 

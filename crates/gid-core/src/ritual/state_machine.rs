@@ -576,10 +576,10 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 )
             } else {
                 // Large task: start with requirements
-                let has_requirements = state.project.as_ref().map_or(false, |p| p.has_requirements);
+                let has_requirements = state.project.as_ref().is_some_and(|p| p.has_requirements);
                 if has_requirements {
                     // Requirements exist → skip to design
-                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                    let skill = if state.project.as_ref().is_some_and(|p| p.has_design) {
                         "update-design"
                     } else {
                         "draft-design"
@@ -656,7 +656,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
 
         // Design done → Review or skip review based on whether design was updated vs created
         (Designing, SkillCompleted { .. }) => {
-            let design_was_updated = state.project.as_ref().map_or(false, |p| p.has_design);
+            let design_was_updated = state.project.as_ref().is_some_and(|p| p.has_design);
             let is_large = state.triage_size.as_deref() == Some("large");
             if design_was_updated && !is_large {
                 // Design already existed + not a large task — incremental update, skip review
@@ -683,7 +683,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
 
         // Planning decided → Graphing
         (Planning, PlanDecided(strategy)) => {
-            let skill = if state.project.as_ref().map_or(false, |p| p.has_graph) {
+            let skill = if state.project.as_ref().is_some_and(|p| p.has_graph) {
                 "update-graph"
             } else {
                 "generate-graph"
@@ -700,7 +700,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
 
         // Graph done → Review or skip review based on whether graph was updated vs created
         (Graphing, SkillCompleted { .. }) => {
-            let graph_was_updated = state.project.as_ref().map_or(false, |p| p.has_graph);
+            let graph_was_updated = state.project.as_ref().is_some_and(|p| p.has_graph);
             let is_large = state.triage_size.as_deref() == Some("large");
             if graph_was_updated && !is_large {
                 // Graph already existed + not large — incremental update, skip review → implement
@@ -778,7 +778,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             // Round 2 (or higher): apply findings and proceed to next phase, reset review_round
             match review_target.as_str() {
                 "requirements" => {
-                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                    let skill = if state.project.as_ref().is_some_and(|p| p.has_design) {
                         "update-design"
                     } else {
                         "draft-design"
@@ -834,7 +834,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             let review_target = state.review_target.clone().unwrap_or_default();
             match review_target.as_str() {
                 "requirements" => {
-                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                    let skill = if state.project.as_ref().is_some_and(|p| p.has_design) {
                         "update-design"
                     } else {
                         "draft-design"
@@ -886,7 +886,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             let review_target = state.review_target.clone().unwrap_or_default();
             let next = match review_target.as_str() {
                 "requirements" => {
-                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                    let skill = if state.project.as_ref().is_some_and(|p| p.has_design) {
                         "update-design"
                     } else {
                         "draft-design"
@@ -1054,7 +1054,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 Notify { message: format!("🔄 Design failed, retrying... ({})", truncate(&error, 100)) },
                 SaveState,
                 RunSkill {
-                    name: if state.project.as_ref().map_or(false, |p| p.has_design) {
+                    name: if state.project.as_ref().is_some_and(|p| p.has_design) {
                         "update-design"
                     } else {
                         "draft-design"
@@ -1071,7 +1071,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 Notify { message: format!("🔄 Graph generation failed, retrying... ({})", truncate(&error, 100)) },
                 SaveState,
                 RunSkill {
-                    name: if state.project.as_ref().map_or(false, |p| p.has_graph) {
+                    name: if state.project.as_ref().is_some_and(|p| p.has_graph) {
                         "update-graph"
                     } else {
                         "generate-graph"
@@ -1214,7 +1214,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                             RunTriage { task: state.task.clone() }
                         }
                         Designing => {
-                            let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                            let skill = if state.project.as_ref().is_some_and(|p| p.has_design) {
                                 "update-design"
                             } else {
                                 "draft-design"
@@ -1237,7 +1237,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                             // Determine where to go based on current phase
                             return match phase {
                                 WritingRequirements => {
-                                    let skill = if state.project.as_ref().map_or(false, |p| p.has_design) {
+                                    let skill = if state.project.as_ref().is_some_and(|p| p.has_design) {
                                         "update-design"
                                     } else {
                                         "draft-design"
@@ -1285,7 +1285,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         }
                         Planning => RunPlanning,
                         Graphing => {
-                            let skill = if state.project.as_ref().map_or(false, |p| p.has_graph) {
+                            let skill = if state.project.as_ref().is_some_and(|p| p.has_graph) {
                                 "update-graph"
                             } else {
                                 "generate-graph"

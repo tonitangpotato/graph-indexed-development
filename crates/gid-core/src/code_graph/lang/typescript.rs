@@ -1046,14 +1046,13 @@ pub(crate) fn build_scope_map_typescript(
                             .unwrap_or("");
                         
                         if let Some(value) = child.child_by_field_name("value") {
-                            if value.kind() == "arrow_function" || value.kind() == "function" {
-                                if !var_name.is_empty() {
+                            if (value.kind() == "arrow_function" || value.kind() == "function")
+                                && !var_name.is_empty() {
                                     let start_line = current.start_position().row + 1;
                                     let end_line = current.end_position().row + 1;
                                     let func_id = format!("func:{}:{}", rel_path, var_name);
                                     scope_map.push((start_line, end_line, func_id, class_ctx.clone()));
                                 }
-                            }
                         }
                         stack.push((child, class_ctx.clone()));
                     }
@@ -1096,7 +1095,7 @@ pub(crate) fn extract_calls_typescript(
     let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
     build_scope_map_typescript(root, source, rel_path, &mut scope_map);
 
-    let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
+    let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
 
     // Walk tree looking for calls
     let mut stack = vec![root];

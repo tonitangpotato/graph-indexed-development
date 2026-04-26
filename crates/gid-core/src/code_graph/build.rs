@@ -651,7 +651,7 @@ impl CodeGraph {
                     .filter(|n| n.kind == NodeKind::Class)
                     .filter(|n| {
                         // Detect trait (Rust) or interface (TS) by signature
-                        n.signature.as_deref().map_or(false, |sig| {
+                        n.signature.as_deref().is_some_and(|sig| {
                             sig.contains("trait ") || sig.contains("interface ")
                         })
                     })

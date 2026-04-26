@@ -155,7 +155,7 @@ impl ApprovalGate {
         
         output.push_str(&format!("🔔 Approval Required: {}\n", request.phase_name));
         output.push_str(&format!("   Phase: {}\n", request.phase_id));
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(&format!("   {}\n", request.summary));
         
         if !request.artifacts_to_review.is_empty() {

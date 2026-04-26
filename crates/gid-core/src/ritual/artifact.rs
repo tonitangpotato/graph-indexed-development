@@ -212,8 +212,8 @@ mod tests {
         
         // Create directory structure
         let features_dir = temp_dir.path().join(".gid/features");
-        fs::create_dir_all(&features_dir.join("auth")).unwrap();
-        fs::create_dir_all(&features_dir.join("api")).unwrap();
+        fs::create_dir_all(features_dir.join("auth")).unwrap();
+        fs::create_dir_all(features_dir.join("api")).unwrap();
         
         // Create files
         fs::write(features_dir.join("auth/requirements.md"), "auth").unwrap();

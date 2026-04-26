@@ -250,11 +250,9 @@ impl CodeGraph {
                     && (node.file_path.contains("/tests/")
                         || node.file_path.contains("/test_")
                         || node.name.starts_with("test_"))
-                {
-                    if seen.insert(node.id.clone()) {
+                    && seen.insert(node.id.clone()) {
                         result.push(node);
                     }
-                }
             }
         }
 
@@ -268,11 +266,10 @@ impl CodeGraph {
                     let func_name = func_part.trim().trim_start_matches('<').trim_end_matches('>');
                     if func_name.len() >= 3 && func_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
                         for node in &self.nodes {
-                            if node.name == func_name && node.kind == NodeKind::Function {
-                                if seen.insert(node.id.clone()) {
+                            if node.name == func_name && node.kind == NodeKind::Function
+                                && seen.insert(node.id.clone()) {
                                     result.push(node);
                                 }
-                            }
                         }
                     }
                 }
@@ -288,11 +285,10 @@ impl CodeGraph {
                         && word.chars().all(|c| c.is_alphanumeric() || c == '_')
                     {
                         for node in &self.nodes {
-                            if node.name == word && (node.kind == NodeKind::Function || node.kind == NodeKind::Class) {
-                                if seen.insert(node.id.clone()) {
+                            if node.name == word && (node.kind == NodeKind::Function || node.kind == NodeKind::Class)
+                                && seen.insert(node.id.clone()) {
                                     result.push(node);
                                 }
-                            }
                         }
                     }
                 }
@@ -308,11 +304,10 @@ impl CodeGraph {
             let is_ident = word.chars().all(|c| c.is_alphanumeric() || c == '_');
             if has_upper && has_lower && is_ident {
                 for node in &self.nodes {
-                    if node.name == word && node.kind == NodeKind::Class {
-                        if seen.insert(node.id.clone()) {
+                    if node.name == word && node.kind == NodeKind::Class
+                        && seen.insert(node.id.clone()) {
                             result.push(node);
                         }
-                    }
                 }
             }
         }
@@ -343,11 +338,10 @@ impl CodeGraph {
                     let match_count = kws.iter()
                         .filter(|kw| name_lower.contains(&kw.to_lowercase()))
                         .count();
-                    if match_count >= 2 || (match_count >= 1 && kws.len() == 1) {
-                        if seen.insert(node.id.clone()) {
+                    if (match_count >= 2 || (match_count >= 1 && kws.len() == 1))
+                        && seen.insert(node.id.clone()) {
                             result.push(node);
                         }
-                    }
                 }
 
                 // Also try matching the test class name to find the test file → source imports
@@ -365,20 +359,17 @@ impl CodeGraph {
                                 for edge in self.outgoing_edges(&file_id) {
                                     if edge.relation == EdgeRelation::TestsFor {
                                         if let Some(target) = self.node_by_id(&edge.to) {
-                                            if target.kind != NodeKind::File {
-                                                if seen.insert(target.id.clone()) {
+                                            if target.kind != NodeKind::File
+                                                && seen.insert(target.id.clone()) {
                                                     result.push(target);
                                                 }
-                                            }
                                         }
                                         for src_node in &self.nodes {
                                             if format!("file:{}", src_node.file_path) == edge.to
                                                 && src_node.kind != NodeKind::File
-                                            {
-                                                if seen.insert(src_node.id.clone()) {
+                                                && seen.insert(src_node.id.clone()) {
                                                     result.push(src_node);
                                                 }
-                                            }
                                         }
                                     }
                                 }

@@ -334,7 +334,7 @@ pub fn generate_bridge_edges(graph: &mut Graph) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code_graph::{CodeNode, CodeEdge, CodeGraph, NodeKind, EdgeRelation};
+    use crate::code_graph::{CodeNode, CodeEdge, CodeGraph, EdgeRelation};
     use std::path::Path;
 
     fn sample_codegraph() -> CodeGraph {

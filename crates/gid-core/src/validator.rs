@@ -325,11 +325,10 @@ impl<'a> Validator<'a> {
                 return true;
             }
             for edge in &self.graph.edges {
-                if edge.from == current && edge.relation == "depends_on" {
-                    if visited.insert(&edge.to) {
+                if edge.from == current && edge.relation == "depends_on"
+                    && visited.insert(&edge.to) {
                         queue.push_back(&edge.to);
                     }
-                }
             }
         }
 
