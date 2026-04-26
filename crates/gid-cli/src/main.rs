@@ -963,7 +963,7 @@ fn main() -> Result<()> {
         }
         Commands::AddNode { id, title, desc, status, tags, node_type } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
-            cmd_add_node_ctx(&ctx, &id, &title, desc, status, tags, node_type, cli.json)
+            cmd_add_node_ctx(&ctx, AddNodeOpts { id, title, desc, status, tags, node_type }, cli.json)
         }
         Commands::AddFeature { name, tasks, deps } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
@@ -1031,7 +1031,15 @@ fn main() -> Result<()> {
             match qc {
                 QueryCommands::Impact { node, relation, layer, type_filter, min_confidence } => cmd_query_impact_ctx(&ctx, &node, relation.as_deref(), layer, type_filter.as_deref(), min_confidence, cli.json),
                 QueryCommands::Deps { node, transitive, relation, layer, type_filter, min_confidence } => {
-                    cmd_query_deps_ctx(&ctx, &node, transitive, relation.as_deref(), layer, type_filter.as_deref(), min_confidence, cli.json)
+                    cmd_query_deps_ctx(&ctx, QueryDepsOpts {
+                        node: &node,
+                        transitive,
+                        relation: relation.as_deref(),
+                        layer,
+                        type_filter: type_filter.as_deref(),
+                        min_confidence,
+                        json: cli.json,
+                    })
                 }
                 QueryCommands::Path { from, to } => cmd_query_path_ctx(&ctx, &from, &to, cli.json),
                 QueryCommands::CommonCause { a, b } => cmd_query_common_ctx(&ctx, &a, &b, cli.json),
@@ -1042,7 +1050,17 @@ fn main() -> Result<()> {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_edit_graph_ctx(&ctx, &operations, cli.json)
         }
-        Commands::Extract { dir, format, output, no_lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, !no_lsp, force, no_semantify, cli.graph.as_ref(), backend_arg),
+        Commands::Extract { dir, format, output, no_lsp, force, no_semantify } => cmd_extract(ExtractOpts {
+            dir: &dir,
+            format: &format,
+            output: output.as_deref(),
+            json_flag: cli.json,
+            lsp: !no_lsp,
+            force,
+            no_semantify,
+            graph_override: cli.graph.as_ref(),
+            backend_arg,
+        }),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
         Commands::CodeFailures { changed, p2p, f2p, dir } => cmd_code_failures(&dir, &changed, p2p.as_deref(), f2p.as_deref(), cli.json),
@@ -1127,7 +1145,15 @@ fn main() -> Result<()> {
         // Context command
         Commands::Context { targets, max_tokens, depth, include, format, project_root } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
-            cmd_context_ctx(&ctx, targets, max_tokens, depth, include, &format, project_root, cli.json)
+            cmd_context_ctx(&ctx, ContextOpts {
+                targets,
+                max_tokens,
+                depth,
+                include,
+                format,
+                project_root,
+                json_flag: cli.json,
+            })
         }
 
         // Migration command
@@ -1160,7 +1186,22 @@ fn main() -> Result<()> {
         Commands::Infer { level, phase, model, no_llm, dry_run, format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size, edge_weights } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_infer(&ctx, &level, phase.as_deref(), &model, no_llm, dry_run, &format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size, edge_weights, cli.json))
+            rt.block_on(cmd_infer(&ctx, InferOpts {
+                level_str: &level,
+                phase: phase.as_deref(),
+                model: &model,
+                no_llm,
+                dry_run,
+                format_str: &format,
+                max_tokens,
+                source,
+                hierarchical,
+                num_trials,
+                min_community_size,
+                max_cluster_size,
+                edge_weight_overrides: edge_weights,
+                json: cli.json,
+            }))
         }
         Commands::Project { action } => cmd_project(action, cli.json),
     }
@@ -1693,29 +1734,39 @@ fn cmd_complete_ctx(ctx: &GraphContext, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Inputs for `cmd_add_node_ctx` — packs the optional node attributes from
+/// the `add-node` CLI subcommand.
+struct AddNodeOpts {
+    id: String,
+    title: String,
+    desc: Option<String>,
+    status: Option<String>,
+    tags: Option<String>,
+    node_type: Option<String>,
+}
+
 fn cmd_add_node_ctx(
     ctx: &GraphContext,
-    id: &str, title: &str, desc: Option<String>,
-    status: Option<String>, tags: Option<String>, node_type: Option<String>,
+    opts: AddNodeOpts,
     json: bool,
 ) -> Result<()> {
     let mut graph = ctx.load()?;
-    if graph.get_node(id).is_some() {
-        bail!("Node already exists: {}", id);
+    if graph.get_node(&opts.id).is_some() {
+        bail!("Node already exists: {}", opts.id);
     }
-    let mut node = Node::new(id, title);
-    if let Some(d) = desc { node.description = Some(d); }
-    if let Some(s) = status { node.status = s.parse()?; }
-    if let Some(t) = tags {
+    let mut node = Node::new(&opts.id, &opts.title);
+    if let Some(d) = opts.desc { node.description = Some(d); }
+    if let Some(s) = opts.status { node.status = s.parse()?; }
+    if let Some(t) = opts.tags {
         node.tags = t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     }
-    if let Some(nt) = node_type { node.node_type = Some(nt); }
+    if let Some(nt) = opts.node_type { node.node_type = Some(nt); }
     graph.add_node(node);
     ctx.save(&graph)?;
     if json {
-        println!("{}", serde_json::json!({"success": true, "id": id}));
+        println!("{}", serde_json::json!({"success": true, "id": opts.id}));
     } else {
-        println!("✓ Added node: {} — {}", id, title);
+        println!("✓ Added node: {} — {}", opts.id, opts.title);
     }
     Ok(())
 }
@@ -1820,40 +1871,53 @@ fn cmd_query_impact_ctx(ctx: &GraphContext, node: &str, relation: Option<&str>, 
     }
 }
 
-fn cmd_query_deps_ctx(ctx: &GraphContext, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, min_confidence: f64, json: bool) -> Result<()> {
+/// Inputs for the `query deps` subcommand. Borrowed strings + plain values
+/// to avoid forcing the caller to clone CLI args.
+#[derive(Clone, Copy)]
+struct QueryDepsOpts<'a> {
+    node: &'a str,
+    transitive: bool,
+    relation: Option<&'a str>,
+    layer: LayerFilter,
+    type_filter: Option<&'a str>,
+    min_confidence: f64,
+    json: bool,
+}
+
+fn cmd_query_deps_ctx(ctx: &GraphContext, opts: QueryDepsOpts<'_>) -> Result<()> {
     match ctx.backend {
-        StorageBackend::Yaml => cmd_query_deps(ctx, node, transitive, relation, layer, type_filter, min_confidence, json),
+        StorageBackend::Yaml => cmd_query_deps(ctx, opts),
         _ => {
             let graph = ctx.load()?;
-            let filtered = apply_layer_filter(&graph, layer);
+            let filtered = apply_layer_filter(&graph, opts.layer);
             let engine = QueryEngine::new(&filtered);
-            let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
+            let rels: Option<Vec<&str>> = opts.relation.map(|r| r.split(',').map(|s| s.trim()).collect());
             let result = engine.deps_with_filters(
-                node,
-                transitive,
+                opts.node,
+                opts.transitive,
                 rels.as_deref(),
-                Some(min_confidence),
+                Some(opts.min_confidence),
             );
-            let deps: Vec<&Node> = if let Some(tf) = type_filter {
+            let deps: Vec<&Node> = if let Some(tf) = opts.type_filter {
                 result.nodes.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
             } else {
                 result.nodes
             };
-            if json {
+            if opts.json {
                 let nodes: Vec<_> = deps.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title, "status": n.status.to_string()})).collect();
                 println!("{}", serde_json::json!({
-                    "node": node,
-                    "transitive": transitive,
+                    "node": opts.node,
+                    "transitive": opts.transitive,
                     "dependencies": nodes,
-                    "min_confidence": min_confidence,
+                    "min_confidence": opts.min_confidence,
                     "hidden_low_confidence": result.hidden_low_confidence,
                 }));
             } else {
-                let label = if transitive { "Transitive" } else { "Direct" };
+                let label = if opts.transitive { "Transitive" } else { "Direct" };
                 if deps.is_empty() {
-                    println!("'{}' has no {} dependencies", node, label.to_lowercase());
+                    println!("'{}' has no {} dependencies", opts.node, label.to_lowercase());
                 } else {
-                    println!("{} dependencies of '{}' ({}):", label, node, deps.len());
+                    println!("{} dependencies of '{}' ({}):", label, opts.node, deps.len());
                     for n in &deps { println!("  {} {} — {}", status_icon(&n.status), n.id, n.title); }
                 }
                 if result.hidden_low_confidence > 0 {
@@ -2012,17 +2076,32 @@ fn cmd_edit_graph_ctx(ctx: &GraphContext, operations_json: &str, json: bool) -> 
 
 
 
-/// Handle `gid context` — assemble context for target nodes. **[GOAL-4.9, 4.12]**
-fn cmd_context_ctx(
-    ctx: &GraphContext,
+/// Inputs for `cmd_context_ctx` — packs the parameters from the `context`
+/// CLI subcommand (target nodes, traversal limits, output formatting).
+struct ContextOpts {
     targets: Vec<String>,
     max_tokens: usize,
     depth: u32,
     include: Vec<String>,
-    format: &str,
+    format: String,
     project_root: Option<PathBuf>,
     json_flag: bool,
+}
+
+/// Handle `gid context` — assemble context for target nodes. **[GOAL-4.9, 4.12]**
+fn cmd_context_ctx(
+    ctx: &GraphContext,
+    opts: ContextOpts,
 ) -> Result<()> {
+    let ContextOpts {
+        targets,
+        max_tokens,
+        depth,
+        include,
+        format,
+        project_root,
+        json_flag,
+    } = opts;
     use gid_core::harness::{
         ContextQuery, ContextFilters, OutputFormat, assemble_context, format_context,
     };
@@ -2234,41 +2313,41 @@ fn cmd_query_impact(ctx: &GraphContext, node: &str, relation: Option<&str>, laye
     Ok(())
 }
 
-fn cmd_query_deps(ctx: &GraphContext, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, min_confidence: f64, json: bool) -> Result<()> {
+fn cmd_query_deps(ctx: &GraphContext, opts: QueryDepsOpts<'_>) -> Result<()> {
     let graph = ctx.load()?;
-    let filtered = apply_layer_filter(&graph, layer);
+    let filtered = apply_layer_filter(&graph, opts.layer);
 
-    let resolved_id = resolve_with_layer_fallback(&filtered, &graph, node, layer, json)?;
+    let resolved_id = resolve_with_layer_fallback(&filtered, &graph, opts.node, opts.layer, opts.json)?;
     let node = &resolved_id;
 
     let engine = QueryEngine::new(&filtered);
-    let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
-    let result = engine.deps_with_filters(node, transitive, rels.as_deref(), Some(min_confidence));
+    let rels: Option<Vec<&str>> = opts.relation.map(|r| r.split(',').map(|s| s.trim()).collect());
+    let result = engine.deps_with_filters(node, opts.transitive, rels.as_deref(), Some(opts.min_confidence));
 
     // Apply type filter
-    let deps: Vec<&Node> = if let Some(tf) = type_filter {
+    let deps: Vec<&Node> = if let Some(tf) = opts.type_filter {
         result.nodes.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
     } else {
         result.nodes
     };
 
-    if json {
+    if opts.json {
         let nodes: Vec<_> = deps.iter().map(|n| serde_json::json!({
             "id": n.id, "title": n.title, "status": n.status.to_string()
         })).collect();
         println!("{}", serde_json::json!({
             "node": node,
-            "transitive": transitive,
-            "relation_filter": relation,
-            "layer": format!("{:?}", layer),
-            "type_filter": type_filter,
+            "transitive": opts.transitive,
+            "relation_filter": opts.relation,
+            "layer": format!("{:?}", opts.layer),
+            "type_filter": opts.type_filter,
             "dependencies": nodes,
-            "min_confidence": min_confidence,
+            "min_confidence": opts.min_confidence,
             "hidden_low_confidence": result.hidden_low_confidence,
         }));
     } else {
-        let label = if transitive { "Transitive" } else { "Direct" };
-        let filter_note = relation.map(|r| format!(" (relations: {})", r)).unwrap_or_default();
+        let label = if opts.transitive { "Transitive" } else { "Direct" };
+        let filter_note = opts.relation.map(|r| format!(" (relations: {})", r)).unwrap_or_default();
         if deps.is_empty() {
             println!("'{}' has no {} dependencies{}", node, label.to_lowercase(), filter_note);
         } else {
@@ -2374,7 +2453,33 @@ fn cmd_query_topo(ctx: &GraphContext, json: bool) -> Result<()> {
 
 
 
-fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool, no_semantify: bool, graph_override: Option<&PathBuf>, backend_arg: Option<String>) -> Result<()> {
+/// Inputs for `cmd_extract` — packs the parameters from the `extract` CLI
+/// subcommand (target directory, formatting, LSP/force/semantify toggles,
+/// and the optional graph/backend overrides).
+struct ExtractOpts<'a> {
+    dir: &'a PathBuf,
+    format: &'a str,
+    output: Option<&'a std::path::Path>,
+    json_flag: bool,
+    lsp: bool,
+    force: bool,
+    no_semantify: bool,
+    graph_override: Option<&'a PathBuf>,
+    backend_arg: Option<String>,
+}
+
+fn cmd_extract(opts: ExtractOpts<'_>) -> Result<()> {
+    let ExtractOpts {
+        dir,
+        format,
+        output,
+        json_flag,
+        lsp,
+        force,
+        no_semantify,
+        graph_override,
+        backend_arg,
+    } = opts;
     let dir = if dir.is_absolute() {
         dir.clone()
     } else {
@@ -4652,14 +4757,16 @@ fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_lsp: bool, no_semantify: bool, 
 // Infer Command
 // =============================================================================
 
-async fn cmd_infer(
-    ctx: &GraphContext,
-    level_str: &str,
-    phase: Option<&str>,
-    model: &str,
+/// Inputs for `cmd_infer` — packs the parameters from the `infer` CLI
+/// subcommand (clustering controls, LLM toggles, output formatting, and
+/// algorithmic tuning knobs).
+struct InferOpts<'a> {
+    level_str: &'a str,
+    phase: Option<&'a str>,
+    model: &'a str,
     no_llm: bool,
     dry_run: bool,
-    format_str: &str,
+    format_str: &'a str,
     max_tokens: usize,
     source: Option<PathBuf>,
     hierarchical: bool,
@@ -4668,7 +4775,28 @@ async fn cmd_infer(
     max_cluster_size: Option<usize>,
     edge_weight_overrides: Vec<String>,
     json: bool,
+}
+
+async fn cmd_infer(
+    ctx: &GraphContext,
+    opts: InferOpts<'_>,
 ) -> Result<()> {
+    let InferOpts {
+        level_str,
+        phase,
+        model,
+        no_llm,
+        dry_run,
+        format_str,
+        max_tokens,
+        source,
+        hierarchical,
+        num_trials,
+        min_community_size,
+        max_cluster_size,
+        edge_weight_overrides,
+        json,
+    } = opts;
     use gid_core::infer;
 
     let mut graph = ctx.load()?;
