@@ -124,6 +124,19 @@ fn collect_impacted_nodes<'a>(
     }
 }
 
+/// Inputs for impact-traversal: the immutable graph context plus traversal filters.
+///
+/// Bundles parameters that are constant across the recursion (graph, edges,
+/// relation filter, confidence threshold) so the recursive call site doesn't
+/// have to pass 8+ arguments. Mutable accumulators (`visited`, `result`,
+/// `hidden_low_confidence`) stay separate.
+struct ImpactCtx<'a, 'r> {
+    code_edges: &'a [&'a Edge],
+    graph: &'a Graph,
+    relations: Option<&'r [&'r str]>,
+    min_confidence: Option<f64>,
+}
+
 /// Collect impacted nodes with relation filter AND confidence threshold.
 ///
 /// Edges with `confidence < min_confidence` are skipped (counted in
@@ -131,10 +144,7 @@ fn collect_impacted_nodes<'a>(
 /// trusted (>= any threshold). See ISS-035 for rationale.
 fn collect_impacted_nodes_with_filters<'a>(
     node_id: &str,
-    code_edges: &[&Edge],
-    graph: &'a Graph,
-    relations: Option<&[&str]>,
-    min_confidence: Option<f64>,
+    ctx: &ImpactCtx<'a, '_>,
     visited: &mut HashSet<String>,
     result: &mut Vec<&'a Node>,
     hidden_low_confidence: &mut usize,
@@ -142,15 +152,15 @@ fn collect_impacted_nodes_with_filters<'a>(
     if !visited.insert(node_id.to_string()) {
         return;
     }
-    for edge in code_edges.iter().filter(|e| e.to == node_id) {
-        if let Some(rels) = relations {
+    for edge in ctx.code_edges.iter().filter(|e| e.to == node_id) {
+        if let Some(rels) = ctx.relations {
             if !rels.contains(&edge.relation.as_str()) {
                 continue;
             }
         }
         // Confidence gate — count hidden edges so the caller can surface
         // a "N hidden low-confidence edges" summary.
-        let passes = match (min_confidence, edge.confidence) {
+        let passes = match (ctx.min_confidence, edge.confidence) {
             (None, _) => true,
             (Some(_), None) => true,             // None = fully trusted
             (Some(thresh), Some(c)) => c >= thresh,
@@ -159,11 +169,10 @@ fn collect_impacted_nodes_with_filters<'a>(
             *hidden_low_confidence += 1;
             continue;
         }
-        if let Some(node) = graph.get_node(&edge.from) {
+        if let Some(node) = ctx.graph.get_node(&edge.from) {
             result.push(node);
             collect_impacted_nodes_with_filters(
-                &edge.from, code_edges, graph, relations, min_confidence,
-                visited, result, hidden_low_confidence,
+                &edge.from, ctx, visited, result, hidden_low_confidence,
             );
         }
     }
@@ -495,15 +504,19 @@ pub fn analyze_impact_with_filters(
         .map(|n| n.id.clone())
         .collect();
 
+    let impact_ctx = ImpactCtx {
+        code_edges: &code_edges,
+        graph,
+        relations,
+        min_confidence,
+    };
+
     for node_id in &changed_node_ids {
         let mut impacted = Vec::new();
         let mut visited = HashSet::new();
         collect_impacted_nodes_with_filters(
             node_id,
-            &code_edges,
-            graph,
-            relations,
-            min_confidence,
+            &impact_ctx,
             &mut visited,
             &mut impacted,
             &mut hidden_low_confidence,

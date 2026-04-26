@@ -255,11 +255,20 @@ fn integrate_file_results(
     state.edges.extend(result.edges);
 }
 
-/// Build helper maps needed for call edge extraction (class_init_map, node_pkg_map).
-fn build_call_extraction_maps(state: &ExtractState) -> (
-    HashMap<String, Vec<(String, String)>>,
-    HashMap<String, String>,
-) {
+/// Aggregated lookup maps used during call-edge extraction.
+///
+/// Built once per extraction pass and reused across all files, so the third pass
+/// (call resolution) doesn't have to re-scan `state.nodes` for every file.
+pub(crate) struct CallExtractionMaps {
+    /// class_name -> [(file_path, init_node_id)]: locates `__init__` methods for
+    /// constructor-call resolution (Python `Foo()` -> `Foo.__init__`).
+    pub class_init_map: HashMap<String, Vec<(String, String)>>,
+    /// node_id -> package_dir: enables package-scoped name resolution.
+    pub node_pkg_map: HashMap<String, String>,
+}
+
+/// Build helper maps needed for call edge extraction.
+fn build_call_extraction_maps(state: &ExtractState) -> CallExtractionMaps {
     // class_init_map for constructor resolution
     let class_init_map: HashMap<String, Vec<(String, String)>> = {
         let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -286,7 +295,7 @@ fn build_call_extraction_maps(state: &ExtractState) -> (
         })
         .collect();
 
-    (class_init_map, node_pkg_map)
+    CallExtractionMaps { class_init_map, node_pkg_map }
 }
 
 /// Extract call edges for a specific file (third pass in the pipeline).
@@ -296,9 +305,7 @@ fn extract_calls_for_file(
     lang: &Language,
     parser: &mut Parser,
     state: &ExtractState,
-    class_init_map: &HashMap<String, Vec<(String, String)>>,
-    node_pkg_map: &HashMap<String, String>,
-    module_map: &HashMap<String, String>,
+    maps: &CallExtractionMaps,
     edges: &mut Vec<CodeEdge>,
 ) {
     let file_func_ids: HashSet<String> = state.nodes
@@ -328,8 +335,8 @@ fn extract_calls_for_file(
                     class_parents: &state.class_parents,
                     file_func_ids: &file_func_ids,
                     file_imported_names: &state.file_imported_names,
-                    class_init_map,
-                    node_pkg_map,
+                    class_init_map: &maps.class_init_map,
+                    node_pkg_map: &maps.node_pkg_map,
                 };
 
                 extract_calls_from_tree(
@@ -347,7 +354,7 @@ fn extract_calls_for_file(
                 for line in content.lines() {
                     if let Some(cap) = from_import_re().captures(line) {
                         let module = cap[1].to_string();
-                        if let Some(source_file_id) = module_map.get(&module) {
+                        if let Some(source_file_id) = state.module_map.get(&module) {
                             edges.push(CodeEdge {
                                 from: file_id.clone(),
                                 to: source_file_id.clone(),
@@ -381,7 +388,7 @@ fn extract_calls_for_file(
                     func_name_map: &state.func_map,
                     method_to_class: &state.method_to_class,
                     file_func_ids: &file_func_ids,
-                    node_pkg_map,
+                    node_pkg_map: &maps.node_pkg_map,
                     file_imported_names: &state.file_imported_names,
                     struct_field_types: &state.all_struct_field_types,
                 };
@@ -404,16 +411,22 @@ fn extract_calls_for_file(
             if let Some(tree) = parser.parse(content, None) {
                 let source = content.as_bytes();
                 let root = tree.root_node();
+                let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+
+                let ts_call_ctx = crate::code_graph::lang::typescript::TsCallCtx {
+                    source,
+                    rel_path,
+                    package_dir,
+                    func_name_map: &state.func_map,
+                    method_to_class: &state.method_to_class,
+                    file_func_ids: &file_func_ids,
+                    file_imported_names: &state.file_imported_names,
+                    node_pkg_map: &maps.node_pkg_map,
+                };
 
                 extract_calls_typescript(
                     root,
-                    source,
-                    rel_path,
-                    &state.func_map,
-                    &state.method_to_class,
-                    &file_func_ids,
-                    &state.file_imported_names,
-                    node_pkg_map,
+                    &ts_call_ctx,
                     edges,
                 );
             }
@@ -1054,7 +1067,7 @@ impl CodeGraph {
         }
 
         // Build helper maps for call extraction
-        let (class_init_map, node_pkg_map) = build_call_extraction_maps(&state);
+        let maps = build_call_extraction_maps(&state);
 
         // Third pass: extract call edges
         // Take edges out to avoid simultaneous immutable borrow of `state` + mutable borrow of `state.edges`
@@ -1062,7 +1075,7 @@ impl CodeGraph {
         for (rel_path, content, lang) in &file_entries {
             extract_calls_for_file(
                 rel_path, content, lang, &mut parser, &state,
-                &class_init_map, &node_pkg_map, &state.module_map, &mut edges,
+                &maps, &mut edges,
             );
         }
         // Add cross-layer edges (ISS-009)
@@ -1351,7 +1364,7 @@ impl CodeGraph {
         // Temporarily set state.nodes to all graph nodes for building maps
         let saved_nodes = std::mem::take(&mut state.nodes);
         state.nodes = graph.nodes.clone();
-        let (class_init_map, node_pkg_map) = build_call_extraction_maps(&state);
+        let maps = build_call_extraction_maps(&state);
         state.nodes = saved_nodes;
 
         // Phase 2b: Extract call edges for changed files only
@@ -1362,7 +1375,7 @@ impl CodeGraph {
             }
             extract_calls_for_file(
                 rel_path, content, lang, &mut parser, &state,
-                &class_init_map, &node_pkg_map, &state.module_map,
+                &maps,
                 &mut new_call_edges,
             );
         }
@@ -1489,7 +1502,7 @@ impl CodeGraph {
         }
 
         // Build helper maps for call extraction
-        let (class_init_map, node_pkg_map) = build_call_extraction_maps(&state);
+        let maps = build_call_extraction_maps(&state);
 
         // Third pass: extract call edges
         // Take edges out to avoid simultaneous immutable borrow of `state` + mutable borrow of `state.edges`
@@ -1497,7 +1510,7 @@ impl CodeGraph {
         for (rel_path, content, lang) in &file_entries {
             extract_calls_for_file(
                 rel_path, content, lang, &mut parser, &state,
-                &class_init_map, &node_pkg_map, &state.module_map, &mut edges,
+                &maps, &mut edges,
             );
         }
         // Add cross-layer edges (ISS-009)

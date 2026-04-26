@@ -189,41 +189,46 @@ impl<'a> Validator<'a> {
         }
 
         // Tarjan's SCC
-        let mut index_counter: usize = 0;
-        let mut stack: Vec<&str> = Vec::new();
-        let mut on_stack: HashSet<&str> = HashSet::new();
-        let mut indices: HashMap<&str, usize> = HashMap::new();
-        let mut lowlinks: HashMap<&str, usize> = HashMap::new();
-        let mut sccs: Vec<Vec<String>> = Vec::new();
+        let index_counter: usize = 0;
+        let stack: Vec<&str> = Vec::new();
+        let on_stack: HashSet<&str> = HashSet::new();
+        let indices: HashMap<&str, usize> = HashMap::new();
+        let lowlinks: HashMap<&str, usize> = HashMap::new();
+        let sccs: Vec<Vec<String>> = Vec::new();
+
+        /// Mutable state threaded through Tarjan's SCC algorithm recursion.
+        struct TarjanState<'a> {
+            index_counter: usize,
+            stack: Vec<&'a str>,
+            on_stack: HashSet<&'a str>,
+            indices: HashMap<&'a str, usize>,
+            lowlinks: HashMap<&'a str, usize>,
+            sccs: Vec<Vec<String>>,
+        }
 
         fn strongconnect<'a>(
             node: &'a str,
             adj: &HashMap<&'a str, Vec<&'a str>>,
-            index_counter: &mut usize,
-            stack: &mut Vec<&'a str>,
-            on_stack: &mut HashSet<&'a str>,
-            indices: &mut HashMap<&'a str, usize>,
-            lowlinks: &mut HashMap<&'a str, usize>,
-            sccs: &mut Vec<Vec<String>>,
+            st: &mut TarjanState<'a>,
         ) {
-            indices.insert(node, *index_counter);
-            lowlinks.insert(node, *index_counter);
-            *index_counter += 1;
-            stack.push(node);
-            on_stack.insert(node);
+            st.indices.insert(node, st.index_counter);
+            st.lowlinks.insert(node, st.index_counter);
+            st.index_counter += 1;
+            st.stack.push(node);
+            st.on_stack.insert(node);
 
             if let Some(neighbors) = adj.get(node) {
                 for &neighbor in neighbors {
-                    if !indices.contains_key(neighbor) {
-                        strongconnect(neighbor, adj, index_counter, stack, on_stack, indices, lowlinks, sccs);
-                        let neighbor_low = lowlinks[neighbor];
-                        let node_low = lowlinks.get_mut(node).unwrap();
+                    if !st.indices.contains_key(neighbor) {
+                        strongconnect(neighbor, adj, st);
+                        let neighbor_low = st.lowlinks[neighbor];
+                        let node_low = st.lowlinks.get_mut(node).unwrap();
                         if neighbor_low < *node_low {
                             *node_low = neighbor_low;
                         }
-                    } else if on_stack.contains(neighbor) {
-                        let neighbor_idx = indices[neighbor];
-                        let node_low = lowlinks.get_mut(node).unwrap();
+                    } else if st.on_stack.contains(neighbor) {
+                        let neighbor_idx = st.indices[neighbor];
+                        let node_low = st.lowlinks.get_mut(node).unwrap();
                         if neighbor_idx < *node_low {
                             *node_low = neighbor_idx;
                         }
@@ -232,11 +237,11 @@ impl<'a> Validator<'a> {
             }
 
             // If node is a root of an SCC
-            if lowlinks[node] == indices[node] {
+            if st.lowlinks[node] == st.indices[node] {
                 let mut scc = Vec::new();
                 loop {
-                    let w = stack.pop().unwrap();
-                    on_stack.remove(w);
+                    let w = st.stack.pop().unwrap();
+                    st.on_stack.remove(w);
                     scc.push(w.to_string());
                     if w == node {
                         break;
@@ -249,21 +254,27 @@ impl<'a> Validator<'a> {
                     if let Some(first) = scc.first().cloned() {
                         scc.push(first);
                     }
-                    sccs.push(scc);
+                    st.sccs.push(scc);
                 }
             }
         }
 
+        let mut st = TarjanState {
+            index_counter,
+            stack,
+            on_stack,
+            indices,
+            lowlinks,
+            sccs,
+        };
+
         for node in &self.graph.nodes {
-            if !indices.contains_key(node.id.as_str()) {
-                strongconnect(
-                    &node.id, &adj, &mut index_counter, &mut stack,
-                    &mut on_stack, &mut indices, &mut lowlinks, &mut sccs,
-                );
+            if !st.indices.contains_key(node.id.as_str()) {
+                strongconnect(&node.id, &adj, &mut st);
             }
         }
 
-        sccs
+        st.sccs
     }
 
     /// Find duplicate node IDs.
