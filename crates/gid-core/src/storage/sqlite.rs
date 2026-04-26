@@ -1866,7 +1866,7 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("string".into(), serde_json::json!("hello"));
         meta.insert("number".into(), serde_json::json!(42));
-        meta.insert("float".into(), serde_json::json!(3.14));
+        meta.insert("float".into(), serde_json::json!(2.5));
         meta.insert("bool".into(), serde_json::json!(true));
         meta.insert("null".into(), serde_json::json!(null));
         meta.insert("array".into(), serde_json::json!([1, 2, 3]));
@@ -1877,7 +1877,7 @@ mod tests {
 
         assert_eq!(loaded.get("string"), Some(&serde_json::json!("hello")));
         assert_eq!(loaded.get("number"), Some(&serde_json::json!(42)));
-        assert_eq!(loaded.get("float"), Some(&serde_json::json!(3.14)));
+        assert_eq!(loaded.get("float"), Some(&serde_json::json!(2.5)));
         assert_eq!(loaded.get("bool"), Some(&serde_json::json!(true)));
         assert_eq!(loaded.get("null"), Some(&serde_json::json!(null)));
         assert_eq!(loaded.get("array"), Some(&serde_json::json!([1, 2, 3])));

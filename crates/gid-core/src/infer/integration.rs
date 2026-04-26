@@ -626,7 +626,7 @@ mod tests {
             nodes,
             edges,
             metrics: ClusterMetrics {
-                codelength: 3.14,
+                codelength: 3.5,
                 num_communities: n,
                 num_total: n * 5,
                 ..Default::default()
@@ -909,7 +909,7 @@ mod tests {
         assert!(summary.contains("1 feature"));
         assert!(summary.contains("Auth Module"));
         assert!(summary.contains("Authentication"));
-        assert!(summary.contains("3.140"));
+        assert!(summary.contains("3.500"));
         assert!(summary.contains("infer:component:0"));
         assert!(summary.contains("infer:component:1"));
         assert!(summary.contains("infer:feature:auth"));

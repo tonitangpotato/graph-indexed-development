@@ -734,3 +734,21 @@ n.name == short_name
 **验证**: 1238 → 1243 tests pass (+5)，clippy `overly_complex_bool_expr` errors 消失。
 
 详见 `.gid/issues/ISS-040-test-node-lookup-dead-branch.md`
+
+---
+
+## ISS-041 [hygiene] [P1] [closed]
+**发现日期**: 2026-04-26
+**关闭日期**: 2026-04-26
+**发现者**: RustClaw (proactive scan)
+**组件**: `gid-core/src/{infer/integration.rs, storage/sqlite.rs}` (test fixtures)
+**关联**: ISS-040 (一起组成 clippy 全部 5 个 errors)
+
+**描述**:
+3 处测试 fixture 用 `3.14` 作为任意 float 数据，clippy `approx_constant` 误判为想用 π。配合 ISS-040 的 2 个 logic errors，`cargo clippy` 完全跑不过 (5 errors)。
+
+**修复**: 将 `3.14` 替换为 `3.5`（非 well-known constant 近似值，仍满足 `>3.0` 断言），同步更新字符串断言 `"3.140"` → `"3.500"`。
+
+**验证**: `cargo clippy --all-targets --all-features` exit 0（仅剩 warnings — 见 ISS-042）；1243 tests pass 不变。
+
+详见 `.gid/issues/ISS-041-clippy-approx-constant-errors.md`
