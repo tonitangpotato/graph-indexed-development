@@ -192,22 +192,13 @@ mod tests {
         // Add nodes from multiple files
         for i in 0..5 {
             let file_path = format!("file{}.py", i);
+            let id = format!("class:{}:TestClass{}", file_path, i);
             graph.nodes.push(CodeNode {
-                id: format!("class:{}:TestClass{}", file_path, i),
-                kind: NodeKind::Class,
                 name: format!("TestClass{}", i),
                 file_path,
                 line: Some(1),
-                decorators: vec![],
-                signature: None,
-                docstring: None,
                 line_count: 10,
-                is_test: false,
-                visibility: None,
-                lang: None,
-                body_hash: None,
-                end_line: None,
-                complexity: None,
+                ..CodeNode::test_default(&id, NodeKind::Class)
             });
         }
         
@@ -224,42 +215,22 @@ mod tests {
         
         // Create a function with many callers
         graph.nodes.push(CodeNode {
-            id: "func:core.py:hot_func".into(),
-            kind: NodeKind::Function,
             name: "hot_func".into(),
             file_path: "core.py".into(),
             line: Some(10),
-            decorators: vec![],
-            signature: None,
-            docstring: None,
             line_count: 20,
-            is_test: false,
-            visibility: None,
-            lang: None,
-            body_hash: None,
-            end_line: None,
-            complexity: None,
+            ..CodeNode::test_default("func:core.py:hot_func", NodeKind::Function)
         });
         
         // Add many callers
         for i in 0..30 {
             let caller_id = format!("func:caller{}.py:caller_{}", i, i);
             graph.nodes.push(CodeNode {
-                id: caller_id.clone(),
-                kind: NodeKind::Function,
                 name: format!("caller_{}", i),
                 file_path: format!("caller{}.py", i),
                 line: Some(1),
-                decorators: vec![],
-                signature: None,
-                docstring: None,
                 line_count: 5,
-                is_test: false,
-                visibility: None,
-                lang: None,
-                body_hash: None,
-                end_line: None,
-                complexity: None,
+                ..CodeNode::test_default(&caller_id, NodeKind::Function)
             });
             graph.edges.push(CodeEdge::new(&caller_id, "func:core.py:hot_func", EdgeRelation::Calls));
         }

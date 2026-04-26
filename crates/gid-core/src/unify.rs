@@ -703,25 +703,13 @@ mod tests {
         let mut cg = CodeGraph {
             nodes: vec![
                 CodeNode {
-                    id: "file:src/main.rs".to_string(),
-                    kind: NodeKind::File,
                     name: "main.rs".to_string(),
                     file_path: "src/main.rs".to_string(),
-                    line: None,
-                    decorators: vec![],
-                    signature: None,
-                    docstring: None,
                     line_count: 100,
-                    is_test: false,
-                    visibility: None,
                     lang: Some("rust".to_string()),
-                    body_hash: None,
-                    end_line: None,
-                    complexity: None,
-                                    },
+                    ..CodeNode::test_default("file:src/main.rs", NodeKind::File)
+                },
                 CodeNode {
-                    id: "fn:src/main.rs:main".to_string(),
-                    kind: NodeKind::Function,
                     name: "main".to_string(),
                     file_path: "src/main.rs".to_string(),
                     line: Some(10),
@@ -729,30 +717,24 @@ mod tests {
                     signature: Some("async fn main() -> Result<()>".to_string()),
                     docstring: Some("Entry point".to_string()),
                     line_count: 50,
-                    is_test: false,
                     visibility: Some("pub".to_string()),
                     lang: Some("rust".to_string()),
                     body_hash: Some("abc123".to_string()),
                     end_line: Some(60),
-                    complexity: None,
-                                    },
+                    ..CodeNode::test_default("fn:src/main.rs:main", NodeKind::Function)
+                },
                 CodeNode {
-                    id: "class:src/lib.rs:Config".to_string(),
-                    kind: NodeKind::Class,
                     name: "Config".to_string(),
                     file_path: "src/lib.rs".to_string(),
                     line: Some(1),
-                    decorators: vec![],
-                    signature: None,
-                    docstring: None,
                     line_count: 20,
                     is_test: true,
                     visibility: Some("pub(crate)".to_string()),
                     lang: Some("rust".to_string()),
                     body_hash: Some("def456".to_string()),
                     end_line: Some(20),
-                    complexity: None,
-                                    },
+                    ..CodeNode::test_default("class:src/lib.rs:Config", NodeKind::Class)
+                },
             ],
             edges: vec![
                 CodeEdge {

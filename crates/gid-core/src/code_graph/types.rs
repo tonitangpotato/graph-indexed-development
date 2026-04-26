@@ -355,6 +355,41 @@ impl CodeNode {
             complexity: None,
         }
     }
+
+    /// Test helper: build a CodeNode with sensible defaults.
+    ///
+    /// Designed for use with Functional Update Syntax (FRU) so tests only specify
+    /// the fields they care about:
+    ///
+    /// ```ignore
+    /// CodeNode {
+    ///     line_count: 100,
+    ///     is_test: true,
+    ///     ..CodeNode::test_default("file:foo.rs", NodeKind::File)
+    /// }
+    /// ```
+    ///
+    /// When new fields are added to `CodeNode`, only this helper needs updating —
+    /// not every test instantiation. See ISS-001.
+    pub fn test_default(id: &str, kind: NodeKind) -> Self {
+        Self {
+            id: id.to_string(),
+            kind,
+            name: id.rsplit(':').next().unwrap_or(id).to_string(),
+            file_path: String::new(),
+            line: None,
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 0,
+            is_test: false,
+            visibility: None,
+            lang: None,
+            body_hash: None,
+            end_line: None,
+            complexity: None,
+        }
+    }
 }
 
 /// Kind of code node.

@@ -1118,38 +1118,17 @@ mod tests {
         // Simulate: struct CodeGraph defined in extract.rs, impl CodeGraph in format.rs
         let nodes = vec![
             CodeNode {
-                id: "class:code_graph/extract.rs:CodeGraph".to_string(),
                 name: "CodeGraph".to_string(),
-                kind: NodeKind::Class,
                 file_path: "code_graph/extract.rs".to_string(),
-                line: None,
-                decorators: vec![],
-                signature: None,
-                docstring: None,
-                line_count: 0,
-                is_test: false,
-                visibility: None,
-                lang: None,
-                body_hash: None,
-                end_line: None,
-                complexity: None,
+                ..CodeNode::test_default("class:code_graph/extract.rs:CodeGraph", NodeKind::Class)
             },
             CodeNode {
-                id: "method:code_graph/format.rs:CodeGraph.format_for_llm".to_string(),
                 name: "format_for_llm".to_string(),
-                kind: NodeKind::Function,
                 file_path: "code_graph/format.rs".to_string(),
-                line: None,
-                decorators: vec![],
-                signature: None,
-                docstring: None,
-                line_count: 0,
-                is_test: false,
-                visibility: None,
-                lang: None,
-                body_hash: None,
-                end_line: None,
-                complexity: None,
+                ..CodeNode::test_default(
+                    "method:code_graph/format.rs:CodeGraph.format_for_llm",
+                    NodeKind::Function,
+                )
             },
         ];
 

@@ -362,38 +362,17 @@ mod tests {
     fn test_build_unified_graph() {
         let mut code_graph = CodeGraph::default();
         code_graph.nodes.push(CodeNode {
-            id: "file:src/main.rs".into(),
-            kind: NodeKind::File,
             name: "main.rs".into(),
             file_path: "src/main.rs".into(),
-            line: None,
-            decorators: vec![],
-            signature: None,
-            docstring: None,
-            line_count: 0,
-            is_test: false,
-            visibility: None,
-            lang: None,
-            body_hash: None,
-            end_line: None,
-            complexity: None,
+            ..CodeNode::test_default("file:src/main.rs", NodeKind::File)
         });
         code_graph.nodes.push(CodeNode {
-            id: "func:src/main.rs:main".into(),
-            kind: NodeKind::Function,
             name: "main".into(),
             file_path: "src/main.rs".into(),
             line: Some(1),
-            decorators: vec![],
             signature: Some("fn main()".into()),
-            docstring: None,
             line_count: 10,
-            is_test: false,
-            visibility: None,
-            lang: None,
-            body_hash: None,
-            end_line: None,
-            complexity: None,
+            ..CodeNode::test_default("func:src/main.rs:main", NodeKind::Function)
         });
         
         let task_graph = Graph {
