@@ -1,6 +1,6 @@
 # ISS-031: Ritual Graph Phase Pollutes Existing Tasks When skip_design=true
 
-**Status:** open
+**Status:** closed (duplicate of ISS-039)
 **Severity:** critical (silent data corruption — LLM invents tasks, overwrites graph, then verifies itself green)
 **Reported:** 2026-04-23
 **Reporter:** potato (via rustclaw session — Phase 5b of engram-ai-rust ISS-021)
@@ -130,3 +130,15 @@ Verifying must receive a declared-deliverables manifest from Implementing (files
 
 - Should reconcile mode allow adding *new* sub-task nodes if the LLM legitimately detects missing granularity? (Current proposal: no. Escalate to human.)
 - How does this interact with multi-issue features (one feature spanning multiple issues)? Probably the prefix-matching rule extends to feature scope — not in initial fix.
+
+---
+
+## Resolution (2026-04-25)
+
+Closed as duplicate of **ISS-039**. The root cause described here (graph-phase prompts that lack mode dispatch and let the LLM invent colliding task IDs) is exactly what ISS-039 fixed. Specifically:
+
+1. **Mode dispatch** (commit `ae834ff`): `determine_graph_mode` distinguishes PlanNew / Reconcile / NoOp from `WorkUnit` + graph state. The exact scenario in the incident report (engram-ai-rust ISS-021 Phase 5b) — work unit references an existing issue with materialized child tasks — now hits **Reconcile** mode, which forbids new node creation.
+2. **ID-collision validation** (commit `ae834ff`): `validate_graph_phase_output` snapshots node IDs before and after the LLM runs and rejects any output that creates new nodes in Reconcile mode.
+3. **Wiring** (commit `d60da91`): `V2Executor::run_skill` now invokes preflight + postvalidate around the graph phase. Verified by `graph_phase_reconcile_rejects_new_node_creation` test, which reproduces the original incident scenario and asserts the ritual emits `SkillFailed` with an ISS-039 diagnostic instead of letting the LLM pollute the graph.
+
+The "skip_design=true routes through Graphing" issue is unchanged structurally — that routing is correct; what was wrong was Graphing's lack of guardrails.

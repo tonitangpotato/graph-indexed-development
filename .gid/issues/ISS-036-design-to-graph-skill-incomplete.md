@@ -1,6 +1,6 @@
 # ISS-036: design-to-graph Pipeline Incomplete — Missing Skill, Schema Gaps
 
-**Status:** open
+**Status:** closed (duplicate of ISS-039)
 **Severity:** important (blocks ritual v2 Graphing phase from running end-to-end; blocks design-doc-to-graph automation for any non-trivial project)
 **Reported:** 2026-04-24
 **Reporter:** potato + RustClaw
@@ -111,3 +111,15 @@ The `Graphing` phase being a placeholder makes ritual v2 **non-functional for re
 - `parse_llm_response` and `gid design --parse --merge` are already schema-agnostic — the merge plumbing works. Gap is purely in the **prompt + skill + reconciliation** layer.
 - Workaround for engram v0.3 (this project): hand-write prompt + run 5 sub-agents + manual merge. Documented for reference; should not be required once this issue is resolved.
 - The yaml format used by `gid design --parse` is a **stdin/stdout protocol** between LLM and tool, not on-disk storage. This is OK and consistent with the "never yaml as storage" rule.
+
+---
+
+## Resolution (2026-04-25)
+
+Closed as duplicate of **ISS-039**. The "skill does not exist / prompt is inline" complaint is fixed by ISS-039 commits:
+
+1. **Prompt extraction** (commit `1d7943e`): the four graph-phase prompts (`generate_graph.txt`, `update_graph.txt`, `implement.txt`, `update_design.txt`) are now real `include_str!`-loaded files, replacing the ~110-line inline string.
+2. **SQLite-canonical storage** (commit `1d7943e`): the prompts no longer reference deprecated `graph.yml`; load_graph_auto / save_graph_auto handle backend selection.
+3. **Mode dispatch + validation + wiring** (commits `ae834ff`, `d60da91`): the skill is now a real, testable phase with PlanNew / Reconcile / NoOp dispatch and ID-collision validation.
+
+The component-middle-layer / planned-code-node concerns from this issue's "Current State" table are real but separate — they describe schema gaps in `parse_llm_response`, not the skill itself. If still relevant after ISS-039, file a fresh issue scoped to the schema specifically.
