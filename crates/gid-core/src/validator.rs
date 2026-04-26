@@ -117,16 +117,14 @@ impl<'a> Validator<'a> {
 
     /// Run all validations and return combined result.
     pub fn validate(&self) -> ValidationResult {
-        let mut result = ValidationResult::default();
-
-        result.duplicate_nodes = self.find_duplicate_nodes();
-        result.missing_refs = self.find_missing_refs();
-        result.orphan_nodes = self.find_orphan_nodes();
-        result.cycles = self.find_cycles();
-        result.duplicate_edges = self.find_duplicate_edges();
-        result.self_edges = self.find_self_edges();
-
-        result
+        ValidationResult {
+            duplicate_nodes: self.find_duplicate_nodes(),
+            missing_refs: self.find_missing_refs(),
+            orphan_nodes: self.find_orphan_nodes(),
+            cycles: self.find_cycles(),
+            duplicate_edges: self.find_duplicate_edges(),
+            self_edges: self.find_self_edges(),
+        }
     }
 
     /// Find nodes that have no edges (neither incoming nor outgoing).

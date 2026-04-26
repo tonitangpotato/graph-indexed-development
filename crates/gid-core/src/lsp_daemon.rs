@@ -229,7 +229,7 @@ impl LspDaemon {
     fn handle_request(&mut self, req: DaemonRequest) -> DaemonResponse {
         match req {
             DaemonRequest::Ping { lang_id } => {
-                let ready = self.servers.get(&lang_id).is_some();
+                let ready = self.servers.contains_key(&lang_id);
                 let uptime = self.servers.get(&lang_id)
                     .map(|s| s.started_at.elapsed().as_secs())
                     .unwrap_or(0);

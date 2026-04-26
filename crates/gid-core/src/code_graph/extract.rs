@@ -1215,8 +1215,10 @@ impl CodeGraph {
             .collect();
 
         // Build state from existing graph nodes for reference resolution
-        let mut state = ExtractState::default();
-        state.module_map = module_map;
+        let mut state = ExtractState {
+            module_map,
+            ..Default::default()
+        };
 
         // Populate maps from existing (unchanged) nodes
         for node in &graph.nodes {

@@ -2484,7 +2484,7 @@ mod tests {
         assert_eq!(map.get("contains").copied(), Some(WEIGHT_STRUCTURAL));
         assert_eq!(map.get("depends_on").copied(), Some(WEIGHT_DEPENDS_ON));
         // Unknown relation must be absent (treated as 0.0 by build_network).
-        assert!(map.get("unknown_relation").is_none());
+        assert!(!map.contains_key("unknown_relation"));
     }
 
     // ── 4. test_build_network_skips_self_loops ─────────────────────────

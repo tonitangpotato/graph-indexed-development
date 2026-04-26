@@ -1899,7 +1899,7 @@ mod tests {
 
         let loaded = s.get_metadata("n1").unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(loaded.get("old_key").is_none());
+        assert!(!loaded.contains_key("old_key"));
         assert_eq!(loaded.get("new_key"), Some(&serde_json::json!("new_value")));
     }
 
@@ -2305,7 +2305,7 @@ mod tests {
         s.put_node(&node2).unwrap();
 
         let loaded = s.get_node("m1").unwrap().unwrap();
-        assert!(loaded.metadata.get("old").is_none());
+        assert!(!loaded.metadata.contains_key("old"));
         assert_eq!(loaded.metadata.get("new"), Some(&serde_json::json!(42)));
     }
 

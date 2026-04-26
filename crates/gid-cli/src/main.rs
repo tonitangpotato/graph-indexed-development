@@ -4687,8 +4687,10 @@ async fn cmd_infer(
     };
 
     // Build clustering config
-    let mut cluster_config = infer::ClusterConfig::default();
-    cluster_config.hierarchical = hierarchical;
+    let mut cluster_config = infer::ClusterConfig {
+        hierarchical,
+        ..Default::default()
+    };
     if let Some(n) = num_trials {
         cluster_config.num_trials = n;
     }
