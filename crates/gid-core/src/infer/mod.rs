@@ -176,7 +176,7 @@ pub async fn run(
         // If user specified default min_community_size, auto-tune based on graph properties
         if config.clustering.min_community_size == ClusterConfig::default().min_community_size {
             // Build network early to compute density-aware config
-            let (net, _) = clustering::build_network(effective_graph);
+            let (net, _) = clustering::build_network(effective_graph, &config.clustering);
             let mut auto = clustering::auto_config_with_network(file_count, &net);
             // Preserve user-specified overrides that auto_config doesn't know about
             if config.clustering.max_cluster_size.is_some() {

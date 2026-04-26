@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::path::Path;
 use std::collections::HashSet;
 use std::io::{self, Read};
-use anyhow::{Context, Result, bail};
+use anyhow::{anyhow, Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use gid_core::{
     Graph, Node, Edge, NodeStatus, TaskSpec,
@@ -571,6 +571,16 @@ enum Commands {
         /// Maximum files per component (oversized clusters are split)
         #[arg(long)]
         max_cluster_size: Option<usize>,
+
+        /// Override per-relation edge weight (repeatable). Format: `relation=weight`.
+        ///
+        /// Examples:
+        ///   --edge-weight calls=1.5 --edge-weight imports=0.5
+        ///
+        /// Unknown relations (not in defaults) are added; existing ones are
+        /// overridden. Set to 0 to ignore a relation entirely. (ISS-002)
+        #[arg(long = "edge-weight", value_name = "RELATION=WEIGHT")]
+        edge_weights: Vec<String>,
     },
 
     /// Manage the project registry (which projects exist on this machine).
@@ -1079,10 +1089,10 @@ fn main() -> Result<()> {
         Commands::Watch { dir, debounce, no_lsp, no_semantify } => {
             cmd_watch(&dir, debounce, no_lsp, no_semantify, cli.graph.as_ref())
         }
-        Commands::Infer { level, phase, model, no_llm, dry_run, format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size } => {
+        Commands::Infer { level, phase, model, no_llm, dry_run, format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size, edge_weights } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_infer(&ctx, &level, phase.as_deref(), &model, no_llm, dry_run, &format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size, cli.json))
+            rt.block_on(cmd_infer(&ctx, &level, phase.as_deref(), &model, no_llm, dry_run, &format, max_tokens, source, hierarchical, num_trials, min_community_size, max_cluster_size, edge_weights, cli.json))
         }
         Commands::Project { action } => cmd_project(action, cli.json),
     }
@@ -4430,6 +4440,7 @@ async fn cmd_infer(
     num_trials: Option<u32>,
     min_community_size: Option<usize>,
     max_cluster_size: Option<usize>,
+    edge_weight_overrides: Vec<String>,
     json: bool,
 ) -> Result<()> {
     use gid_core::infer;
@@ -4463,6 +4474,26 @@ async fn cmd_infer(
     }
     if let Some(n) = max_cluster_size {
         cluster_config.max_cluster_size = Some(n);
+    }
+
+    // Parse --edge-weight RELATION=WEIGHT overrides (ISS-002).
+    // Each entry overrides one relation's weight. Setting weight=0 effectively
+    // ignores that relation (build_network skips zero-weight edges).
+    for spec in &edge_weight_overrides {
+        let (relation, weight_str) = spec.split_once('=').ok_or_else(|| {
+            anyhow!("--edge-weight expects RELATION=WEIGHT, got {:?}", spec)
+        })?;
+        let relation = relation.trim();
+        if relation.is_empty() {
+            bail!("--edge-weight: relation name cannot be empty (got {:?})", spec);
+        }
+        let weight: f64 = weight_str.trim().parse().map_err(|e| {
+            anyhow!("--edge-weight: invalid weight {:?} for {:?}: {}", weight_str, relation, e)
+        })?;
+        if !weight.is_finite() || weight < 0.0 {
+            bail!("--edge-weight: weight must be finite and non-negative (got {} for {:?})", weight, relation);
+        }
+        cluster_config.edge_weights.insert(relation.to_string(), weight);
     }
 
     // Build labeling config

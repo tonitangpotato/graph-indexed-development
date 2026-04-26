@@ -1361,9 +1361,9 @@ fn detect_modules(graph: &Graph) -> Vec<Advice> {
 #[cfg(feature = "infomap")]
 pub fn detect_code_modules(graph: &Graph) -> Vec<DetectedModule> {
     use infomap_rs::Infomap;
-    use crate::infer::clustering::build_network;
+    use crate::infer::clustering::{build_network, ClusterConfig};
 
-    let (net, idx_to_id) = build_network(graph);
+    let (net, idx_to_id) = build_network(graph, &ClusterConfig::default());
 
     if net.num_nodes() < 2 || net.num_edges() < 1 {
         return vec![];
