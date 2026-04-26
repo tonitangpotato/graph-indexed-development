@@ -1,6 +1,7 @@
 //! TypeScript/JavaScript code extraction using tree-sitter AST parsing
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use regex::Regex;
 use tree_sitter::Parser;
@@ -702,16 +703,35 @@ pub(crate) fn extract_typescript_docstring(node: tree_sitter::Node, source_str: 
 /// Extract from TypeScript/JavaScript source (regex-based fallback, kept for reference).
 #[allow(dead_code)]
 pub(crate) fn extract_typescript_regex(path: &str, content: &str) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
+    // Lazily-compiled regexes hoisted out of the function body — since this
+    // helper may be re-introduced as the active extractor at any point, keep
+    // its compile-once discipline aligned with python.rs / rust_lang.rs (ISS-044).
+    static RE_IMPORT: OnceLock<Regex> = OnceLock::new();
+    static RE_CLASS: OnceLock<Regex> = OnceLock::new();
+    static RE_INTERFACE: OnceLock<Regex> = OnceLock::new();
+    static RE_FUNCTION: OnceLock<Regex> = OnceLock::new();
+    static RE_ARROW: OnceLock<Regex> = OnceLock::new();
+
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
     let file_id = format!("file:{}", path);
 
-    let re_import = Regex::new(r#"(?m)^import\s+.*?\s+from\s+['"]([^'"]+)['"]"#).unwrap();
-    let re_class = Regex::new(r"(?m)^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?").unwrap();
-    let re_interface = Regex::new(r"(?m)^(?:export\s+)?interface\s+(\w+)(?:\s+extends\s+(\w+))?").unwrap();
-    let re_function = Regex::new(r"(?m)^(?:export\s+)?(?:async\s+)?function\s+(\w+)").unwrap();
-    let re_arrow = Regex::new(r"(?m)^(?:export\s+)?(?:const|let)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>").unwrap();
+    let re_import = RE_IMPORT.get_or_init(|| {
+        Regex::new(r#"(?m)^import\s+.*?\s+from\s+['"]([^'"]+)['"]"#).expect("static regex must compile")
+    });
+    let re_class = RE_CLASS.get_or_init(|| {
+        Regex::new(r"(?m)^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?").expect("static regex must compile")
+    });
+    let re_interface = RE_INTERFACE.get_or_init(|| {
+        Regex::new(r"(?m)^(?:export\s+)?interface\s+(\w+)(?:\s+extends\s+(\w+))?").expect("static regex must compile")
+    });
+    let re_function = RE_FUNCTION.get_or_init(|| {
+        Regex::new(r"(?m)^(?:export\s+)?(?:async\s+)?function\s+(\w+)").expect("static regex must compile")
+    });
+    let re_arrow = RE_ARROW.get_or_init(|| {
+        Regex::new(r"(?m)^(?:export\s+)?(?:const|let)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>").expect("static regex must compile")
+    });
 
     for cap in re_import.captures_iter(content) {
         let module = cap[1].to_string();

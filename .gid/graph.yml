@@ -436,3 +436,55 @@ edges:
   - from: feat-mega-cluster-splitting
     to: comp-infer-clustering
     relation: enhances
+
+  # ── ISS-043: Python confidence ladder fix ──────────────────────────────
+  - id: issue-043
+    title: ISS-043 - Python confidence ladder collapsed tier
+    type: issue
+    status: in_progress
+    description: Python call-resolution has same_file and imported both at 0.8 (should be 0.8 and 0.75)
+    tags:
+      - p2
+      - correctness
+      - python
+    metadata:
+      location: "crates/gid-core/src/code_graph/lang/python.rs:858-860"
+
+  - id: task-043-git-blame-analysis
+    title: Git blame and compare with rust_lang.rs
+    type: task
+    status: done
+    description: |
+      - Run git blame on python.rs:846-852
+      - Read ISS-012 design notes
+      - Compare with rust_lang.rs equivalent ladder
+      - Determine if bug or intentional design
+    tags:
+      - investigation
+
+  - id: task-043-fix-ladder
+    title: Fix confidence ladder and add test
+    type: task
+    status: todo
+    description: |
+      - Change imported branch from 0.8 to 0.75 in python.rs:860
+      - Add unit test in tests/ asserting strict ordering (same_file > imported > same_pkg)
+      - Verify clippy warning is gone
+      - Verify all 1243 tests still pass
+    tags:
+      - fix
+      - testing
+
+
+  # ── ISS-043 edges ───────────────────────────────────────────────────────
+  - from: task-043-git-blame-analysis
+    to: issue-043
+    relation: implements
+
+  - from: task-043-fix-ladder
+    to: issue-043
+    relation: implements
+
+  - from: task-043-fix-ladder
+    to: task-043-git-blame-analysis
+    relation: depends_on

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
 
 use regex::Regex;
@@ -14,6 +15,16 @@ use crate::unify::graph_to_codegraph;
 
 // ═══ Current metadata version. Bump on struct changes → triggers full rebuild. ═══
 const EXTRACT_META_VERSION: u32 = 2;
+
+/// Module-level cache for the Python `from X import …` regex used during
+/// test-to-source mapping. Previously constructed via `Regex::new(...)` per
+/// extracted test file (ISS-044); now compiled once per process.
+fn from_import_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^from\s+([\w.]+)\s+import").expect("static regex must compile")
+    })
+}
 
 // ═══ Shared Helper Types ═══
 
@@ -329,10 +340,9 @@ fn extract_calls_for_file(
             let is_test_file = rel_path.contains("/tests/") || rel_path.contains("/test_");
             if is_test_file {
                 let file_id = format!("file:{}", rel_path);
-                let re_from_import = Regex::new(r"^from\s+([\w.]+)\s+import").unwrap();
 
                 for line in content.lines() {
-                    if let Some(cap) = re_from_import.captures(line) {
+                    if let Some(cap) = from_import_re().captures(line) {
                         let module = cap[1].to_string();
                         if let Some(source_file_id) = module_map.get(&module) {
                             edges.push(CodeEdge {

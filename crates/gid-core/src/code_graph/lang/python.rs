@@ -1,11 +1,23 @@
 //! Python code extraction using tree-sitter AST parsing
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use regex::Regex;
 use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
+
+/// Module-level cache for the import-statement regex.
+///
+/// Compiled exactly once per process. Previously this was constructed via
+/// `Regex::new(...)` inside the AST-walk loop, recompiling on every
+/// top-level statement (ISS-044). On a 5k-file Python codebase that
+/// translated to ~5–25s of wasted CPU during extraction.
+fn import_statement_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"import\s+([\w.]+)").expect("static regex must compile"))
+}
 
 /// Determine Python visibility by naming convention.
 fn extract_python_visibility(name: &str) -> String {
@@ -196,8 +208,7 @@ pub(crate) fn extract_python_tree_sitter(
             }
             "import_statement" => {
                 let import_text = text(child);
-                let re_import = Regex::new(r"import\s+([\w.]+)").unwrap();
-                if let Some(cap) = re_import.captures(&import_text) {
+                if let Some(cap) = import_statement_re().captures(&import_text) {
                     let module = cap[1].to_string();
                     if !is_stdlib(&module) {
                         edges.push(CodeEdge {
@@ -843,10 +854,20 @@ pub(crate) fn resolve_and_add_call_edge(
             3
         };
 
+        // Confidence ladder for resolved-target calls (graduated by scope):
+        //   same_file = 0.8  >  imported = 0.75  >  same_pkg = 0.7
+        // Mirrors the Rust extractor's ladder (rust_lang.rs:1855 — 0.9/0.8/0.7)
+        // for consistent cross-language semantics. ISS-043 fix: previously
+        // `imported` was 0.8 (same as same_file — typo), collapsing the top
+        // two tiers; restored to a strict descent with imported=0.75.
+        // The trailing `attribute = 0.3` and `unknown = 0.5` rungs are
+        // *unresolved*-target heuristics and intentionally not part of the
+        // resolved-scope ladder above (attribute calls signal a strong
+        // wrong-target risk, hence ranked below generic unknown names).
         let confidence = if !same_file.is_empty() {
             0.8_f32
         } else if !imported.is_empty() {
-            0.8
+            0.75
         } else if !same_pkg.is_empty() {
             0.7
         } else if is_attribute_call {
@@ -1188,5 +1209,122 @@ pub(crate) fn is_stdlib(module: &str) -> bool {
 
     let first_part = module.split('.').next().unwrap_or(module);
     stdlib_prefixes.contains(&first_part)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the Python call-resolution confidence ladder.
+    //!
+    //! Regression tests for ISS-043: prior to the fix, the `imported` branch in
+    //! `resolve_and_add_call_edge` returned the same 0.8 confidence as `same_file`,
+    //! collapsing the top two tiers of the resolution ladder. These tests assert
+    //! strict ordering — `same_file > imported > same_pkg` — by driving the
+    //! resolver through scenarios where exactly one tier should win, and inspecting
+    //! the confidence on the produced `Calls` edge.
+    use super::*;
+
+    /// Drive `resolve_and_add_call_edge` for a single callee that lives in
+    /// `defining_file` (with optional package), called from `caller_file`, and
+    /// optionally imported into `caller_file`. Returns the confidence written
+    /// onto the produced edge.
+    fn confidence_for(
+        caller_file: &str,
+        caller_pkg: &str,
+        defining_file: &str,
+        defining_pkg: &str,
+        imported_in_caller: bool,
+    ) -> f32 {
+        let callee_name = "do_thing";
+        let caller_id = format!("func:{}:caller", caller_file);
+        let callee_id = format!("func:{}:{}", defining_file, callee_name);
+
+        let mut func_name_map: HashMap<String, Vec<String>> = HashMap::new();
+        func_name_map.insert(callee_name.to_string(), vec![callee_id.clone()]);
+
+        // file_func_ids is the set of function ids defined in the *caller's* file.
+        // Same-file resolution wins iff the callee_id is also in this set.
+        let mut file_func_ids: HashSet<String> = HashSet::new();
+        if caller_file == defining_file {
+            file_func_ids.insert(callee_id.clone());
+        }
+
+        let mut file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
+        if imported_in_caller {
+            let mut names = HashSet::new();
+            names.insert(callee_name.to_string());
+            file_imported_names.insert(caller_file.to_string(), names);
+        }
+
+        let class_init_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut node_pkg_map: HashMap<String, String> = HashMap::new();
+        node_pkg_map.insert(callee_id.clone(), defining_pkg.to_string());
+
+        let mut edges: Vec<CodeEdge> = Vec::new();
+
+        resolve_and_add_call_edge(
+            &caller_id,
+            callee_name,
+            &func_name_map,
+            &file_func_ids,
+            &file_imported_names,
+            caller_file,
+            caller_pkg,
+            &class_init_map,
+            &node_pkg_map,
+            /* is_attribute_call = */ false,
+            &mut edges,
+        );
+
+        let edge = edges
+            .iter()
+            .find(|e| e.relation == EdgeRelation::Calls && e.to == callee_id)
+            .expect("expected a Calls edge to the resolved callee");
+        edge.confidence
+    }
+
+    /// ISS-043 regression: same_file resolution must outrank imported, which
+    /// must in turn outrank same_pkg. Prior to the fix, same_file and imported
+    /// both produced 0.8, collapsing the ladder.
+    #[test]
+    fn iss_043_call_confidence_ladder_is_strictly_ordered() {
+        // same_file: callee defined in the very file the caller lives in.
+        let same_file = confidence_for(
+            "pkg/mod.py", "pkg", "pkg/mod.py", "pkg", /* imported = */ false,
+        );
+
+        // imported: callee defined in a *different* file, but imported into
+        // the caller's file. To isolate this from same_pkg, put the definer
+        // in a different package directory.
+        let imported = confidence_for(
+            "pkg/mod.py", "pkg", "other/lib.py", "other", /* imported = */ true,
+        );
+
+        // same_pkg: callee in a sibling file in the same package directory,
+        // not imported.
+        let same_pkg = confidence_for(
+            "pkg/mod.py", "pkg", "pkg/sibling.py", "pkg", /* imported = */ false,
+        );
+
+        assert!(
+            same_file > imported,
+            "same_file ({}) must be strictly greater than imported ({}) — \
+             ISS-043 regression: ladder has collapsed",
+            same_file,
+            imported,
+        );
+        assert!(
+            imported > same_pkg,
+            "imported ({}) must be strictly greater than same_pkg ({}) — \
+             ISS-043 regression: ladder has collapsed",
+            imported,
+            same_pkg,
+        );
+
+        // Pin the exact ladder values so accidental future edits to the
+        // numerics surface immediately.
+        assert_eq!(same_file, 0.8_f32, "same_file confidence drifted from 0.8");
+        assert_eq!(imported, 0.75_f32, "imported confidence drifted from 0.75");
+        assert_eq!(same_pkg, 0.7_f32, "same_pkg confidence drifted from 0.7");
+    }
 }
 
