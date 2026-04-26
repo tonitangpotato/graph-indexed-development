@@ -18,7 +18,7 @@ use gid_core::{
     query::QueryEngine,
     validator::Validator,
     CodeGraph, CodeNode, NodeKind,
-    analyze_impact, analyze_impact_filtered, format_impact_for_llm,
+    analyze_impact, analyze_impact_filtered, analyze_impact_with_filters, format_impact_for_llm,
     assess_complexity_from_graph, assess_risk_level,
     unify::{codegraph_to_graph_nodes, merge_code_layer, graph_to_codegraph},
     // New modules
@@ -318,6 +318,11 @@ enum Commands {
         /// Filter by edge relation(s), comma-separated (e.g., calls,imports,tests_for)
         #[arg(long)]
         relation: Option<String>,
+        /// Minimum edge confidence (0.0-1.0). Default 0.8 hides
+        /// tree-sitter name-match fallback noise. Pass `0.0` to include
+        /// everything. See ISS-035.
+        #[arg(long, default_value_t = gid_core::DEFAULT_MIN_CONFIDENCE)]
+        min_confidence: f64,
     },
 
     /// Extract code snippets for relevant nodes
@@ -633,6 +638,13 @@ enum QueryCommands {
         /// Filter results by node_type (e.g., code, task, feature)
         #[arg(long, name = "type")]
         type_filter: Option<String>,
+        /// Minimum edge confidence (0.0-1.0). Edges with `confidence`
+        /// below this are hidden. Default 0.8 filters out tree-sitter
+        /// name-match fallback noise. Pass `0.0` to include everything.
+        /// Edges with no confidence (None) are always treated as trusted.
+        /// See ISS-035.
+        #[arg(long, default_value_t = gid_core::DEFAULT_MIN_CONFIDENCE)]
+        min_confidence: f64,
     },
 
     /// Show dependencies of a node
@@ -651,6 +663,9 @@ enum QueryCommands {
         /// Filter results by node_type (e.g., code, task, feature)
         #[arg(long, name = "type")]
         type_filter: Option<String>,
+        /// Minimum edge confidence (0.0-1.0). See `query impact --help`.
+        #[arg(long, default_value_t = gid_core::DEFAULT_MIN_CONFIDENCE)]
+        min_confidence: f64,
     },
 
     /// Find path between two nodes
@@ -936,9 +951,9 @@ fn main() -> Result<()> {
         Commands::Query(qc) => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             match qc {
-                QueryCommands::Impact { node, relation, layer, type_filter } => cmd_query_impact_ctx(&ctx, &node, relation.as_deref(), layer, type_filter.as_deref(), cli.json),
-                QueryCommands::Deps { node, transitive, relation, layer, type_filter } => {
-                    cmd_query_deps_ctx(&ctx, &node, transitive, relation.as_deref(), layer, type_filter.as_deref(), cli.json)
+                QueryCommands::Impact { node, relation, layer, type_filter, min_confidence } => cmd_query_impact_ctx(&ctx, &node, relation.as_deref(), layer, type_filter.as_deref(), min_confidence, cli.json),
+                QueryCommands::Deps { node, transitive, relation, layer, type_filter, min_confidence } => {
+                    cmd_query_deps_ctx(&ctx, &node, transitive, relation.as_deref(), layer, type_filter.as_deref(), min_confidence, cli.json)
                 }
                 QueryCommands::Path { from, to } => cmd_query_path_ctx(&ctx, &from, &to, cli.json),
                 QueryCommands::CommonCause { a, b } => cmd_query_common_ctx(&ctx, &a, &b, cli.json),
@@ -956,7 +971,7 @@ fn main() -> Result<()> {
         Commands::CodeSymptoms { problem, tests, dir } => cmd_code_symptoms(&dir, &problem, &tests, cli.json),
         Commands::CodeTrace { symptoms, depth, max_chains, dir } => cmd_code_trace(&dir, &symptoms, depth, max_chains, cli.json),
         Commands::CodeComplexity { nodes, dir } => cmd_code_complexity(&dir, &nodes, cli.json),
-        Commands::CodeImpact { files, dir, relation } => cmd_code_impact(&dir, &files, relation.as_deref(), cli.json),
+        Commands::CodeImpact { files, dir, relation, min_confidence } => cmd_code_impact(&dir, &files, relation.as_deref(), min_confidence, cli.json),
         Commands::CodeSnippets { keywords, max_lines, dir } => cmd_code_snippets(&dir, &keywords, max_lines, cli.json),
         Commands::Schema { dir } => cmd_schema(&dir, cli.json),
         Commands::FileSummary { file, dir } => cmd_file_summary(&dir, &file, cli.json),
@@ -1526,27 +1541,33 @@ fn cmd_remove_edge_ctx(ctx: &GraphContext, from: &str, to: &str, relation: Optio
     Ok(())
 }
 
-fn cmd_query_impact_ctx(ctx: &GraphContext, node: &str, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
+fn cmd_query_impact_ctx(ctx: &GraphContext, node: &str, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, min_confidence: f64, json: bool) -> Result<()> {
     // For SQLite backend, load graph into memory and use same logic as YAML
     match ctx.backend {
-        StorageBackend::Yaml => cmd_query_impact(ctx, node, relation, layer, type_filter, json),
+        StorageBackend::Yaml => cmd_query_impact(ctx, node, relation, layer, type_filter, min_confidence, json),
         _ => {
             let graph = ctx.load()?;
             let filtered = apply_layer_filter(&graph, layer);
             let engine = QueryEngine::new(&filtered);
             let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
-            let impacted = match &rels {
-                Some(r) => engine.impact_filtered(node, Some(r)),
-                None => engine.impact(node),
-            };
+            let result = engine.impact_with_filters(
+                node,
+                rels.as_deref(),
+                Some(min_confidence),
+            );
             let impacted: Vec<&Node> = if let Some(tf) = type_filter {
-                impacted.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+                result.nodes.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
             } else {
-                impacted
+                result.nodes
             };
             if json {
                 let nodes: Vec<_> = impacted.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title})).collect();
-                println!("{}", serde_json::json!({"node": node, "impacted": nodes}));
+                println!("{}", serde_json::json!({
+                    "node": node,
+                    "impacted": nodes,
+                    "min_confidence": min_confidence,
+                    "hidden_low_confidence": result.hidden_low_confidence,
+                }));
             } else {
                 if impacted.is_empty() {
                     println!("No nodes would be affected by changes to '{}'", node);
@@ -1554,32 +1575,46 @@ fn cmd_query_impact_ctx(ctx: &GraphContext, node: &str, relation: Option<&str>, 
                     println!("Changes to '{}' would affect {} node(s):", node, impacted.len());
                     for n in &impacted { println!("  {} — {}", n.id, n.title); }
                 }
+                if result.hidden_low_confidence > 0 {
+                    println!(
+                        "  ({} low-confidence edges hidden — pass `--min-confidence 0.0` to include.)",
+                        result.hidden_low_confidence,
+                    );
+                }
             }
             Ok(())
         }
     }
 }
 
-fn cmd_query_deps_ctx(ctx: &GraphContext, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
+fn cmd_query_deps_ctx(ctx: &GraphContext, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, min_confidence: f64, json: bool) -> Result<()> {
     match ctx.backend {
-        StorageBackend::Yaml => cmd_query_deps(ctx, node, transitive, relation, layer, type_filter, json),
+        StorageBackend::Yaml => cmd_query_deps(ctx, node, transitive, relation, layer, type_filter, min_confidence, json),
         _ => {
             let graph = ctx.load()?;
             let filtered = apply_layer_filter(&graph, layer);
             let engine = QueryEngine::new(&filtered);
             let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
-            let deps = match &rels {
-                Some(r) => engine.deps_filtered(node, transitive, Some(r)),
-                None => engine.deps(node, transitive),
-            };
+            let result = engine.deps_with_filters(
+                node,
+                transitive,
+                rels.as_deref(),
+                Some(min_confidence),
+            );
             let deps: Vec<&Node> = if let Some(tf) = type_filter {
-                deps.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+                result.nodes.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
             } else {
-                deps
+                result.nodes
             };
             if json {
                 let nodes: Vec<_> = deps.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title, "status": n.status.to_string()})).collect();
-                println!("{}", serde_json::json!({"node": node, "transitive": transitive, "dependencies": nodes}));
+                println!("{}", serde_json::json!({
+                    "node": node,
+                    "transitive": transitive,
+                    "dependencies": nodes,
+                    "min_confidence": min_confidence,
+                    "hidden_low_confidence": result.hidden_low_confidence,
+                }));
             } else {
                 let label = if transitive { "Transitive" } else { "Direct" };
                 if deps.is_empty() {
@@ -1587,6 +1622,12 @@ fn cmd_query_deps_ctx(ctx: &GraphContext, node: &str, transitive: bool, relation
                 } else {
                     println!("{} dependencies of '{}' ({}):", label, node, deps.len());
                     for n in &deps { println!("  {} {} — {}", status_icon(&n.status), n.id, n.title); }
+                }
+                if result.hidden_low_confidence > 0 {
+                    println!(
+                        "  ({} low-confidence edges hidden — pass `--min-confidence 0.0` to include.)",
+                        result.hidden_low_confidence,
+                    );
                 }
             }
             Ok(())
@@ -1911,7 +1952,7 @@ fn resolve_with_layer_fallback(filtered: &Graph, graph: &Graph, query: &str, lay
     }
 }
 
-fn cmd_query_impact(ctx: &GraphContext, node: &str, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
+fn cmd_query_impact(ctx: &GraphContext, node: &str, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, min_confidence: f64, json: bool) -> Result<()> {
     let graph = ctx.load()?;
     let filtered = apply_layer_filter(&graph, layer);
 
@@ -1920,21 +1961,26 @@ fn cmd_query_impact(ctx: &GraphContext, node: &str, relation: Option<&str>, laye
 
     let engine = QueryEngine::new(&filtered);
     let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
-    let impacted = match &rels {
-        Some(r) => engine.impact_filtered(node, Some(r)),
-        None => engine.impact(node),
-    };
+    let result = engine.impact_with_filters(node, rels.as_deref(), Some(min_confidence));
 
     // Apply type filter
     let impacted: Vec<&Node> = if let Some(tf) = type_filter {
-        impacted.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+        result.nodes.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
     } else {
-        impacted
+        result.nodes
     };
 
     if json {
         let nodes: Vec<_> = impacted.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title})).collect();
-        println!("{}", serde_json::json!({"node": node, "relation_filter": relation, "layer": format!("{:?}", layer), "type_filter": type_filter, "impacted": nodes}));
+        println!("{}", serde_json::json!({
+            "node": node,
+            "relation_filter": relation,
+            "layer": format!("{:?}", layer),
+            "type_filter": type_filter,
+            "impacted": nodes,
+            "min_confidence": min_confidence,
+            "hidden_low_confidence": result.hidden_low_confidence,
+        }));
     } else {
         if impacted.is_empty() {
             println!("No nodes would be affected by changes to '{}'", node);
@@ -1945,11 +1991,17 @@ fn cmd_query_impact(ctx: &GraphContext, node: &str, relation: Option<&str>, laye
                 println!("  {} — {}", n.id, n.title);
             }
         }
+        if result.hidden_low_confidence > 0 {
+            println!(
+                "  ({} low-confidence edges hidden — pass `--min-confidence 0.0` to include.)",
+                result.hidden_low_confidence,
+            );
+        }
     }
     Ok(())
 }
 
-fn cmd_query_deps(ctx: &GraphContext, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
+fn cmd_query_deps(ctx: &GraphContext, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, min_confidence: f64, json: bool) -> Result<()> {
     let graph = ctx.load()?;
     let filtered = apply_layer_filter(&graph, layer);
 
@@ -1958,23 +2010,29 @@ fn cmd_query_deps(ctx: &GraphContext, node: &str, transitive: bool, relation: Op
 
     let engine = QueryEngine::new(&filtered);
     let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
-    let deps = match &rels {
-        Some(r) => engine.deps_filtered(node, transitive, Some(r)),
-        None => engine.deps(node, transitive),
-    };
+    let result = engine.deps_with_filters(node, transitive, rels.as_deref(), Some(min_confidence));
 
     // Apply type filter
     let deps: Vec<&Node> = if let Some(tf) = type_filter {
-        deps.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+        result.nodes.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
     } else {
-        deps
+        result.nodes
     };
 
     if json {
         let nodes: Vec<_> = deps.iter().map(|n| serde_json::json!({
             "id": n.id, "title": n.title, "status": n.status.to_string()
         })).collect();
-        println!("{}", serde_json::json!({"node": node, "transitive": transitive, "relation_filter": relation, "layer": format!("{:?}", layer), "type_filter": type_filter, "dependencies": nodes}));
+        println!("{}", serde_json::json!({
+            "node": node,
+            "transitive": transitive,
+            "relation_filter": relation,
+            "layer": format!("{:?}", layer),
+            "type_filter": type_filter,
+            "dependencies": nodes,
+            "min_confidence": min_confidence,
+            "hidden_low_confidence": result.hidden_low_confidence,
+        }));
     } else {
         let label = if transitive { "Transitive" } else { "Direct" };
         let filter_note = relation.map(|r| format!(" (relations: {})", r)).unwrap_or_default();
@@ -1985,6 +2043,12 @@ fn cmd_query_deps(ctx: &GraphContext, node: &str, transitive: bool, relation: Op
             for n in &deps {
                 println!("  {} {} — {}", status_icon(&n.status), n.id, n.title);
             }
+        }
+        if result.hidden_low_confidence > 0 {
+            println!(
+                "  ({} low-confidence edges hidden — pass `--min-confidence 0.0` to include.)",
+                result.hidden_low_confidence,
+            );
         }
     }
     Ok(())
@@ -2410,7 +2474,14 @@ fn cmd_analyze(file: &PathBuf, show_callers: bool, show_callees: bool, show_impa
         let mut unified = gid_core::graph::Graph::new();
         unified.nodes = code_nodes;
         unified.edges = code_edges;
-        let analysis = analyze_impact(&[rel_path.clone()], &unified);
+        // ISS-035: surface only high-confidence edges by default; the
+        // hidden count is reported in `analysis.summary`.
+        let analysis = analyze_impact_with_filters(
+            &[rel_path.clone()],
+            &unified,
+            None,
+            Some(gid_core::DEFAULT_MIN_CONFIDENCE),
+        );
         print!("{}", format_impact_for_llm(&analysis));
     }
     
@@ -3497,7 +3568,7 @@ fn cmd_code_complexity(dir: &PathBuf, nodes_str: &str, json: bool) -> Result<()>
     Ok(())
 }
 
-fn cmd_code_impact(dir: &PathBuf, files_str: &str, relation: Option<&str>, json: bool) -> Result<()> {
+fn cmd_code_impact(dir: &PathBuf, files_str: &str, relation: Option<&str>, min_confidence: f64, json: bool) -> Result<()> {
     let dir = resolve_dir(dir)?;
     let code_graph = load_code_graph(&dir);
     let files: Vec<String> = files_str.split(',').map(|s| s.trim().to_string()).collect();
@@ -3508,15 +3579,13 @@ fn cmd_code_impact(dir: &PathBuf, files_str: &str, relation: Option<&str>, json:
     graph.nodes = code_nodes;
     graph.edges = code_edges;
 
-    let analysis = if let Some(rel_str) = relation {
-        let rels: Vec<&str> = rel_str
-            .split(',')
-            .map(|s| s.trim())
-            .collect();
-        analyze_impact_filtered(&files, &graph, Some(&rels))
-    } else {
-        analyze_impact(&files, &graph)
-    };
+    let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
+    let analysis = gid_core::analyze_impact_with_filters(
+        &files,
+        &graph,
+        rels.as_deref(),
+        Some(min_confidence),
+    );
     let formatted = format_impact_for_llm(&analysis);
 
     if json {
@@ -3526,6 +3595,8 @@ fn cmd_code_impact(dir: &PathBuf, files_str: &str, relation: Option<&str>, json:
             "risk_level": format!("{:?}", analysis.risk_level),
             "affected_source": analysis.affected_source.len(),
             "affected_tests": analysis.affected_tests.len(),
+            "min_confidence": min_confidence,
+            "hidden_low_confidence": analysis.hidden_low_confidence,
             "formatted": formatted,
         }));
     } else {

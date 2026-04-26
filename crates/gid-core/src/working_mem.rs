@@ -124,14 +124,20 @@ fn collect_impacted_nodes<'a>(
     }
 }
 
-/// Collect impacted nodes with optional relation filter.
-fn collect_impacted_nodes_filtered<'a>(
+/// Collect impacted nodes with relation filter AND confidence threshold.
+///
+/// Edges with `confidence < min_confidence` are skipped (counted in
+/// `hidden_low_confidence`). `confidence == None` is treated as fully
+/// trusted (>= any threshold). See ISS-035 for rationale.
+fn collect_impacted_nodes_with_filters<'a>(
     node_id: &str,
     code_edges: &[&Edge],
     graph: &'a Graph,
     relations: Option<&[&str]>,
+    min_confidence: Option<f64>,
     visited: &mut HashSet<String>,
     result: &mut Vec<&'a Node>,
+    hidden_low_confidence: &mut usize,
 ) {
     if !visited.insert(node_id.to_string()) {
         return;
@@ -142,9 +148,23 @@ fn collect_impacted_nodes_filtered<'a>(
                 continue;
             }
         }
+        // Confidence gate — count hidden edges so the caller can surface
+        // a "N hidden low-confidence edges" summary.
+        let passes = match (min_confidence, edge.confidence) {
+            (None, _) => true,
+            (Some(_), None) => true,             // None = fully trusted
+            (Some(thresh), Some(c)) => c >= thresh,
+        };
+        if !passes {
+            *hidden_low_confidence += 1;
+            continue;
+        }
         if let Some(node) = graph.get_node(&edge.from) {
             result.push(node);
-            collect_impacted_nodes_filtered(&edge.from, code_edges, graph, relations, visited, result);
+            collect_impacted_nodes_with_filters(
+                &edge.from, code_edges, graph, relations, min_confidence,
+                visited, result, hidden_low_confidence,
+            );
         }
     }
 }
@@ -330,6 +350,10 @@ pub struct ImpactAnalysis {
     pub risk_level: RiskLevel,
     /// Human-readable summary
     pub summary: String,
+    /// Number of edges hidden because their `confidence` was below the
+    /// query threshold. Reported in the summary so callers know noise
+    /// (tree-sitter fallback edges) was filtered out — see ISS-035.
+    pub hidden_low_confidence: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,14 +440,44 @@ pub fn analyze_impact(files_changed: &[String], graph: &Graph) -> ImpactAnalysis
         affected_tests,
         risk_level,
         summary,
+        hidden_low_confidence: 0,
     }
 }
 
 /// Analyze impact of changing files, with optional edge relation filter.
+///
+/// Confidence filtering is **disabled** in this entry point — it preserves
+/// legacy behavior. Use [`analyze_impact_with_filters`] for the recommended
+/// confidence-aware version (default threshold = 0.8, see ISS-035).
 pub fn analyze_impact_filtered(
     files_changed: &[String],
     graph: &Graph,
     relations: Option<&[&str]>,
+) -> ImpactAnalysis {
+    analyze_impact_with_filters(files_changed, graph, relations, None)
+}
+
+/// Analyze impact of changing files, with optional edge relation filter and
+/// confidence threshold.
+///
+/// `min_confidence`:
+/// - `None` → no confidence filtering (legacy behavior)
+/// - `Some(0.0)` → include all edges, equivalent to `None` but explicit
+/// - `Some(0.8)` → recommended default; hides tree-sitter name-match
+///   fallback edges (`confidence=0.6`) that pollute results for common
+///   method names (`.contains`, `.clone`, `.to_string` etc.)
+///
+/// Edges with `confidence == None` are always treated as fully trusted,
+/// since hand-authored / `depends_on` / LSP-confirmed edges all have
+/// `None` confidence.
+///
+/// The returned `ImpactAnalysis.hidden_low_confidence` reports how many
+/// edges were filtered, so callers can surface this to users (see ISS-035).
+pub fn analyze_impact_with_filters(
+    files_changed: &[String],
+    graph: &Graph,
+    relations: Option<&[&str]>,
+    min_confidence: Option<f64>,
 ) -> ImpactAnalysis {
     let gid_ctx = query_gid_context(files_changed, graph);
     let code_edges = graph.code_edges();
@@ -431,6 +485,7 @@ pub fn analyze_impact_filtered(
     let mut affected_source = Vec::new();
     let mut affected_tests = Vec::new();
     let mut seen = HashSet::new();
+    let mut hidden_low_confidence = 0usize;
 
     let changed_node_ids: Vec<String> = graph.code_nodes().iter()
         .filter(|n| {
@@ -443,7 +498,16 @@ pub fn analyze_impact_filtered(
     for node_id in &changed_node_ids {
         let mut impacted = Vec::new();
         let mut visited = HashSet::new();
-        collect_impacted_nodes_filtered(node_id, &code_edges, graph, relations, &mut visited, &mut impacted);
+        collect_impacted_nodes_with_filters(
+            node_id,
+            &code_edges,
+            graph,
+            relations,
+            min_confidence,
+            &mut visited,
+            &mut impacted,
+            &mut hidden_low_confidence,
+        );
 
         for impacted_node in impacted {
             if seen.insert(impacted_node.id.clone()) {
@@ -469,7 +533,7 @@ pub fn analyze_impact_filtered(
         _ => RiskLevel::Critical,
     };
 
-    let summary = format!(
+    let mut summary = format!(
         "Changing {} file(s) affects {} source nodes and {} test nodes. Risk: {} (max {} callers, blast radius {}).",
         files_changed.len(),
         affected_source.len(),
@@ -479,11 +543,19 @@ pub fn analyze_impact_filtered(
         gid_ctx.total_blast_radius,
     );
 
+    if hidden_low_confidence > 0 {
+        summary.push_str(&format!(
+            " ({} low-confidence edges hidden — pass min_confidence=0.0 to include.)",
+            hidden_low_confidence,
+        ));
+    }
+
     ImpactAnalysis {
         affected_source,
         affected_tests,
         risk_level,
         summary,
+        hidden_low_confidence,
     }
 }
 

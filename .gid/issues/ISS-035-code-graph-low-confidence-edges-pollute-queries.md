@@ -1,10 +1,12 @@
 # ISS-035: Low-Confidence Tree-Sitter Edges Pollute Impact/Caller Queries by Default
 
-**Status:** open
+**Status:** closed
 **Severity:** important (affects correctness of impact analysis for all agents using code graph)
 **Reported:** 2026-04-24
+**Closed:** 2026-04-25
 **Reporter:** potato + RustClaw
 **Related:** ISS-002 (tree-sitter false positives), ISS-016 (LSP pass1 dangling edges), ISS-012 (confidence-weighted edges)
+**Resolution:** Option D (hybrid) implemented. `DEFAULT_MIN_CONFIDENCE = 0.8` constant added in `gid-core::query`. `--min-confidence` flag added to `gid query impact`, `gid query deps`, `gid code-impact`. Hidden edge counts surfaced in both human and JSON output. Public APIs (`impact_with_filters`, `deps_with_filters`, `analyze_impact_with_filters`) added; legacy entry points preserved. Backward compatible (legacy `analyze_impact_filtered` calls `analyze_impact_with_filters(..., None)` = no filtering, same as before). Regression tests in `query.rs::tests::test_iss035_*`.
 
 ## Summary
 

@@ -31,7 +31,7 @@ pub mod ritual;
 // Re-export commonly used types
 pub use graph::*;
 pub use slugify::slugify;
-pub use query::QueryEngine;
+pub use query::{QueryEngine, QueryResult, DEFAULT_MIN_CONFIDENCE};
 pub use parser::{load_graph, save_graph, find_graph_file, find_graph_file_walk_up, find_project_root};
 pub use code_graph::{
     CodeGraph, CodeNode, CodeEdge, NodeKind, EdgeRelation, Language,
@@ -45,7 +45,7 @@ pub use unified::{build_unified_graph, merge_relevant_code, link_tasks_to_code, 
 pub use working_mem::{
     GidContext, NodeInfo, ErrorType, RiskLevel, ImpactAnalysis,
     query_gid_context, find_low_risk_alternatives, classify_error,
-    extract_key_traceback, analyze_impact, analyze_impact_filtered, format_impact_for_llm,
+    extract_key_traceback, analyze_impact, analyze_impact_filtered, analyze_impact_with_filters, format_impact_for_llm,
     // Agent working memory types
     Action, TestOutcome, AttemptRecord, NodeRisk, WorkingMemory,
 };
