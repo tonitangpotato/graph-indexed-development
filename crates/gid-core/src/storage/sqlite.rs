@@ -1866,7 +1866,7 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("string".into(), serde_json::json!("hello"));
         meta.insert("number".into(), serde_json::json!(42));
-        meta.insert("float".into(), serde_json::json!(3.14));
+        meta.insert("float".into(), serde_json::json!(2.5));
         meta.insert("bool".into(), serde_json::json!(true));
         meta.insert("null".into(), serde_json::json!(null));
         meta.insert("array".into(), serde_json::json!([1, 2, 3]));
@@ -1877,7 +1877,7 @@ mod tests {
 
         assert_eq!(loaded.get("string"), Some(&serde_json::json!("hello")));
         assert_eq!(loaded.get("number"), Some(&serde_json::json!(42)));
-        assert_eq!(loaded.get("float"), Some(&serde_json::json!(3.14)));
+        assert_eq!(loaded.get("float"), Some(&serde_json::json!(2.5)));
         assert_eq!(loaded.get("bool"), Some(&serde_json::json!(true)));
         assert_eq!(loaded.get("null"), Some(&serde_json::json!(null)));
         assert_eq!(loaded.get("array"), Some(&serde_json::json!([1, 2, 3])));
@@ -1899,7 +1899,7 @@ mod tests {
 
         let loaded = s.get_metadata("n1").unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(loaded.get("old_key").is_none());
+        assert!(!loaded.contains_key("old_key"));
         assert_eq!(loaded.get("new_key"), Some(&serde_json::json!("new_value")));
     }
 
@@ -2305,7 +2305,7 @@ mod tests {
         s.put_node(&node2).unwrap();
 
         let loaded = s.get_node("m1").unwrap().unwrap();
-        assert!(loaded.metadata.get("old").is_none());
+        assert!(!loaded.metadata.contains_key("old"));
         assert_eq!(loaded.metadata.get("new"), Some(&serde_json::json!(42)));
     }
 
@@ -2422,7 +2422,7 @@ mod tests {
         // Build a small graph: 5 "code" nodes + 1 "task" node, fully connected
         // among the code nodes (4 edges) plus 1 task→code edge.
         for id in &["c1", "c2", "c3", "c4", "c5"] {
-            let mut n = Node::new(*id, *id);
+            let mut n = Node::new(id, id);
             n.metadata.insert("node_type".into(), serde_json::json!("code"));
             s.put_node(&n).unwrap();
         }

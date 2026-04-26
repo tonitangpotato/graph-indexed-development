@@ -86,11 +86,10 @@ impl CodeGraph {
             for edge in self.incoming_edges(source_id) {
                 if edge.relation == EdgeRelation::Calls {
                     if let Some(caller) = self.node_by_id(&edge.from) {
-                        if caller.file_path.contains("/tests/") || caller.file_path.contains("/test_") {
-                            if seen.insert(caller.id.clone()) {
+                        if (caller.file_path.contains("/tests/") || caller.file_path.contains("/test_"))
+                            && seen.insert(caller.id.clone()) {
                                 test_nodes.push(caller);
                             }
-                        }
                     }
                 }
             }
@@ -432,11 +431,7 @@ impl CodeGraph {
                 let short_name = test_name.split("::").last().unwrap_or(test_name);
                 result.push_str(&format!("### ❌ REGRESSION: `{}`\n", short_name));
 
-                let test_node = self.nodes.iter().find(|n| {
-                    n.name == short_name
-                        || n.name.ends_with(short_name)
-                        || (n.file_path.contains("/test") && n.name == short_name)
-                });
+                let test_node = self.resolve_pytest_id(test_name);
 
                 if let Some(test) = test_node {
                     let chains = self.find_paths_to_test(changed_node_ids, &test.id);

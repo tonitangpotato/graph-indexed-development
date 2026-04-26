@@ -7,16 +7,16 @@
 #[cfg(test)]
 #[cfg(feature = "sqlite")]
 mod tests {
-    use std::collections::HashMap;
+    
     use std::fs;
 
     use tempfile::TempDir;
 
-    use crate::graph::{Edge, Graph, Node, NodeStatus, ProjectMeta};
+    use crate::graph::{Edge, Graph, Node, NodeStatus};
     use crate::harness::context::{
         budget_fit_by_category, score_candidates, Candidate, ScoredCandidate, TargetContext,
     };
-    use crate::history::{GraphDiff, HistoryManager};
+    use crate::history::HistoryManager;
     use crate::storage::migration::{
         migrate, MigrationConfig, MigrationStatus, ValidationLevel,
     };

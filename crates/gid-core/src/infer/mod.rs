@@ -36,7 +36,7 @@ pub use clustering::{
     ClusterConfig, ClusterMetrics, ClusterResult, RawCluster,
     WEIGHT_CALLS, WEIGHT_CO_CITATION, WEIGHT_DEPENDS_ON, WEIGHT_DIR_COLOCATION, WEIGHT_IMPORTS,
     WEIGHT_STRUCTURAL, WEIGHT_SYMBOL_SIMILARITY, WEIGHT_TYPE_REF,
-    COLOCATION_PAIRWISE_LIMIT, CO_CITATION_MIN_SHARED,
+    CO_CITATION_MIN_SHARED,
     SYMBOL_MIN_SHARED_TOKENS, SYMBOL_MIN_JACCARD,
 };
 
@@ -50,20 +50,17 @@ pub use labeling::{LabelingConfig, LabelingResult, SimpleLlm};
 
 /// Inference depth level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum InferLevel {
     /// Only Infomap clustering → component layer.
     Component,
     /// Clustering + LLM → component + feature layers.
     Feature,
     /// Same as Feature (alias for completeness).
+    #[default]
     All,
 }
 
-impl Default for InferLevel {
-    fn default() -> Self {
-        Self::All
-    }
-}
 
 // ── InferConfig ────────────────────────────────────────────────────────────
 
@@ -176,7 +173,7 @@ pub async fn run(
         // If user specified default min_community_size, auto-tune based on graph properties
         if config.clustering.min_community_size == ClusterConfig::default().min_community_size {
             // Build network early to compute density-aware config
-            let (net, _) = clustering::build_network(effective_graph);
+            let (net, _) = clustering::build_network(effective_graph, &config.clustering);
             let mut auto = clustering::auto_config_with_network(file_count, &net);
             // Preserve user-specified overrides that auto_config doesn't know about
             if config.clustering.max_cluster_size.is_some() {

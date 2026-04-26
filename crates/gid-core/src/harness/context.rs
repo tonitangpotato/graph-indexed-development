@@ -157,8 +157,8 @@ fn extract_design_section(content: &str, design_ref: &str) -> Option<String> {
 
     // Capture until next heading of same or higher (lower number) level
     let mut end_idx = lines.len();
-    for i in (start + 1)..lines.len() {
-        if let Some((level, _)) = parse_heading(lines[i]) {
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
+        if let Some((level, _)) = parse_heading(line) {
             if level <= start_level {
                 end_idx = i;
                 break;
@@ -903,8 +903,10 @@ pub struct ContextFilters {
 
 /// GOAL-4.9: Output format selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum OutputFormat {
     /// Human-readable markdown sections (default).
+    #[default]
     Markdown,
     /// Machine-parseable JSON.
     Json,
@@ -912,9 +914,6 @@ pub enum OutputFormat {
     Yaml,
 }
 
-impl Default for OutputFormat {
-    fn default() -> Self { Self::Markdown }
-}
 
 impl std::str::FromStr for OutputFormat {
     type Err = String;
@@ -1132,12 +1131,11 @@ fn gather_dependencies(
 
     for root_id in root_ids {
         for edge in &graph.edges {
-            if edge.from == *root_id {
-                if !visited.contains(&edge.to) {
+            if edge.from == *root_id
+                && !visited.contains(&edge.to) {
                     visited.insert(edge.to.clone());
                     queue.push_back((edge.to.clone(), 1, edge.relation.clone()));
                 }
-            }
         }
     }
 
@@ -1262,7 +1260,7 @@ fn gather_callers_and_tests(
 /// Other patterns match file_path as a glob.
 fn passes_filters(candidate: &Candidate, filters: &ContextFilters) -> bool {
     // Check exclude_ids
-    if filters.exclude_ids.iter().any(|ex| candidate.node_id == *ex) {
+    if filters.exclude_ids.contains(&candidate.node_id) {
         return false;
     }
 
@@ -2156,11 +2154,13 @@ mod tests {
     #[test]
     fn test_relation_is_dominant_factor() {
         // W_RELATION (0.60) is the largest weight — relation tier should be the
-        // primary differentiator, not hop distance alone
-        assert!(W_RELATION > W_PROXIMITY,
-            "W_RELATION ({}) must be > W_PROXIMITY ({})", W_RELATION, W_PROXIMITY);
-        assert!(W_RELATION > W_WEIGHT,
-            "W_RELATION ({}) must be > W_WEIGHT ({})", W_RELATION, W_WEIGHT);
+        // primary differentiator, not hop distance alone.
+        // Compile-time enforced via const assertions below; this test exists
+        // so failures surface in test output with a clear domain message.
+        const _: () = assert!(W_RELATION > W_PROXIMITY,
+            "W_RELATION must be > W_PROXIMITY");
+        const _: () = assert!(W_RELATION > W_WEIGHT,
+            "W_RELATION must be > W_WEIGHT");
     }
 
     // --- Sorting stability: same-scored candidates maintain relative order ---
@@ -2340,7 +2340,7 @@ mod tests {
         // Multi-byte chars: each emoji is 4 bytes
         let text = "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥"; // 10 emojis = 40 bytes
         // Budget = 5 tokens = 20 bytes, marker = 16 bytes → 4 usable = 1 emoji
-        let result = truncate_text(&text, 5);
+        let result = truncate_text(text, 5);
         // Must be valid UTF-8 (String guarantees this)
         assert!(result.ends_with("... [truncated]"));
         // Must not panic or produce invalid string
@@ -2535,7 +2535,7 @@ mod tests {
         // Both direct deps should be fully included (200 tokens)
         assert_eq!(result.dependencies.len(), 2, "Both deps should fit");
         // Callers get remaining 100 — one fits, one truncated or dropped
-        assert!(result.callers.len() >= 1, "At least one caller should fit");
+        assert!(!result.callers.is_empty(), "At least one caller should fit");
         // Total non-target tokens ≤ 300
         let dep_tokens: usize = result.dependencies.iter().map(|d| d.token_estimate).sum();
         let caller_tokens: usize = result.callers.iter().map(|c| c.token_estimate).sum();
@@ -3443,6 +3443,7 @@ mod tests {
     // §9 Tests: ContextQuery + Pipeline (assemble_context)
     // =========================================================================
 
+    #[allow(dead_code)]
     fn make_code_node(id: &str, file_path: &str, sig: Option<&str>) -> Node {
         let mut n = Node::new(id, id);
         n.node_type = Some("function".to_string());

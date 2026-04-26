@@ -116,7 +116,7 @@ pub fn preview_rename(graph: &Graph, old_id: &str, new_id: &str) -> Option<Refac
     // Node rename
     changes.push(Change {
         change_type: ChangeType::RenameNode,
-        description: format!("Rename node ID"),
+        description: "Rename node ID".to_string(),
         before: Some(old_id.to_string()),
         after: Some(new_id.to_string()),
     });
@@ -126,7 +126,7 @@ pub fn preview_rename(graph: &Graph, old_id: &str, new_id: &str) -> Option<Refac
         if edge.from == old_id {
             changes.push(Change {
                 change_type: ChangeType::UpdateEdge,
-                description: format!("Update edge source"),
+                description: "Update edge source".to_string(),
                 before: Some(format!("{} → {}", edge.from, edge.to)),
                 after: Some(format!("{} → {}", new_id, edge.to)),
             });
@@ -135,7 +135,7 @@ pub fn preview_rename(graph: &Graph, old_id: &str, new_id: &str) -> Option<Refac
         if edge.to == old_id {
             changes.push(Change {
                 change_type: ChangeType::UpdateEdge,
-                description: format!("Update edge target"),
+                description: "Update edge target".to_string(),
                 before: Some(format!("{} → {}", edge.from, edge.to)),
                 after: Some(format!("{} → {}", edge.from, new_id)),
             });

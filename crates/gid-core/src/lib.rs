@@ -13,6 +13,7 @@ pub mod advise;
 pub mod design;
 pub mod semantify;
 pub mod refactor;
+pub mod repair;
 pub mod ignore;
 pub mod task_graph_knowledge;
 pub mod complexity;
@@ -75,6 +76,9 @@ pub use refactor::{
     preview_extract, apply_extract,
     update_title, move_to_layer,
     RefactorPreview, Change, ChangeType, SplitDefinition,
+};
+pub use repair::{
+    plan_repair, apply_repair, RepairOptions, RepairPlan, RepairReport,
 };
 pub use ignore::{
     load_ignore_list, IgnoreList, IgnorePattern, is_common_ignore, DEFAULT_IGNORES,

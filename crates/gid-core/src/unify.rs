@@ -334,7 +334,7 @@ pub fn generate_bridge_edges(graph: &mut Graph) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code_graph::{CodeNode, CodeEdge, CodeGraph, NodeKind, EdgeRelation};
+    use crate::code_graph::{CodeNode, CodeEdge, CodeGraph, EdgeRelation};
     use std::path::Path;
 
     fn sample_codegraph() -> CodeGraph {
@@ -461,18 +461,20 @@ mod tests {
 
     #[test]
     fn test_all_node_kinds() {
-        let mut cg = CodeGraph::default();
-        cg.nodes = vec![
-            CodeNode::new_file("src/lib.rs"),
-            CodeNode::new_class("src/lib.rs", "Foo", 1),
-            CodeNode::new_function("src/lib.rs", "bar", 10, false),
-            CodeNode::new_module("src/mod"),
-            CodeNode::new_constant("src/lib.rs", "MAX", 1),
-            CodeNode::new_interface("src/lib.rs", "IService", 20),
-            CodeNode::new_enum("src/e.rs", "Color", 1),
-            CodeNode::new_type_alias("src/t.rs", "Id", 1),
-            CodeNode::new_trait("src/tr.rs", "Storage", 1),
-        ];
+        let cg = CodeGraph {
+            nodes: vec![
+                CodeNode::new_file("src/lib.rs"),
+                CodeNode::new_class("src/lib.rs", "Foo", 1),
+                CodeNode::new_function("src/lib.rs", "bar", 10, false),
+                CodeNode::new_module("src/mod"),
+                CodeNode::new_constant("src/lib.rs", "MAX", 1),
+                CodeNode::new_interface("src/lib.rs", "IService", 20),
+                CodeNode::new_enum("src/e.rs", "Color", 1),
+                CodeNode::new_type_alias("src/t.rs", "Id", 1),
+                CodeNode::new_trait("src/tr.rs", "Storage", 1),
+            ],
+            ..Default::default()
+        };
         let (nodes, _) = codegraph_to_graph_nodes(&cg, Path::new("/tmp"));
         assert_eq!(nodes.len(), 9);
         // Verify all have extract source
@@ -481,17 +483,19 @@ mod tests {
 
     #[test]
     fn test_edge_metadata_fields() {
-        let mut cg = CodeGraph::default();
-        cg.nodes = vec![
-            CodeNode::new_function("src/a.rs", "foo", 1, false),
-            CodeNode::new_function("src/b.rs", "bar", 1, false),
-        ];
         let mut edge = CodeEdge::new("func:src/a.rs:foo", "func:src/b.rs:bar", EdgeRelation::Calls);
         edge.call_count = 5;
         edge.in_error_path = true;
         edge.confidence = 0.8;
         edge.weight = 0.9;
-        cg.edges = vec![edge];
+        let cg = CodeGraph {
+            nodes: vec![
+                CodeNode::new_function("src/a.rs", "foo", 1, false),
+                CodeNode::new_function("src/b.rs", "bar", 1, false),
+            ],
+            edges: vec![edge],
+            ..CodeGraph::default()
+        };
 
         let (_, edges) = codegraph_to_graph_nodes(&cg, Path::new("/tmp"));
         assert_eq!(edges.len(), 1);
@@ -703,25 +707,13 @@ mod tests {
         let mut cg = CodeGraph {
             nodes: vec![
                 CodeNode {
-                    id: "file:src/main.rs".to_string(),
-                    kind: NodeKind::File,
                     name: "main.rs".to_string(),
                     file_path: "src/main.rs".to_string(),
-                    line: None,
-                    decorators: vec![],
-                    signature: None,
-                    docstring: None,
                     line_count: 100,
-                    is_test: false,
-                    visibility: None,
                     lang: Some("rust".to_string()),
-                    body_hash: None,
-                    end_line: None,
-                    complexity: None,
-                                    },
+                    ..CodeNode::test_default("file:src/main.rs", NodeKind::File)
+                },
                 CodeNode {
-                    id: "fn:src/main.rs:main".to_string(),
-                    kind: NodeKind::Function,
                     name: "main".to_string(),
                     file_path: "src/main.rs".to_string(),
                     line: Some(10),
@@ -729,30 +721,24 @@ mod tests {
                     signature: Some("async fn main() -> Result<()>".to_string()),
                     docstring: Some("Entry point".to_string()),
                     line_count: 50,
-                    is_test: false,
                     visibility: Some("pub".to_string()),
                     lang: Some("rust".to_string()),
                     body_hash: Some("abc123".to_string()),
                     end_line: Some(60),
-                    complexity: None,
-                                    },
+                    ..CodeNode::test_default("fn:src/main.rs:main", NodeKind::Function)
+                },
                 CodeNode {
-                    id: "class:src/lib.rs:Config".to_string(),
-                    kind: NodeKind::Class,
                     name: "Config".to_string(),
                     file_path: "src/lib.rs".to_string(),
                     line: Some(1),
-                    decorators: vec![],
-                    signature: None,
-                    docstring: None,
                     line_count: 20,
                     is_test: true,
                     visibility: Some("pub(crate)".to_string()),
                     lang: Some("rust".to_string()),
                     body_hash: Some("def456".to_string()),
                     end_line: Some(20),
-                    complexity: None,
-                                    },
+                    ..CodeNode::test_default("class:src/lib.rs:Config", NodeKind::Class)
+                },
             ],
             edges: vec![
                 CodeEdge {

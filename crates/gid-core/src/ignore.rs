@@ -72,15 +72,15 @@ impl IgnorePattern {
         let pattern = pattern.trim();
         
         // Handle negation
-        let (negated, pattern) = if pattern.starts_with('!') {
-            (true, &pattern[1..])
+        let (negated, pattern) = if let Some(stripped) = pattern.strip_prefix('!') {
+            (true, stripped)
         } else {
             (false, pattern)
         };
         
         // Handle directory-only pattern
-        let (dir_only, pattern) = if pattern.ends_with('/') {
-            (true, &pattern[..pattern.len() - 1])
+        let (dir_only, pattern) = if let Some(stripped) = pattern.strip_suffix('/') {
+            (true, stripped)
         } else {
             (false, pattern)
         };
@@ -158,11 +158,7 @@ impl IgnoreList {
         
         for pattern in &self.patterns {
             if pattern.matches(path, is_dir) {
-                if pattern.negated {
-                    ignored = false;
-                } else {
-                    ignored = true;
-                }
+                ignored = !pattern.negated;
             }
         }
         

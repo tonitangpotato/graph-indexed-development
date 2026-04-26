@@ -32,8 +32,10 @@ impl RitualPhase {
 /// Policy for bash/shell command execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BashPolicy {
     /// No shell access.
+    #[default]
     Deny,
     /// Unrestricted shell access.
     AllowAll,
@@ -41,11 +43,6 @@ pub enum BashPolicy {
     AllowList(Vec<String>),
 }
 
-impl Default for BashPolicy {
-    fn default() -> Self {
-        BashPolicy::Deny
-    }
-}
 
 /// Capability boundary for a single ritual phase.
 ///

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
 
 use regex::Regex;
@@ -14,6 +15,16 @@ use crate::unify::graph_to_codegraph;
 
 // ═══ Current metadata version. Bump on struct changes → triggers full rebuild. ═══
 const EXTRACT_META_VERSION: u32 = 2;
+
+/// Module-level cache for the Python `from X import …` regex used during
+/// test-to-source mapping. Previously constructed via `Regex::new(...)` per
+/// extracted test file (ISS-044); now compiled once per process.
+fn from_import_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^from\s+([\w.]+)\s+import").expect("static regex must compile")
+    })
+}
 
 // ═══ Shared Helper Types ═══
 
@@ -204,15 +215,14 @@ fn integrate_file_results(
 
     // Track method→class and class→methods relationships
     for edge in &result.edges {
-        if edge.relation == EdgeRelation::DefinedIn {
-            if edge.from.starts_with("method:") && edge.to.starts_with("class:") {
+        if edge.relation == EdgeRelation::DefinedIn
+            && edge.from.starts_with("method:") && edge.to.starts_with("class:") {
                 state.method_to_class.insert(edge.from.clone(), edge.to.clone());
                 state.class_methods
                     .entry(edge.to.clone())
                     .or_default()
                     .push(edge.from.clone());
             }
-        }
         if edge.relation == EdgeRelation::Inherits {
             if let Some(parent_id) = state.class_map.get(
                 edge.to.strip_prefix("class_ref:").unwrap_or(&edge.to),
@@ -245,11 +255,20 @@ fn integrate_file_results(
     state.edges.extend(result.edges);
 }
 
-/// Build helper maps needed for call edge extraction (class_init_map, node_pkg_map).
-fn build_call_extraction_maps(state: &ExtractState) -> (
-    HashMap<String, Vec<(String, String)>>,
-    HashMap<String, String>,
-) {
+/// Aggregated lookup maps used during call-edge extraction.
+///
+/// Built once per extraction pass and reused across all files, so the third pass
+/// (call resolution) doesn't have to re-scan `state.nodes` for every file.
+pub(crate) struct CallExtractionMaps {
+    /// class_name -> [(file_path, init_node_id)]: locates `__init__` methods for
+    /// constructor-call resolution (Python `Foo()` -> `Foo.__init__`).
+    pub class_init_map: HashMap<String, Vec<(String, String)>>,
+    /// node_id -> package_dir: enables package-scoped name resolution.
+    pub node_pkg_map: HashMap<String, String>,
+}
+
+/// Build helper maps needed for call edge extraction.
+fn build_call_extraction_maps(state: &ExtractState) -> CallExtractionMaps {
     // class_init_map for constructor resolution
     let class_init_map: HashMap<String, Vec<(String, String)>> = {
         let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -271,12 +290,12 @@ fn build_call_extraction_maps(state: &ExtractState) -> (
     let node_pkg_map: HashMap<String, String> = state.nodes
         .iter()
         .map(|n| {
-            let pkg = n.file_path.rsplitn(2, '/').nth(1).unwrap_or("").to_string();
+            let pkg = n.file_path.rsplit_once('/').map(|x| x.0).unwrap_or("").to_string();
             (n.id.clone(), pkg)
         })
         .collect();
 
-    (class_init_map, node_pkg_map)
+    CallExtractionMaps { class_init_map, node_pkg_map }
 }
 
 /// Extract call edges for a specific file (third pass in the pipeline).
@@ -286,9 +305,7 @@ fn extract_calls_for_file(
     lang: &Language,
     parser: &mut Parser,
     state: &ExtractState,
-    class_init_map: &HashMap<String, Vec<(String, String)>>,
-    node_pkg_map: &HashMap<String, String>,
-    module_map: &HashMap<String, String>,
+    maps: &CallExtractionMaps,
     edges: &mut Vec<CodeEdge>,
 ) {
     let file_func_ids: HashSet<String> = state.nodes
@@ -297,7 +314,7 @@ fn extract_calls_for_file(
         .map(|n| n.id.clone())
         .collect();
 
-    let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
+    let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
 
     match lang {
         Language::Python => {
@@ -309,18 +326,22 @@ fn extract_calls_for_file(
                 let source = content.as_bytes();
                 let root = tree.root_node();
 
-                extract_calls_from_tree(
-                    root,
+                let py_call_ctx = crate::code_graph::lang::python::PyCallCtx {
                     source,
                     rel_path,
-                    &state.func_map,
-                    &state.method_to_class,
-                    &state.class_parents,
-                    &file_func_ids,
-                    &state.file_imported_names,
                     package_dir,
-                    class_init_map,
-                    node_pkg_map,
+                    func_name_map: &state.func_map,
+                    method_to_class: &state.method_to_class,
+                    class_parents: &state.class_parents,
+                    file_func_ids: &file_func_ids,
+                    file_imported_names: &state.file_imported_names,
+                    class_init_map: &maps.class_init_map,
+                    node_pkg_map: &maps.node_pkg_map,
+                };
+
+                extract_calls_from_tree(
+                    root,
+                    &py_call_ctx,
                     edges,
                 );
             }
@@ -329,12 +350,11 @@ fn extract_calls_for_file(
             let is_test_file = rel_path.contains("/tests/") || rel_path.contains("/test_");
             if is_test_file {
                 let file_id = format!("file:{}", rel_path);
-                let re_from_import = Regex::new(r"^from\s+([\w.]+)\s+import").unwrap();
 
                 for line in content.lines() {
-                    if let Some(cap) = re_from_import.captures(line) {
+                    if let Some(cap) = from_import_re().captures(line) {
                         let module = cap[1].to_string();
-                        if let Some(source_file_id) = module_map.get(&module) {
+                        if let Some(source_file_id) = state.module_map.get(&module) {
                             edges.push(CodeEdge {
                                 from: file_id.clone(),
                                 to: source_file_id.clone(),
@@ -360,18 +380,19 @@ fn extract_calls_for_file(
                 let source = content.as_bytes();
                 let root = tree.root_node();
 
-                extract_calls_rust(
-                    root,
+                let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+                let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
                     source,
                     rel_path,
-                    &state.func_map,
-                    &state.method_to_class,
-                    &file_func_ids,
-                    node_pkg_map,
-                    &state.file_imported_names,
-                    &state.all_struct_field_types,
-                    edges,
-                );
+                    package_dir,
+                    func_name_map: &state.func_map,
+                    method_to_class: &state.method_to_class,
+                    file_func_ids: &file_func_ids,
+                    node_pkg_map: &maps.node_pkg_map,
+                    file_imported_names: &state.file_imported_names,
+                    struct_field_types: &state.all_struct_field_types,
+                };
+                extract_calls_rust(root, &call_ctx, edges);
             }
         }
         Language::TypeScript => {
@@ -390,16 +411,22 @@ fn extract_calls_for_file(
             if let Some(tree) = parser.parse(content, None) {
                 let source = content.as_bytes();
                 let root = tree.root_node();
+                let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+
+                let ts_call_ctx = crate::code_graph::lang::typescript::TsCallCtx {
+                    source,
+                    rel_path,
+                    package_dir,
+                    func_name_map: &state.func_map,
+                    method_to_class: &state.method_to_class,
+                    file_func_ids: &file_func_ids,
+                    file_imported_names: &state.file_imported_names,
+                    node_pkg_map: &maps.node_pkg_map,
+                };
 
                 extract_calls_typescript(
                     root,
-                    source,
-                    rel_path,
-                    &state.func_map,
-                    &state.method_to_class,
-                    &file_func_ids,
-                    &state.file_imported_names,
-                    node_pkg_map,
+                    &ts_call_ctx,
                     edges,
                 );
             }
@@ -511,7 +538,7 @@ fn remove_phantom_nodes(
 ///   method:X:FooBar.method → class:X:FooBar
 /// But the actual class node is `class:Y:FooBar`. This function remaps these
 /// dangling edges to point to the correct node.
-pub(crate) fn remap_cross_file_impl_edges(edges: &mut Vec<CodeEdge>, nodes: &[CodeNode]) {
+pub(crate) fn remap_cross_file_impl_edges(edges: &mut [CodeEdge], nodes: &[CodeNode]) {
     // Build set of valid node IDs and a map from type_name → actual class node ID
     let valid_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     let mut type_to_class_id: HashMap<&str, &str> = HashMap::new();
@@ -661,13 +688,13 @@ fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> (Vec<Co
 
     // Collect all directories that contain source files
     for (rel_path, _, _) in file_entries {
-        if let Some(dir) = rel_path.rsplitn(2, '/').nth(1) {
+        if let Some(dir) = rel_path.rsplit_once('/').map(|x| x.0) {
             if !dir.is_empty() {
                 // Add this directory and all ancestors
                 let mut current = dir.to_string();
                 loop {
                     dir_set.insert(current.clone());
-                    match current.rsplitn(2, '/').nth(1) {
+                    match current.rsplit_once('/').map(|x| x.0) {
                         Some(parent) if !parent.is_empty() => current = parent.to_string(),
                         _ => break,
                     }
@@ -683,7 +710,7 @@ fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> (Vec<Co
         nodes.push(CodeNode::new_module(dir));
 
         // Module → parent module (belongs_to)
-        if let Some(parent) = dir.rsplitn(2, '/').nth(1) {
+        if let Some(parent) = dir.rsplit_once('/').map(|x| x.0) {
             if !parent.is_empty() && dir_set.contains(parent) {
                 edges.push(CodeEdge::new(
                     &format!("module:{}", dir),
@@ -701,7 +728,7 @@ fn generate_module_nodes(file_entries: &[(String, String, Language)]) -> (Vec<Co
 fn generate_file_to_module_edges(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
     let mut edges = Vec::new();
     for (rel_path, _, _) in file_entries {
-        if let Some(dir) = rel_path.rsplitn(2, '/').nth(1) {
+        if let Some(dir) = rel_path.rsplit_once('/').map(|x| x.0) {
             if !dir.is_empty() {
                 edges.push(CodeEdge::new(
                     &format!("file:{}", rel_path),
@@ -732,8 +759,8 @@ fn generate_rust_tests_for_edges(file_entries: &[(String, String, Language)]) ->
         // also: "src/auth/mod.rs" → "auth"
         let without_prefix = path.strip_prefix("src/").unwrap_or(path);
         let stem = without_prefix.trim_end_matches(".rs");
-        let stem = if stem.ends_with("/mod") {
-            &stem[..stem.len() - 4]
+        let stem = if let Some(stripped) = stem.strip_suffix("/mod") {
+            stripped
         } else {
             stem
         };
@@ -1040,7 +1067,7 @@ impl CodeGraph {
         }
 
         // Build helper maps for call extraction
-        let (class_init_map, node_pkg_map) = build_call_extraction_maps(&state);
+        let maps = build_call_extraction_maps(&state);
 
         // Third pass: extract call edges
         // Take edges out to avoid simultaneous immutable borrow of `state` + mutable borrow of `state.edges`
@@ -1048,7 +1075,7 @@ impl CodeGraph {
         for (rel_path, content, lang) in &file_entries {
             extract_calls_for_file(
                 rel_path, content, lang, &mut parser, &state,
-                &class_init_map, &node_pkg_map, &state.module_map, &mut edges,
+                &maps, &mut edges,
             );
         }
         // Add cross-layer edges (ISS-009)
@@ -1206,8 +1233,10 @@ impl CodeGraph {
             .collect();
 
         // Build state from existing graph nodes for reference resolution
-        let mut state = ExtractState::default();
-        state.module_map = module_map;
+        let mut state = ExtractState {
+            module_map,
+            ..Default::default()
+        };
 
         // Populate maps from existing (unchanged) nodes
         for node in &graph.nodes {
@@ -1223,15 +1252,14 @@ impl CodeGraph {
 
         // Populate method_to_class and class_methods from existing edges
         for edge in &graph.edges {
-            if edge.relation == EdgeRelation::DefinedIn {
-                if edge.from.starts_with("method:") && edge.to.starts_with("class:") {
+            if edge.relation == EdgeRelation::DefinedIn
+                && edge.from.starts_with("method:") && edge.to.starts_with("class:") {
                     state.method_to_class.insert(edge.from.clone(), edge.to.clone());
                     state.class_methods
                         .entry(edge.to.clone())
                         .or_default()
                         .push(edge.from.clone());
                 }
-            }
             if edge.relation == EdgeRelation::Inherits {
                 if let Some(parent_id) = state.class_map.get(
                     edge.to.strip_prefix("class_ref:").unwrap_or(&edge.to),
@@ -1279,7 +1307,7 @@ impl CodeGraph {
         }
 
         // Merge new nodes into graph
-        graph.nodes.extend(state.nodes.drain(..));
+        graph.nodes.append(&mut state.nodes);
 
         // Re-populate maps from ALL nodes (existing + new) for reference resolution
         state.class_map.clear();
@@ -1305,15 +1333,14 @@ impl CodeGraph {
             .collect();
 
         for edge in &all_edges_for_maps {
-            if edge.relation == EdgeRelation::DefinedIn {
-                if edge.from.starts_with("method:") && edge.to.starts_with("class:") {
+            if edge.relation == EdgeRelation::DefinedIn
+                && edge.from.starts_with("method:") && edge.to.starts_with("class:") {
                     state.method_to_class.insert(edge.from.clone(), edge.to.clone());
                     state.class_methods
                         .entry(edge.to.clone())
                         .or_default()
                         .push(edge.from.clone());
                 }
-            }
             if edge.relation == EdgeRelation::Inherits {
                 if let Some(parent_id) = state.class_map.get(
                     edge.to.strip_prefix("class_ref:").unwrap_or(&edge.to),
@@ -1337,7 +1364,7 @@ impl CodeGraph {
         // Temporarily set state.nodes to all graph nodes for building maps
         let saved_nodes = std::mem::take(&mut state.nodes);
         state.nodes = graph.nodes.clone();
-        let (class_init_map, node_pkg_map) = build_call_extraction_maps(&state);
+        let maps = build_call_extraction_maps(&state);
         state.nodes = saved_nodes;
 
         // Phase 2b: Extract call edges for changed files only
@@ -1348,7 +1375,7 @@ impl CodeGraph {
             }
             extract_calls_for_file(
                 rel_path, content, lang, &mut parser, &state,
-                &class_init_map, &node_pkg_map, &state.module_map,
+                &maps,
                 &mut new_call_edges,
             );
         }
@@ -1475,7 +1502,7 @@ impl CodeGraph {
         }
 
         // Build helper maps for call extraction
-        let (class_init_map, node_pkg_map) = build_call_extraction_maps(&state);
+        let maps = build_call_extraction_maps(&state);
 
         // Third pass: extract call edges
         // Take edges out to avoid simultaneous immutable borrow of `state` + mutable borrow of `state.edges`
@@ -1483,7 +1510,7 @@ impl CodeGraph {
         for (rel_path, content, lang) in &file_entries {
             extract_calls_for_file(
                 rel_path, content, lang, &mut parser, &state,
-                &class_init_map, &node_pkg_map, &state.module_map, &mut edges,
+                &maps, &mut edges,
             );
         }
         // Add cross-layer edges (ISS-009)
@@ -1594,17 +1621,6 @@ impl CodeGraph {
         Some(graph)
     }
 
-    /// Save graph as JSON.
-    fn save_graph_json(graph_path: &Path, graph: &Self) {
-        if let Some(parent) = graph_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string(graph) {
-            if let Err(e) = std::fs::write(graph_path, json) {
-                tracing::warn!("Failed to save graph: {}", e);
-            }
-        }
-    }
 }
 
 /// Compute file delta with mtime-first, hash-second strategy.

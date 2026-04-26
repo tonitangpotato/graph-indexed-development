@@ -271,8 +271,8 @@ pub fn parse_planned_ids(issue_md_path: &Path, issue_id: &str) -> Vec<String> {
             continue;
         }
         // Find ISS-X-NN tokens
-        let mut chars = line.char_indices().peekable();
-        while let Some((i, c)) = chars.next() {
+        let chars = line.char_indices().peekable();
+        for (i, c) in chars {
             if c.is_ascii_alphabetic() {
                 // Try to match the prefix starting here
                 if line[i..].starts_with(&prefix) {

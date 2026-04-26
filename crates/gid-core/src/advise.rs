@@ -390,7 +390,7 @@ pub fn analyze(graph: &Graph) -> AnalysisResult {
     score -= (error_count * 25) as i32;          // -25 per error (critical)
     score -= (warning_count * 10) as i32;        // -10 per warning (significant)
     score -= (info_count.min(10) * 2) as i32;    // -2 per info, max -20 (advisory, capped)
-    let health_score = score.max(0).min(100) as u8;
+    let health_score = score.clamp(0, 100) as u8;
     
     AnalysisResult {
         items,
@@ -1020,11 +1020,10 @@ fn is_entry_point(node: &crate::code_graph::CodeNode) -> bool {
     }
     
     // Rust: functions in main.rs or lib.rs at root
-    if node.file_path.ends_with("main.rs") || node.file_path.ends_with("lib.rs") {
-        if name == "main" || name.starts_with("pub ") {
+    if (node.file_path.ends_with("main.rs") || node.file_path.ends_with("lib.rs"))
+        && (name == "main" || name.starts_with("pub ")) {
             return true;
         }
-    }
     
     // TypeScript/JavaScript: common entry files
     if node.file_path.ends_with("index.ts") 
@@ -1305,9 +1304,7 @@ fn detect_modules(graph: &Graph) -> Vec<Advice> {
                 severity: Severity::Info,
                 message,
                 nodes: files.iter().map(|f| format!("file:{}", f)).collect(),
-                suggestion: Some(format!(
-                    "Consider co-locating these files into a dedicated module — they form a cohesive unit based on dependency analysis."
-                )),
+                suggestion: Some("Consider co-locating these files into a dedicated module — they form a cohesive unit based on dependency analysis.".to_string()),
             });
         }
     }
@@ -1361,9 +1358,9 @@ fn detect_modules(graph: &Graph) -> Vec<Advice> {
 #[cfg(feature = "infomap")]
 pub fn detect_code_modules(graph: &Graph) -> Vec<DetectedModule> {
     use infomap_rs::Infomap;
-    use crate::infer::clustering::build_network;
+    use crate::infer::clustering::{build_network, ClusterConfig};
 
-    let (net, idx_to_id) = build_network(graph);
+    let (net, idx_to_id) = build_network(graph, &ClusterConfig::default());
 
     if net.num_nodes() < 2 || net.num_edges() < 1 {
         return vec![];
@@ -1406,8 +1403,7 @@ pub fn detect_code_modules(graph: &Graph) -> Vec<DetectedModule> {
             let node_ids: Vec<String> = m
                 .nodes
                 .iter()
-                .filter_map(|&idx| idx_to_id.get(idx))
-                .map(|nid| nid.clone())
+                .filter_map(|&idx| idx_to_id.get(idx)).cloned()
                 .collect();
             DetectedModule {
                 id: m.id,
@@ -1563,7 +1559,7 @@ mod tests {
             e
         });
         
-        let result = detect_modules(&graph);
+        let _result = detect_modules(&graph);
         // Should detect at least 2 modules — the clusters are well-organized in their dirs
         // so it might not produce cross-dir suggestions, but the public API should find them
         let modules = detect_code_modules(&graph);
@@ -1634,7 +1630,7 @@ mod tests {
         
         let modules = detect_code_modules(&graph);
         // Function-level edges should still be detected and mapped to files
-        assert!(modules.len() >= 1, "Should detect modules from function-level edges");
+        assert!(!modules.is_empty(), "Should detect modules from function-level edges");
     }
     
     #[cfg(feature = "infomap")]

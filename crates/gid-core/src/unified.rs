@@ -63,7 +63,7 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             metadata,
             file_path: Some(code_node.file_path.clone()),
             lang: None,
-            start_line: code_node.line.map(|l| l as usize),
+            start_line: code_node.line,
             end_line: None,
             signature: code_node.signature.clone(),
             visibility: None,
@@ -204,7 +204,7 @@ pub fn merge_relevant_code(
             metadata,
             file_path: Some(code_node.file_path.clone()),
             lang: None,
-            start_line: code_node.line.map(|l| l as usize),
+            start_line: code_node.line,
             end_line: None,
             signature: code_node.signature.clone(),
             visibility: None,
@@ -285,8 +285,7 @@ fn code_node_to_task_id(code_id: &str) -> String {
         .replace("func:", "code:")
         .replace("method:", "code:")
         .replace("module_ref:", "code:")
-        .replace('/', "_")
-        .replace(':', "_")
+        .replace(['/', ':'], "_")
 }
 
 /// Statistics about the unified graph.
@@ -359,41 +358,21 @@ mod tests {
     use crate::code_graph::CodeNode;
     
     #[test]
+    #[allow(deprecated)]
     fn test_build_unified_graph() {
         let mut code_graph = CodeGraph::default();
         code_graph.nodes.push(CodeNode {
-            id: "file:src/main.rs".into(),
-            kind: NodeKind::File,
             name: "main.rs".into(),
             file_path: "src/main.rs".into(),
-            line: None,
-            decorators: vec![],
-            signature: None,
-            docstring: None,
-            line_count: 0,
-            is_test: false,
-            visibility: None,
-            lang: None,
-            body_hash: None,
-            end_line: None,
-            complexity: None,
+            ..CodeNode::test_default("file:src/main.rs", NodeKind::File)
         });
         code_graph.nodes.push(CodeNode {
-            id: "func:src/main.rs:main".into(),
-            kind: NodeKind::Function,
             name: "main".into(),
             file_path: "src/main.rs".into(),
             line: Some(1),
-            decorators: vec![],
             signature: Some("fn main()".into()),
-            docstring: None,
             line_count: 10,
-            is_test: false,
-            visibility: None,
-            lang: None,
-            body_hash: None,
-            end_line: None,
-            complexity: None,
+            ..CodeNode::test_default("func:src/main.rs:main", NodeKind::Function)
         });
         
         let task_graph = Graph {

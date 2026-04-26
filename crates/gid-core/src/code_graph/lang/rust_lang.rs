@@ -8,6 +8,72 @@ use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
 
+// ─── Extraction Context (ISS-046) ───
+//
+// These structs collapse repeated parameter lists across the recursive Rust
+// extractors. The split is intentional:
+//   * `RustExtractCtx` carries *immutable* per-file inputs (source bytes,
+//     normalized path, file_id). Borrowed shared, never mutated.
+//   * `RustExtractSink` carries the *mutable* output collections and lookup
+//     tables that every recursive call needs to append to. Borrowed `&mut`
+//     once at the entry point and threaded through.
+//
+// Keeping the two separate avoids the classic "ctx owns &mut edges, can't
+// also borrow source" lifetime trap — the sink is a distinct mutable borrow
+// while the ctx remains shared and freely reborrowed.
+
+/// Per-file immutable extraction context for Rust tree-sitter walking.
+pub(crate) struct RustExtractCtx<'a> {
+    pub source: &'a [u8],
+    pub source_str: &'a str,
+    pub path: &'a str,
+    pub file_id: &'a str,
+}
+
+/// Mutable output sink shared across the recursive Rust extractors.
+pub(crate) struct RustExtractSink<'a> {
+    pub nodes: &'a mut Vec<CodeNode>,
+    pub edges: &'a mut Vec<CodeEdge>,
+    pub class_id_map: &'a mut HashMap<String, String>,
+    pub impl_target_map: &'a mut HashMap<String, String>,
+    pub imports: &'a mut HashSet<String>,
+    pub struct_field_types: &'a mut HashMap<String, HashMap<String, String>>,
+}
+
+/// Immutable lookups + outputs needed during Rust call-edge resolution.
+///
+/// Built once per file at the entry of `extract_calls_rust` and threaded
+/// through the recursive call-extraction helpers (`extract_calls_from_token_tree`,
+/// `scan_args_for_fn_refs`, `resolve_rust_call_edge`,
+/// `resolve_rust_self_method_call`).
+///
+/// `edges` is *not* in here — it stays as a separate `&mut` parameter so
+/// the ctx itself can be borrowed shared while edges are appended.
+pub(crate) struct RustCallCtx<'a> {
+    pub source: &'a [u8],
+    pub rel_path: &'a str,
+    pub package_dir: &'a str,
+    pub func_name_map: &'a HashMap<String, Vec<String>>,
+    pub method_to_class: &'a HashMap<String, String>,
+    pub file_func_ids: &'a HashSet<String>,
+    pub node_pkg_map: &'a HashMap<String, String>,
+    pub file_imported_names: &'a HashMap<String, HashSet<String>>,
+    pub struct_field_types: &'a HashMap<String, HashMap<String, String>>,
+}
+
+/// Result of a per-file Rust tree-sitter extraction pass.
+///
+/// Tuple-shaped (rather than a named struct) on purpose: callers in tests
+/// and the higher-level extract pipeline destructure it positionally.
+/// Introduced to satisfy `clippy::type_complexity` without churning every
+/// call site.
+pub(crate) type RustTreeSitterExtractResult = (
+    Vec<CodeNode>,
+    Vec<CodeEdge>,
+    HashSet<String>,
+    HashMap<String, HashMap<String, String>>,
+);
+
 // ─── Helpers for new CodeNode fields ───
 
 /// Extract visibility modifier from a Rust AST node.
@@ -46,7 +112,7 @@ pub(crate) fn extract_rust_tree_sitter(
     content: &str,
     parser: &mut Parser,
     class_id_map: &mut HashMap<String, String>,
-) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>, HashMap<String, HashMap<String, String>>) {
+) -> RustTreeSitterExtractResult {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut imports = HashSet::new();
@@ -69,22 +135,24 @@ pub(crate) fn extract_rust_tree_sitter(
     // Track impl blocks to associate methods with types
     let mut impl_target_map: HashMap<String, String> = HashMap::new();
 
+    let ctx = RustExtractCtx {
+        source,
+        source_str: content,
+        path,
+        file_id: &file_id,
+    };
+    let mut sink = RustExtractSink {
+        nodes: &mut nodes,
+        edges: &mut edges,
+        class_id_map,
+        impl_target_map: &mut impl_target_map,
+        imports: &mut imports,
+        struct_field_types: &mut struct_field_types,
+    };
+
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        extract_rust_node(
-            child,
-            source,
-            content,
-            path,
-            &file_id,
-            &mut nodes,
-            &mut edges,
-            class_id_map,
-            &mut impl_target_map,
-            &mut imports,
-            &mut struct_field_types,
-            "",  // no parent module prefix at root
-        );
+        extract_rust_node(child, &ctx, &mut sink, "");
     }
 
     (nodes, edges, imports, struct_field_types)
@@ -93,18 +161,22 @@ pub(crate) fn extract_rust_tree_sitter(
 /// Recursively extract Rust nodes from AST
 pub(crate) fn extract_rust_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
-    file_id: &str,
-    nodes: &mut Vec<CodeNode>,
-    edges: &mut Vec<CodeEdge>,
-    class_id_map: &mut HashMap<String, String>,
-    impl_target_map: &mut HashMap<String, String>,
-    imports: &mut HashSet<String>,
-    struct_field_types: &mut HashMap<String, HashMap<String, String>>,
+    ctx: &RustExtractCtx<'_>,
+    sink: &mut RustExtractSink<'_>,
     module_prefix: &str,
 ) {
+    // Re-bind ctx/sink fields to the names the rest of the body already
+    // uses. This keeps the ~470-line function body unchanged after the
+    // ISS-046 signature collapse. The compiler's split-borrow handling
+    // allows simultaneous `&mut` reborrows of distinct named fields.
+    let RustExtractCtx { source, source_str, path, file_id } = *ctx;
+    let sink_ref = sink; // single binding so split-borrow rules apply
+    let nodes = &mut *sink_ref.nodes;
+    let edges = &mut *sink_ref.edges;
+    let class_id_map = &mut *sink_ref.class_id_map;
+    let impl_target_map = &mut *sink_ref.impl_target_map;
+    let imports = &mut *sink_ref.imports;
+    let struct_field_types = &mut *sink_ref.struct_field_types;
     let text = |n: tree_sitter::Node| -> String {
         n.utf8_text(source).unwrap_or("").to_string()
     };
@@ -484,20 +556,18 @@ pub(crate) fn extract_rust_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut body_cursor = body.walk();
                 for body_child in body.children(&mut body_cursor) {
-                    extract_rust_node(
-                        body_child,
-                        source,
-                        source_str,
-                        path,
-                        file_id,
-                        nodes,
-                        edges,
-                        class_id_map,
-                        impl_target_map,
-                        imports,
-                        struct_field_types,
-                        &new_prefix,
-                    );
+                    // Rebuild a sink view from the split-borrowed fields
+                    // for each iteration. Each `&mut *x` is a fresh
+                    // reborrow scoped to the call.
+                    let mut child_sink = RustExtractSink {
+                        nodes: &mut *nodes,
+                        edges: &mut *edges,
+                        class_id_map: &mut *class_id_map,
+                        impl_target_map: &mut *impl_target_map,
+                        imports: &mut *imports,
+                        struct_field_types: &mut *struct_field_types,
+                    };
+                    extract_rust_node(body_child, ctx, &mut child_sink, &new_prefix);
                 }
             }
         }
@@ -857,6 +927,7 @@ pub(crate) fn extract_rust_regex(path: &str, content: &str) -> (Vec<CodeNode>, V
 /// For `self.client.send()`, receiver is "self.client":
 ///   - Extract field name "client" 
 ///   - Look up impl_type in struct_field_types to find field type
+///
 /// For chained calls like `self.foo.bar.baz()`, uses first field after self.
 /// Returns None if type cannot be inferred.
 pub(crate) fn infer_receiver_type(
@@ -876,8 +947,8 @@ pub(crate) fn infer_receiver_type(
     // "self.client" → "client"
     // "self.client.inner" → "client" (use first field only)
     // "foo" → "foo" (non-self receiver, try as-is)
-    let field_name = if receiver.starts_with("self.") {
-        let after_self = &receiver[5..]; // skip "self."
+    let field_name = if let Some(after_self) = receiver.strip_prefix("self.") {
+        // skip "self."
         after_self.split('.').next().unwrap_or(after_self)
     } else {
         // Direct variable name — can't resolve type without local variable analysis
@@ -1017,7 +1088,6 @@ pub(crate) fn is_rust_macro_builtin(name: &str) -> bool {
 }
 
 /// Check if a TypeScript/JavaScript call is a builtin to skip
-
 pub(crate) fn build_scope_map_rust(
     node: tree_sitter::Node,
     source: &[u8],
@@ -1180,21 +1250,26 @@ pub(crate) fn build_scope_map_rust(
 /// Extract calls from Rust AST
 pub(crate) fn extract_calls_rust(
     root: tree_sitter::Node,
-    source: &[u8],
-    rel_path: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    method_to_class: &HashMap<String, String>,
-    file_func_ids: &HashSet<String>,
-    node_pkg_map: &HashMap<String, String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    struct_field_types: &HashMap<String, HashMap<String, String>>,
+    ctx: &RustCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    // Re-bind only the ctx fields the body still reads directly. The
+    // call-site helpers (`resolve_rust_call_edge`, `scan_args_for_fn_refs`,
+    // `extract_calls_from_token_tree`) take `ctx` themselves and pull what
+    // they need internally.
+    let RustCallCtx {
+        source,
+        rel_path,
+        func_name_map,
+        method_to_class,
+        file_func_ids,
+        struct_field_types,
+        ..
+    } = *ctx;
+
     // Build scope map
     let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
     build_scope_map_rust(root, source, rel_path, &mut scope_map);
-
-    let package_dir = rel_path.rsplitn(2, '/').nth(1).unwrap_or("");
 
     // Walk tree looking for calls
     let mut stack = vec![root];
@@ -1274,15 +1349,9 @@ pub(crate) fn extract_calls_rust(
                                 resolve_rust_call_edge(
                                     caller_id,
                                     &callee_name,
-                                    func_name_map,
-                                    file_func_ids,
-                                    package_dir,
-                                    node_pkg_map,
                                     false,
-                                    file_imported_names,
-                                    rel_path,
                                     None,
-                                    method_to_class,
+                                    ctx,
                                     edges,
                                 );
                                 // Patch call site position using the callee identifier node
@@ -1300,11 +1369,7 @@ pub(crate) fn extract_calls_rust(
                     // Scan arguments for function references (fn passed as argument)
                     // Pattern: foo(bar) where bar is a known function name
                     if let Some(args_node) = node.child_by_field_name("arguments") {
-                        scan_args_for_fn_refs(
-                            args_node, source, caller_id,
-                            func_name_map, file_func_ids, package_dir, node_pkg_map,
-                            file_imported_names, rel_path, edges,
-                        );
+                        scan_args_for_fn_refs(args_node, caller_id, ctx, edges);
                     }
                 }
             }
@@ -1352,15 +1417,9 @@ pub(crate) fn extract_calls_rust(
                             resolve_rust_call_edge(
                                 caller_id,
                                 method_name,
-                                func_name_map,
-                                file_func_ids,
-                                package_dir,
-                                node_pkg_map,
                                 true,
-                                file_imported_names,
-                                rel_path,
                                 receiver_type.as_deref(),
-                                method_to_class,
+                                ctx,
                                 edges,
                             );
                         }
@@ -1376,11 +1435,7 @@ pub(crate) fn extract_calls_rust(
                     
                     // Scan arguments for function references
                     if let Some(args_node) = node.child_by_field_name("arguments") {
-                        scan_args_for_fn_refs(
-                            args_node, source, caller_id,
-                            func_name_map, file_func_ids, package_dir, node_pkg_map,
-                            file_imported_names, rel_path, edges,
-                        );
+                        scan_args_for_fn_refs(args_node, caller_id, ctx, edges);
                     }
                 }
             }
@@ -1444,17 +1499,9 @@ pub(crate) fn extract_calls_rust(
                     if let Some(token_tree) = tt {
                         extract_calls_from_token_tree(
                             token_tree,
-                            source,
                             caller_id,
                             impl_ctx.as_deref(),
-                            func_name_map,
-                            method_to_class,
-                            file_func_ids,
-                            package_dir,
-                            node_pkg_map,
-                            file_imported_names,
-                            rel_path,
-                            struct_field_types,
+                            ctx,
                             edges,
                         );
                     }
@@ -1477,16 +1524,11 @@ pub(crate) fn extract_calls_rust(
 /// e.g., `.is_some_and(header_value_is_credential)`, `get(verify_webhook)`
 pub(crate) fn scan_args_for_fn_refs(
     args_node: tree_sitter::Node,
-    source: &[u8],
     caller_id: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
-    package_dir: &str,
-    node_pkg_map: &HashMap<String, String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    rel_path: &str,
+    ctx: &RustCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let RustCallCtx { source, func_name_map, .. } = *ctx;
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
         if child.kind() == "identifier" {
@@ -1499,9 +1541,7 @@ pub(crate) fn scan_args_for_fn_refs(
             {
                 let edges_before = edges.len();
                 resolve_rust_call_edge(
-                    caller_id, name, func_name_map, file_func_ids,
-                    package_dir, node_pkg_map, false,
-                    file_imported_names, rel_path, None, &HashMap::new(), edges,
+                    caller_id, name, false, None, ctx, edges,
                 );
                 // Patch call site position using the identifier node
                 let call_pos = child.start_position();
@@ -1521,19 +1561,13 @@ pub(crate) fn scan_args_for_fn_refs(
 /// Also detects `self.identifier(...)` patterns for self method calls.
 pub(crate) fn extract_calls_from_token_tree(
     token_tree: tree_sitter::Node,
-    source: &[u8],
     caller_id: &str,
     impl_ctx: Option<&str>,
-    func_name_map: &HashMap<String, Vec<String>>,
-    method_to_class: &HashMap<String, String>,
-    file_func_ids: &HashSet<String>,
-    package_dir: &str,
-    node_pkg_map: &HashMap<String, String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    rel_path: &str,
-    struct_field_types: &HashMap<String, HashMap<String, String>>,
+    ctx: &RustCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    // Re-bind the ctx fields the body actually reads.
+    let RustCallCtx { source, func_name_map, method_to_class, file_func_ids, .. } = *ctx;
     let mut cursor = token_tree.walk();
     let children: Vec<tree_sitter::Node> = token_tree.children(&mut cursor).collect();
     
@@ -1594,15 +1628,9 @@ pub(crate) fn extract_calls_from_token_tree(
                     resolve_rust_call_edge(
                         caller_id,
                         callee_name,
-                        func_name_map,
-                        file_func_ids,
-                        package_dir,
-                        node_pkg_map,
                         false,
-                        file_imported_names,
-                        rel_path,
                         None,
-                        method_to_class,
+                        ctx,
                         edges,
                     );
                     // Patch call site position using the identifier node
@@ -1619,21 +1647,7 @@ pub(crate) fn extract_calls_from_token_tree(
         
         // Recurse into nested token_trees
         if child.kind() == "token_tree" {
-            extract_calls_from_token_tree(
-                child,
-                source,
-                caller_id,
-                impl_ctx,
-                func_name_map,
-                method_to_class,
-                file_func_ids,
-                package_dir,
-                node_pkg_map,
-                file_imported_names,
-                rel_path,
-                struct_field_types,
-                edges,
-            );
+            extract_calls_from_token_tree(child, caller_id, impl_ctx, ctx, edges);
         }
         
         i += 1;
@@ -1691,7 +1705,6 @@ pub(crate) fn extract_rust_call_target(node: tree_sitter::Node, source: &[u8]) -
 /// For `impl Type` (no trait), returns None.
 pub(crate) fn extract_impl_trait_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut first_type: Option<String> = None;
-    let mut seen_for = false;
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1710,15 +1723,18 @@ pub(crate) fn extract_impl_trait_name(node: tree_sitter::Node, source: &[u8]) ->
 
                 if first_type.is_none() {
                     first_type = name;
-                } else if !seen_for {
-                    // Second type without 'for' — shouldn't happen normally
+                } else {
+                    // Second type without an intervening `for` keyword —
+                    // we already would have returned early in the `for` branch
+                    // below. This means malformed `impl A B`; treat as no trait.
                     return None;
                 }
             }
             _ => {
                 if child.utf8_text(source).ok() == Some("for") {
-                    seen_for = true;
-                    // first_type was the trait
+                    // first_type was the trait; the next type ident will be
+                    // the impl target. We can return early here since the
+                    // caller only needs the trait name.
                     return first_type;
                 }
             }
@@ -1772,17 +1788,21 @@ pub(crate) fn extract_impl_type(node: tree_sitter::Node, source: &[u8]) -> Optio
 pub(crate) fn resolve_rust_call_edge(
     caller_id: &str,
     callee_name: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
-    package_dir: &str,
-    node_pkg_map: &HashMap<String, String>,
     is_method_call: bool,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    rel_path: &str,
     receiver_type: Option<&str>,
-    method_to_class: &HashMap<String, String>,
+    ctx: &RustCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let RustCallCtx {
+        rel_path,
+        package_dir,
+        func_name_map,
+        method_to_class,
+        file_func_ids,
+        node_pkg_map,
+        file_imported_names,
+        ..
+    } = *ctx;
     if let Some(callee_ids) = func_name_map.get(callee_name) {
         // Level 2: If we know the receiver type, filter by it first
         if let Some(recv_type) = receiver_type {

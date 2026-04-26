@@ -884,7 +884,7 @@ pub async fn name_components(
 
         // Call LLM
         let batch_num = batch_start / config.batch_size + 1;
-        let total_batches = (llm_contexts.len() + config.batch_size - 1) / config.batch_size;
+        let total_batches = llm_contexts.len().div_ceil(config.batch_size);
         tracing::info!(batch = batch_num, total = total_batches, "Calling LLM for naming batch");
         match llm.complete(&prompt).await {
             Ok(response) => {
@@ -1306,6 +1306,7 @@ mod tests {
     }
 
     /// Helper: build a simple ClusterResult with given components and membership edges.
+    #[allow(dead_code)]
     fn make_cluster_result(
         components: Vec<Node>,
         edges: Vec<Edge>,

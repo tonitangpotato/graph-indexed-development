@@ -168,8 +168,7 @@ impl SigningKey {
     /// The stored form is uppercase hex with no separators.
     pub fn new(fingerprint: &str) -> Result<Self, IdentityError> {
         let cleaned = fingerprint
-            .replace(' ', "")
-            .replace(':', "")
+            .replace([' ', ':'], "")
             .to_uppercase();
 
         if validate_fingerprint(&cleaned) {

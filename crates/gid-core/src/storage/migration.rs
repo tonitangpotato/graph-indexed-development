@@ -1468,17 +1468,17 @@ edges:
             "Custom metadata key 'reviewed_by' should be in node_metadata");
 
         // Promoted keys must NOT appear in node_metadata (they're dedicated columns)
-        assert!(meta.get("file_path").is_none(),
+        assert!(!meta.contains_key("file_path"),
             "PROMOTED_KEY file_path should NOT be in node_metadata");
-        assert!(meta.get("lang").is_none(),
+        assert!(!meta.contains_key("lang"),
             "PROMOTED_KEY lang should NOT be in node_metadata");
-        assert!(meta.get("start_line").is_none(),
+        assert!(!meta.contains_key("start_line"),
             "PROMOTED_KEY start_line should NOT be in node_metadata");
-        assert!(meta.get("signature").is_none(),
+        assert!(!meta.contains_key("signature"),
             "PROMOTED_KEY signature should NOT be in node_metadata");
-        assert!(meta.get("owner").is_none(),
+        assert!(!meta.contains_key("owner"),
             "PROMOTED_KEY owner should NOT be in node_metadata");
-        assert!(meta.get("source").is_none(),
+        assert!(!meta.contains_key("source"),
             "PROMOTED_KEY source should NOT be in node_metadata");
     }
 

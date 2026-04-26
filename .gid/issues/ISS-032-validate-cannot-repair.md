@@ -4,9 +4,15 @@
 **发现者**: potato + RustClaw
 **组件**: gid-cli, `commands/validate.rs`; gid-core (new repair module needed)
 **优先级**: P1
-**Status:** open
+**Status:** closed
 **类型**: feature-gap
 **标签**: cli, validation, ux, tooling
+
+---
+
+## ✅ Resolution (2026-04-26)
+
+Implemented `gid repair` command. See bottom of file for closure note.
 
 ---
 
@@ -129,3 +135,40 @@ pub fn execute_repair(graph: &mut Graph, plan: &RepairPlan, opts: RepairOpts) ->
 - ISS-033: PRAGMA foreign_keys 默认未开，CASCADE 不生效（姐妹 issue）
 - ISS-015: FK enforcement 在 migration batch 内是 no-op（已修）
 - 触发案例：RustClaw memory/2026-04-23.md "GID usage rules added to AGENTS.md (23:20)"
+
+---
+
+## ✅ Closure Note (2026-04-26)
+
+**Implemented**: `gid repair` command with full feature set per spec.
+
+**Files changed:**
+- `crates/gid-core/src/repair.rs` (NEW, 380 LoC + 12 tests) — pure logic: `RepairOptions`, `RepairPlan`, `RepairReport`, `plan_repair()`, `apply_repair()`
+- `crates/gid-core/src/lib.rs` — module + re-exports
+- `crates/gid-cli/src/main.rs` — `Commands::Repair { ... }` variant + `cmd_repair_ctx()` + `backup_graph_file()`
+
+**Capabilities delivered:**
+- `gid repair --all --dry-run` — preview plan
+- `gid repair --all --yes` — CI mode (no prompt)
+- `gid repair --orphan-edges` etc. — selective fixes
+- Default interactive: shows plan, prompts `[y/N]` before applying
+- Auto-backup to `graph.{db,yml}.backup-<unix-ts>` before apply (skip with `--no-backup`)
+- `--json` output for both dry-run and apply modes
+- Both YAML and SQLite backends supported (uses `ctx.save()` + `std::fs::copy()` for backup)
+
+**Safety design (副问题 #3 resolved):**
+Orphan node removal is restricted to `SAFE_ORPHAN_NODE_TYPES` = code/file/function/method/class/module/trait/struct/enum. User-authored types (task/issue/feature/component) are SKIPPED with a transparency note in the plan. Tasks without edges often = "not yet linked", not "stale data".
+
+**Test coverage**: 12 unit tests in `repair::tests` covering each repair category individually + combined; all pass. Total gid-core test count: 1095 → 1107.
+
+**Manual verification** (both backends):
+- YAML: synthetic graph with 5 issue categories → plan shows 5 changes + 1 skipped → apply → re-validate clean except for preserved orphan task ✓
+- SQLite: same flow on graph.db → backup file created at `graph.db.backup-<ts>` ✓
+- JSON mode: both dry-run and apply produce structured output ✓
+- Guard: no flags → clear error message ✓
+
+**What was NOT done (intentionally out of scope):**
+- Cycle breaking — requires choosing which edge to drop, which is a domain decision; not safely auto-repairable
+- Orphan task/issue auto-removal — would risk data loss; user must use `gid refactor delete` explicitly
+
+**Branch**: `iss-001-002-revive` (continuing the revive batch)

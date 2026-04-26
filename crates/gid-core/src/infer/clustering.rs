@@ -36,16 +36,22 @@ pub const WEIGHT_SYMBOL_SIMILARITY: f64 = 0.5;
 pub const SYMBOL_MIN_SHARED_TOKENS: usize = 2;
 /// Default minimum Jaccard threshold for symbol similarity edges.
 pub const SYMBOL_MIN_JACCARD: f64 = 0.15;
-/// Legacy constant — no longer used.  Co-location edges now only apply to
-/// code-isolated files (zero edges in the network), so O(n²) explosion in
-/// large directories is structurally impossible.
-#[deprecated(note = "co-location is now isolation-gated; pairwise limit is unnecessary")]
-pub const COLOCATION_PAIRWISE_LIMIT: usize = 80;
+// COLOCATION_PAIRWISE_LIMIT removed in ISS-045 (2026-04-26). Co-location
+// edges are now isolation-gated (only emitted between code-isolated files,
+// where the network has zero edges), so the O(n²) pairwise cap is
+// structurally impossible to hit. The deprecated constant was unused
+// internally and not referenced by any downstream crate (gid-cli, rustclaw).
 
-/// Map an edge relation string to its clustering weight.
+/// Map an edge relation string to its clustering weight (uses default weights).
 ///
 /// Unknown relations return `0.0` and are effectively ignored.
+///
+/// **Note:** This is a convenience wrapper over [`default_edge_weights`].
+/// Production code paths should consult [`ClusterConfig::edge_weights`] so
+/// users can tune per-project weights via CLI / config (ISS-002).
 pub fn relation_weight(relation: &str) -> f64 {
+    // Match the default map exactly. Inlined here to keep the function cheap
+    // (no HashMap allocation per call) for hot diagnostic / display paths.
     match relation {
         "calls" => WEIGHT_CALLS,
         "imports" => WEIGHT_IMPORTS,
@@ -56,6 +62,32 @@ pub fn relation_weight(relation: &str) -> f64 {
         "tests_for" => 0.3,            // weak coupling — tests cluster with source but don't dominate
         _ => 0.0,
     }
+}
+
+/// Default edge-weight map used by [`ClusterConfig::default`].
+///
+/// Mirrors [`relation_weight`] but materialises the table so users can
+/// override individual entries (e.g. `gid infer --edge-weight calls=1.5`)
+/// without forking the whole match arm.
+///
+/// Synonym groups (e.g. `inherits` / `implements` / `uses`) are expanded
+/// into individual entries — this lets users tune them independently if
+/// they choose.
+pub fn default_edge_weights() -> HashMap<String, f64> {
+    let mut w = HashMap::new();
+    w.insert("calls".to_string(), WEIGHT_CALLS);
+    w.insert("imports".to_string(), WEIGHT_IMPORTS);
+    w.insert("type_reference".to_string(), WEIGHT_TYPE_REF);
+    w.insert("inherits".to_string(), WEIGHT_TYPE_REF);
+    w.insert("implements".to_string(), WEIGHT_TYPE_REF);
+    w.insert("uses".to_string(), WEIGHT_TYPE_REF);
+    w.insert("overrides".to_string(), WEIGHT_TYPE_REF);
+    w.insert("defined_in".to_string(), WEIGHT_STRUCTURAL);
+    w.insert("contains".to_string(), WEIGHT_STRUCTURAL);
+    w.insert("belongs_to".to_string(), WEIGHT_STRUCTURAL);
+    w.insert("depends_on".to_string(), WEIGHT_DEPENDS_ON);
+    w.insert("tests_for".to_string(), 0.3);
+    w
 }
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -107,6 +139,16 @@ pub struct ClusterConfig {
     /// naturally has a few imports. The effective cutoff is
     /// `max(threshold * total_files, hub_min_degree)`.
     pub hub_min_degree: usize,
+    /// Per-relation edge weight overrides (ISS-002).
+    ///
+    /// Keys are edge `relation` strings (e.g. `"calls"`, `"imports"`,
+    /// `"type_reference"`); values are the weight applied to that edge in
+    /// the Infomap network. Unknown relations (not in this map) are
+    /// treated as weight `0.0` and ignored.
+    ///
+    /// Default values mirror [`default_edge_weights`]. Override per project
+    /// via `gid infer --edge-weight calls=1.5 --edge-weight imports=0.5`.
+    pub edge_weights: HashMap<String, f64>,
 }
 
 impl Default for ClusterConfig {
@@ -126,6 +168,7 @@ impl Default for ClusterConfig {
             max_cluster_size: None,
             hub_exclusion_threshold: 0.05,
             hub_min_degree: 10,
+            edge_weights: default_edge_weights(),
         }
     }
 }
@@ -202,8 +245,12 @@ impl ClusterResult {
 /// Build an Infomap [`Network`] from a [`Graph`], collapsing non-file nodes
 /// onto their parent files.
 ///
+/// Edge weights are looked up from `config.edge_weights` (ISS-002). Relations
+/// not present in the map are treated as weight `0.0` and skipped — pass
+/// [`ClusterConfig::default`] to use the built-in defaults.
+///
 /// Returns the network and a vec mapping network indices back to node ID strings.
-pub fn build_network(graph: &Graph) -> (Network, Vec<String>) {
+pub fn build_network(graph: &Graph, config: &ClusterConfig) -> (Network, Vec<String>) {
     // 1. Collect file nodes and assign indices.
     let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
     let mut idx_to_id: Vec<String> = Vec::new();
@@ -252,15 +299,16 @@ pub fn build_network(graph: &Graph) -> (Network, Vec<String>) {
 
     // 3. Accumulate edge weights between file pairs.
     //
-    // Weight = relation_weight(relation) × confidence.
+    // Weight = config.edge_weights[relation] × confidence.
     // This ensures LSP-confirmed edges (confidence ≥ 0.95) dominate over
     // tree-sitter heuristic edges (confidence 0.3–0.7). Edges without an
     // explicit confidence field are treated as confidence = 1.0 (legacy/manual
-    // edges are assumed reliable).
+    // edges are assumed reliable). Relations missing from `edge_weights` are
+    // skipped (treated as weight 0.0) — see ISS-002.
     let mut edge_weights: HashMap<(usize, usize), f64> = HashMap::new();
 
     for edge in &graph.edges {
-        let w = relation_weight(&edge.relation);
+        let w = config.edge_weights.get(edge.relation.as_str()).copied().unwrap_or(0.0);
         if w == 0.0 {
             continue;
         }
@@ -452,12 +500,10 @@ pub fn add_co_citation_edges(
     // For each pair of candidates, count shared importers and weight by
     // the mean confidence of the citing edges.
     let mut co_citation_edges = 0usize;
-    for i in 0..candidates.len() {
-        let a = candidates[i];
+    for (i, &a) in candidates.iter().enumerate() {
         let citers_a = &imported_by[&a];
 
-        for j in (i + 1)..candidates.len() {
-            let b = candidates[j];
+        for &b in &candidates[i + 1..] {
 
             // Skip pairs already connected by high-confidence direct edges —
             // co-citation would just redundantly echo what LSP already told us.
@@ -565,7 +611,7 @@ pub fn add_dir_colocation_edges(net: &mut Network, idx_to_id: &[String], weight:
     //    Since these are *only* isolated files, groups are typically small
     //    and O(n²) pairwise is fine (no need for thresholds or decay).
     let mut total_edges = 0usize;
-    for (_dir, files) in &dir_groups {
+    for files in dir_groups.values() {
         if files.len() < 2 {
             continue; // single isolated file in a dir — nothing to pair with
         }
@@ -749,7 +795,7 @@ pub fn add_symbol_similarity_edges(
 
     // Step 3: Count shared tokens per file pair using inverted index
     let mut shared_counts: HashMap<(usize, usize), usize> = HashMap::new();
-    for (_token, files) in &inverted_index {
+    for files in inverted_index.values() {
         if files.len() < 2 || files.len() > 200 {
             // Skip tokens appearing in too many files — they're effectively stop words
             continue;
@@ -2117,7 +2163,7 @@ fn create_infra_component(
 /// This is the main entry point. It builds a file-level network, runs Infomap,
 /// and maps results back to component nodes and membership edges.
 pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
-    let (net, idx_to_id) = build_network(graph);
+    let (net, idx_to_id) = build_network(graph, config);
 
     // Hub exclusion — remove infrastructure files from the network before
     // adding synthetic edges (co-citation, symbol similarity, colocation).
@@ -2324,7 +2370,7 @@ mod tests {
         g.edges.push(Edge::new("file:a.rs", "file:b.rs", "calls"));
         g.edges.push(Edge::new("file:b.rs", "file:c.rs", "imports"));
 
-        let (net, idx_to_id) = build_network(&g);
+        let (net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         assert_eq!(net.num_nodes(), 3);
         assert_eq!(idx_to_id.len(), 3);
@@ -2343,7 +2389,7 @@ mod tests {
         g.edges.push(Edge::new("file:x.rs", "file:y.rs", "calls"));
         g.edges.push(Edge::new("file:x.rs", "file:z.rs", "imports"));
 
-        let (net, idx_to_id) = build_network(&g);
+        let (net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         // Find index of x, y, z
         let x = idx_to_id.iter().position(|id| id == "file:x.rs").unwrap();
@@ -2363,6 +2409,82 @@ mod tests {
         );
     }
 
+    // ── 3b. test_build_network_respects_edge_weight_overrides (ISS-002) ─
+
+    #[test]
+    fn test_build_network_respects_edge_weight_overrides() {
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("x.rs"));
+        g.nodes.push(make_file_node("y.rs"));
+        g.nodes.push(make_file_node("z.rs"));
+        g.edges.push(Edge::new("file:x.rs", "file:y.rs", "calls"));
+        g.edges.push(Edge::new("file:x.rs", "file:z.rs", "imports"));
+
+        // Invert the default ranking: make `imports` outweigh `calls`.
+        let mut config = ClusterConfig::default();
+        config.edge_weights.insert("calls".to_string(), 0.1);
+        config.edge_weights.insert("imports".to_string(), 5.0);
+
+        let (net, idx_to_id) = build_network(&g, &config);
+        let x = idx_to_id.iter().position(|id| id == "file:x.rs").unwrap();
+        let y = idx_to_id.iter().position(|id| id == "file:y.rs").unwrap();
+        let z = idx_to_id.iter().position(|id| id == "file:z.rs").unwrap();
+
+        let out = net.out_neighbors(x);
+        let weight_xy = out.iter().find(|&&(t, _)| t == y).map(|&(_, w)| w).unwrap();
+        let weight_xz = out.iter().find(|&&(t, _)| t == z).map(|&(_, w)| w).unwrap();
+
+        assert!(
+            weight_xz > weight_xy,
+            "with override, imports ({}) should outweigh calls ({})",
+            weight_xz,
+            weight_xy
+        );
+    }
+
+    // ── 3c. test_build_network_zero_weight_skips_edge (ISS-002) ────────
+
+    #[test]
+    fn test_build_network_zero_weight_skips_edge() {
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("a.rs"));
+        g.nodes.push(make_file_node("b.rs"));
+        g.edges.push(Edge::new("file:a.rs", "file:b.rs", "calls"));
+
+        // Disable `calls` entirely.
+        let mut config = ClusterConfig::default();
+        config.edge_weights.insert("calls".to_string(), 0.0);
+
+        let (net, _) = build_network(&g, &config);
+        assert_eq!(net.num_edges(), 0, "zero-weight relations must be skipped");
+    }
+
+    // ── 3d. test_default_edge_weights_matches_relation_weight (ISS-002) ─
+
+    #[test]
+    fn test_default_edge_weights_matches_relation_weight() {
+        // Ensures backwards compatibility: the materialised default map and
+        // the legacy `relation_weight` function must agree on every relation
+        // either side knows about.
+        let map = default_edge_weights();
+        for (relation, &expected) in &map {
+            let actual = relation_weight(relation);
+            assert_eq!(
+                actual, expected,
+                "relation_weight({:?}) = {} but default map has {}",
+                relation, actual, expected
+            );
+        }
+        // Spot-check the well-known relations.
+        assert_eq!(map.get("calls").copied(), Some(WEIGHT_CALLS));
+        assert_eq!(map.get("imports").copied(), Some(WEIGHT_IMPORTS));
+        assert_eq!(map.get("inherits").copied(), Some(WEIGHT_TYPE_REF));
+        assert_eq!(map.get("contains").copied(), Some(WEIGHT_STRUCTURAL));
+        assert_eq!(map.get("depends_on").copied(), Some(WEIGHT_DEPENDS_ON));
+        // Unknown relation must be absent (treated as 0.0 by build_network).
+        assert!(!map.contains_key("unknown_relation"));
+    }
+
     // ── 4. test_build_network_skips_self_loops ─────────────────────────
 
     #[test]
@@ -2373,7 +2495,7 @@ mod tests {
         g.edges.push(Edge::new("file:a.rs", "file:a.rs", "calls")); // self-loop
         g.edges.push(Edge::new("file:a.rs", "file:b.rs", "calls"));
 
-        let (net, _idx_to_id) = build_network(&g);
+        let (net, _idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         // Only the a→b edge should exist, not the self-loop
         assert_eq!(net.num_edges(), 1);
@@ -2392,7 +2514,7 @@ mod tests {
         // Edge between function nodes; should resolve to file-level edge
         g.edges.push(Edge::new("fn:do_stuff", "fn:helper", "calls"));
 
-        let (net, idx_to_id) = build_network(&g);
+        let (net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         // Only 2 file nodes in the network
         assert_eq!(net.num_nodes(), 2);
@@ -3135,7 +3257,7 @@ mod tests {
         // 1 file in different directory
         g.nodes.push(make_file_node("src/utils/helper.rs"));
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         // Before co-location: no edges at all
         assert_eq!(net.num_edges(), 0, "Should have no edges before co-location");
@@ -3207,7 +3329,7 @@ mod tests {
         g.nodes.push(make_file_node("src/models/a.rs"));
         g.nodes.push(make_file_node("src/models/b.rs"));
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         assert_eq!(net.num_edges(), 0);
 
         // Weight = 0.0 should disable co-location
@@ -3249,7 +3371,7 @@ mod tests {
         g.nodes.push(make_file_node("src/utils/errors.ts"));
 
         // Internal cluster edges (strong coupling within clusters)
-        let cluster_a = vec!["src/auth/login.ts", "src/auth/register.ts", "src/auth/session.ts"];
+        let cluster_a = ["src/auth/login.ts", "src/auth/register.ts", "src/auth/session.ts"];
         for i in 0..cluster_a.len() {
             for j in (i + 1)..cluster_a.len() {
                 g.edges.push(Edge::new(
@@ -3259,12 +3381,10 @@ mod tests {
                 ));
             }
         }
-        let cluster_b = vec![
-            "src/commands/run.ts",
+        let cluster_b = ["src/commands/run.ts",
             "src/commands/build.ts",
             "src/commands/test.ts",
-            "src/commands/deploy.ts",
-        ];
+            "src/commands/deploy.ts"];
         for i in 0..cluster_b.len() {
             for j in (i + 1)..cluster_b.len() {
                 g.edges.push(Edge::new(
@@ -3274,7 +3394,7 @@ mod tests {
                 ));
             }
         }
-        let cluster_c = vec!["src/ui/render.ts", "src/ui/layout.ts", "src/ui/theme.ts"];
+        let cluster_c = ["src/ui/render.ts", "src/ui/layout.ts", "src/ui/theme.ts"];
         for i in 0..cluster_c.len() {
             for j in (i + 1)..cluster_c.len() {
                 g.edges.push(Edge::new(
@@ -3317,7 +3437,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
         let (clusters, metrics) = run_clustering(&net, &idx_to_id, &config);
 
@@ -3390,7 +3510,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
         let (clusters, metrics) = run_clustering(&net, &idx_to_id, &config);
 
@@ -3455,7 +3575,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
         let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
 
@@ -3537,7 +3657,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
         let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
 
@@ -3589,7 +3709,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
         let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
 
@@ -3648,7 +3768,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_dir_colocation_edges(&mut net, &idx_to_id, config.dir_colocation_weight);
         let (clusters, _metrics) = run_clustering(&net, &idx_to_id, &config);
 
@@ -3913,7 +4033,7 @@ mod tests {
         g.edges
             .push(Edge::new("file:features/f3.ts", "file:utils/e.ts", "imports"));
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
@@ -3965,7 +4085,7 @@ mod tests {
         g.edges
             .push(Edge::new("file:features/f1.ts", "file:utils/b.ts", "imports"));
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         // min_shared=2, but only 1 shared citer → no co-citation edge
@@ -4007,7 +4127,7 @@ mod tests {
             ));
         }
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
 
         let a_idx = idx_to_id
@@ -4052,7 +4172,7 @@ mod tests {
         g.edges
             .push(Edge::new("file:features/f2.ts", "file:utils/b.ts", "imports"));
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         // weight = 0.0 → disabled
@@ -4193,7 +4313,7 @@ mod tests {
                 .push(make_file_node(&format!("src/utils/orphan{}.ts", i)));
         }
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         // edges_before should be 6 (the import chain)
@@ -4252,7 +4372,7 @@ mod tests {
             ));
         }
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         add_dir_colocation_edges(&mut net, &idx_to_id, 0.3);
@@ -4289,7 +4409,7 @@ mod tests {
         g.edges
             .push(Edge::new("file:features/f2.ts", "file:utils/b.ts", "contains"));
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
@@ -4450,7 +4570,7 @@ mod tests {
         n.file_path = Some("src/utils/formatCurrency.ts".into());
         g.nodes.push(n);
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         assert_eq!(net.num_nodes(), 4);
         assert_eq!(net.num_edges(), 0); // no import edges
 
@@ -4522,7 +4642,7 @@ mod tests {
         n.file_path = Some("b.ts".into());
         g.nodes.push(n);
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         // With min_shared=2, single shared token "auth" should NOT create edge
         add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.5, 2, 0.15);
@@ -4533,7 +4653,7 @@ mod tests {
         );
 
         // With min_shared=1, it SHOULD create edge
-        let (mut net2, idx_to_id2) = build_network(&g);
+        let (mut net2, idx_to_id2) = build_network(&g, &ClusterConfig::default());
         add_symbol_similarity_edges(&mut net2, &g, &idx_to_id2, 0.5, 1, 0.0);
         assert!(
             net2.num_edges() > 0,
@@ -4574,7 +4694,7 @@ mod tests {
         n.file_path = Some("b.ts".into());
         g.nodes.push(n);
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let base_weight = 0.5;
         add_symbol_similarity_edges(&mut net, &g, &idx_to_id, base_weight, 2, 0.0);
 
@@ -4599,7 +4719,7 @@ mod tests {
         g.nodes.push(make_file_node("b.ts"));
         // No function/class nodes
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.5, 2, 0.15);
         assert_eq!(net.num_edges(), 0);
     }
@@ -4623,7 +4743,7 @@ mod tests {
         n.file_path = Some("b.ts".into());
         g.nodes.push(n);
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.0, 1, 0.0);
         assert_eq!(net.num_edges(), 0, "Weight 0.0 should add no edges");
     }
@@ -4647,7 +4767,7 @@ mod tests {
             ));
         }
 
-        let (_, idx_to_id) = build_network(&g);
+        let (_, idx_to_id) = build_network(&g, &ClusterConfig::default());
         // threshold=0.05, min_degree=1 → cutoff = max(ceil(0.05*11), 1) = 1
         // hub.ts has in_degree=10 > 1 → hub
         let hubs = identify_hubs(&g, &idx_to_id, 0.05, 1);
@@ -4678,7 +4798,7 @@ mod tests {
             ));
         }
 
-        let (_, idx_to_id) = build_network(&g);
+        let (_, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         // threshold=0.05, min_degree=1 → cutoff = max(ceil(0.05*20), 1) = 1
         // shared.ts(5) > 1 → hub
@@ -4855,7 +4975,7 @@ mod tests {
         edge_low.confidence = Some(0.3); // tree-sitter heuristic
         g.edges.push(edge_low);
 
-        let (net, idx_to_id) = build_network(&g);
+        let (net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         let a = idx_to_id.iter().position(|id| id == "file:a.rs").unwrap();
         let b = idx_to_id.iter().position(|id| id == "file:b.rs").unwrap();
@@ -4888,7 +5008,7 @@ mod tests {
         g.nodes.push(make_file_node("y.rs"));
         g.edges.push(Edge::new("file:x.rs", "file:y.rs", "imports")); // confidence = None
 
-        let (net, idx_to_id) = build_network(&g);
+        let (net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         let x = idx_to_id.iter().position(|id| id == "file:x.rs").unwrap();
         let y = idx_to_id.iter().position(|id| id == "file:y.rs").unwrap();
@@ -4922,7 +5042,7 @@ mod tests {
             }
         }
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
@@ -4953,7 +5073,7 @@ mod tests {
             }
         }
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
         let edges_before = net.num_edges();
 
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
@@ -4991,12 +5111,12 @@ mod tests {
             }
         }
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         // Record a→b weight before co-citation
         let a_idx = idx_to_id.iter().position(|id| id == "file:utils/a.ts").unwrap();
         let b_idx = idx_to_id.iter().position(|id| id == "file:utils/b.ts").unwrap();
-        let edges_before = net.num_edges();
+        let _edges_before = net.num_edges();
 
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
 
@@ -5048,7 +5168,7 @@ mod tests {
             g.edges.push(edge);
         }
 
-        let (mut net, idx_to_id) = build_network(&g);
+        let (mut net, idx_to_id) = build_network(&g, &ClusterConfig::default());
 
         add_co_citation_edges(&mut net, &g, &idx_to_id, 0.4, 2, 2.0);
 

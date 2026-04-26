@@ -20,7 +20,7 @@ const CODE_NODE_TYPES: &[&str] = &[
 
 /// Check whether a node type string refers to a code-layer type.
 fn is_code_node_type(node_type: Option<&str>) -> bool {
-    node_type.map_or(false, |t| CODE_NODE_TYPES.contains(&t))
+    node_type.is_some_and(|t| CODE_NODE_TYPES.contains(&t))
 }
 
 // ── MergeStats ─────────────────────────────────────────────────────────────
@@ -351,7 +351,7 @@ fn format_number(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(ch);
@@ -626,7 +626,7 @@ mod tests {
             nodes,
             edges,
             metrics: ClusterMetrics {
-                codelength: 3.14,
+                codelength: 3.5,
                 num_communities: n,
                 num_total: n * 5,
                 ..Default::default()
@@ -909,7 +909,7 @@ mod tests {
         assert!(summary.contains("1 feature"));
         assert!(summary.contains("Auth Module"));
         assert!(summary.contains("Authentication"));
-        assert!(summary.contains("3.140"));
+        assert!(summary.contains("3.500"));
         assert!(summary.contains("infer:component:0"));
         assert!(summary.contains("infer:component:1"));
         assert!(summary.contains("infer:feature:auth"));

@@ -300,7 +300,7 @@ impl LspClient {
         let stderr = process.stderr.take().context("take stderr")?;
         let _stderr_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 if line.contains("error") || line.contains("Error") || line.contains("FATAL")
                     || line.contains("WARN") || line.contains("panic")
                 {
@@ -492,7 +492,7 @@ impl LspClient {
                 // Debug: show blocking tokens periodically
                 if !all_ended {
                     let elapsed = max_wait.as_secs().saturating_sub(deadline.saturating_duration_since(now).as_secs());
-                    if elapsed % 15 == 0 && elapsed > 0 {
+                    if elapsed.is_multiple_of(15) && elapsed > 0 {
                         for (name, status) in &self.progress_tokens {
                             if !status.ended {
                                 eprintln!("[LSP] Waiting for: '{}' pct={:?}", name, status.percentage);
@@ -1073,6 +1073,7 @@ pub fn open_project_files(
 /// - Closes deleted files
 /// - For modified files: close + re-open with new content
 /// - Opens newly added files
+///
 /// Returns the count of files processed.
 pub fn refine_files(
     client: &mut LspClient,
@@ -1152,16 +1153,11 @@ pub fn find_closest_node(
     // Search within tolerance
     let mut best: Option<(u32, String)> = None;
     for (&line, id) in file_index {
-        let dist = if line > target_line {
-            line - target_line
-        } else {
-            target_line - line
-        };
-        if dist <= tolerance {
-            if best.as_ref().map_or(true, |(d, _)| dist < *d) {
+        let dist = line.abs_diff(target_line);
+        if dist <= tolerance
+            && best.as_ref().is_none_or(|(d, _)| dist < *d) {
                 best = Some((dist, id.clone()));
             }
-        }
     }
 
     best.map(|(_, id)| id)

@@ -229,7 +229,7 @@ impl LspDaemon {
     fn handle_request(&mut self, req: DaemonRequest) -> DaemonResponse {
         match req {
             DaemonRequest::Ping { lang_id } => {
-                let ready = self.servers.get(&lang_id).is_some();
+                let ready = self.servers.contains_key(&lang_id);
                 let uptime = self.servers.get(&lang_id)
                     .map(|s| s.started_at.elapsed().as_secs())
                     .unwrap_or(0);
@@ -703,7 +703,7 @@ pub fn is_daemon_running(project_root: &Path) -> bool {
 
     // Stale socket, clean up
     let _ = std::fs::remove_file(&socket_path);
-    let _ = std::fs::remove_file(&daemon_pid_path(project_root));
+    let _ = std::fs::remove_file(daemon_pid_path(project_root));
     false
 }
 
@@ -771,7 +771,7 @@ pub fn stop_daemon(project_root: &Path) -> Result<()> {
 
     // Force cleanup if needed
     let _ = std::fs::remove_file(&socket_path);
-    let _ = std::fs::remove_file(&daemon_pid_path(project_root));
+    let _ = std::fs::remove_file(daemon_pid_path(project_root));
 
     Ok(())
 }

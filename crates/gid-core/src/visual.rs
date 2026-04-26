@@ -130,7 +130,7 @@ pub fn render_ascii(graph: &Graph) -> String {
     // Summary
     let summary = graph.summary();
     output.push(String::new());
-    output.push(format!("─────────────────────────────────"));
+    output.push("─────────────────────────────────".to_string());
     output.push(format!("{}", summary));
     
     output.join("\n")

@@ -1,11 +1,54 @@
 //! Python code extraction using tree-sitter AST parsing
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use regex::Regex;
 use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
+
+// ─── Extraction Context (ISS-046) ───
+//
+// Mirrors the design used in `rust_lang.rs`: split the long extractor
+// argument lists into immutable/mutable contexts.
+//
+// `PyExtractCtx` is the per-file immutable input shared by the
+// `extract_class_node` / `extract_method_node` / `extract_function_node`
+// helpers. `PyCallCtx` is the per-file immutable lookup state shared by
+// `extract_calls_from_tree` / `resolve_and_add_call_edge` /
+// `resolve_self_method_call`. `edges` stays as a separate `&mut`
+// parameter so the ctx can stay shared while edges are appended.
+
+pub(crate) struct PyExtractCtx<'a> {
+    pub source: &'a [u8],
+    pub source_str: &'a str,
+    pub path: &'a str,
+}
+
+pub(crate) struct PyCallCtx<'a> {
+    pub source: &'a [u8],
+    pub rel_path: &'a str,
+    pub package_dir: &'a str,
+    pub func_name_map: &'a HashMap<String, Vec<String>>,
+    pub method_to_class: &'a HashMap<String, String>,
+    pub class_parents: &'a HashMap<String, Vec<String>>,
+    pub file_func_ids: &'a HashSet<String>,
+    pub file_imported_names: &'a HashMap<String, HashSet<String>>,
+    pub class_init_map: &'a HashMap<String, Vec<(String, String)>>,
+    pub node_pkg_map: &'a HashMap<String, String>,
+}
+
+/// Module-level cache for the import-statement regex.
+///
+/// Compiled exactly once per process. Previously this was constructed via
+/// `Regex::new(...)` inside the AST-walk loop, recompiling on every
+/// top-level statement (ISS-044). On a 5k-file Python codebase that
+/// translated to ~5–25s of wasted CPU during extraction.
+fn import_statement_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"import\s+([\w.]+)").expect("static regex must compile"))
+}
 
 /// Determine Python visibility by naming convention.
 fn extract_python_visibility(name: &str) -> String {
@@ -53,8 +96,8 @@ pub(crate) fn extract_docstring(node: tree_sitter::Node, source: &str) -> Option
         }
         if child.kind() == "expression_statement" {
             if let Some(str_node) = child.child(0) {
-                if str_node.kind() == "string" || str_node.kind() == "concatenated_string" {
-                    if str_node.start_byte() < source.len() && str_node.end_byte() <= source.len() {
+                if (str_node.kind() == "string" || str_node.kind() == "concatenated_string")
+                    && str_node.start_byte() < source.len() && str_node.end_byte() <= source.len() {
                         let doc_text = &source[str_node.start_byte()..str_node.end_byte()];
                         let doc_clean = doc_text
                             .trim_start_matches("\"\"\"")
@@ -81,7 +124,6 @@ pub(crate) fn extract_docstring(node: tree_sitter::Node, source: &str) -> Option
                         };
                         return Some(truncated.to_string());
                     }
-                }
             }
         }
         break;
@@ -144,6 +186,12 @@ pub(crate) fn extract_python_tree_sitter(
     let source = content.as_bytes();
     let root = tree.root_node();
 
+    let ctx = PyExtractCtx {
+        source,
+        source_str: content,
+        path,
+    };
+
     let text = |node: tree_sitter::Node| -> String {
         node.utf8_text(source).unwrap_or("").to_string()
     };
@@ -154,9 +202,7 @@ pub(crate) fn extract_python_tree_sitter(
             "class_definition" => {
                 extract_class_node(
                     child,
-                    source,
-                    content,
-                    path,
+                    &ctx,
                     &file_id,
                     &[],
                     &mut nodes,
@@ -165,7 +211,7 @@ pub(crate) fn extract_python_tree_sitter(
                 );
             }
             "function_definition" => {
-                extract_function_node(child, source, content, path, &file_id, &[], &mut nodes, &mut edges);
+                extract_function_node(child, &ctx, &file_id, &[], &mut nodes, &mut edges);
             }
             "decorated_definition" => {
                 let decorators = collect_decorators(child, source);
@@ -175,9 +221,7 @@ pub(crate) fn extract_python_tree_sitter(
                         "class_definition" => {
                             extract_class_node(
                                 inner,
-                                source,
-                                content,
-                                path,
+                                &ctx,
                                 &file_id,
                                 &decorators,
                                 &mut nodes,
@@ -187,7 +231,7 @@ pub(crate) fn extract_python_tree_sitter(
                         }
                         "function_definition" => {
                             extract_function_node(
-                                inner, source, content, path, &file_id, &decorators, &mut nodes, &mut edges,
+                                inner, &ctx, &file_id, &decorators, &mut nodes, &mut edges,
                             );
                         }
                         _ => {}
@@ -196,8 +240,7 @@ pub(crate) fn extract_python_tree_sitter(
             }
             "import_statement" => {
                 let import_text = text(child);
-                let re_import = Regex::new(r"import\s+([\w.]+)").unwrap();
-                if let Some(cap) = re_import.captures(&import_text) {
+                if let Some(cap) = import_statement_re().captures(&import_text) {
                     let module = cap[1].to_string();
                     if !is_stdlib(&module) {
                         edges.push(CodeEdge {
@@ -274,15 +317,16 @@ pub(crate) fn extract_python_tree_sitter(
 
 pub(crate) fn extract_class_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &PyExtractCtx<'_>,
     file_id: &str,
     decorators: &[String],
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
     class_id_map: &mut HashMap<String, String>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let class_name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
@@ -349,7 +393,7 @@ pub(crate) fn extract_class_node(
             let kind = sc_child.kind();
             if kind == "identifier" || kind == "attribute" {
                 let parent_text = sc_child.utf8_text(source).unwrap_or("");
-                let parent_name = parent_text.split('.').last().unwrap_or("").trim();
+                let parent_name = parent_text.split('.').next_back().unwrap_or("").trim();
                 if !parent_name.is_empty() && parent_name != "object" {
                     edges.push(CodeEdge {
                         from: class_id.clone(),
@@ -373,7 +417,7 @@ pub(crate) fn extract_class_node(
         for body_child in body.children(&mut body_cursor) {
             match body_child.kind() {
                 "function_definition" => {
-                    extract_method_node(body_child, source, source_str, path, &class_id, &[], nodes, edges);
+                    extract_method_node(body_child, ctx, &class_id, &[], nodes, edges);
                 }
                 "decorated_definition" => {
                     let method_decorators = collect_decorators(body_child, source);
@@ -382,9 +426,7 @@ pub(crate) fn extract_class_node(
                         if inner.kind() == "function_definition" {
                             extract_method_node(
                                 inner,
-                                source,
-                                source_str,
-                                path,
+                                ctx,
                                 &class_id,
                                 &method_decorators,
                                 nodes,
@@ -401,14 +443,15 @@ pub(crate) fn extract_class_node(
 
 pub(crate) fn extract_method_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &PyExtractCtx<'_>,
     class_id: &str,
     decorators: &[String],
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let func_name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
@@ -476,14 +519,15 @@ pub(crate) fn extract_method_node(
 
 pub(crate) fn extract_function_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &PyExtractCtx<'_>,
     file_id: &str,
     decorators: &[String],
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let func_name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
@@ -546,18 +590,12 @@ pub(crate) fn extract_function_node(
 /// Extract call edges from tree-sitter AST
 pub(crate) fn extract_calls_from_tree(
     root: tree_sitter::Node,
-    source: &[u8],
-    rel_path: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    method_to_class: &HashMap<String, String>,
-    class_parents: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    package_dir: &str,
-    class_init_map: &HashMap<String, Vec<(String, String)>>,
-    node_pkg_map: &HashMap<String, String>,
+    ctx: &PyCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let source = ctx.source;
+    let rel_path = ctx.rel_path;
+
     // Build scope map
     let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
     build_scope_map(root, source, rel_path, &mut scope_map);
@@ -594,13 +632,7 @@ pub(crate) fn extract_calls_from_tree(
                                 resolve_and_add_call_edge(
                                     caller_id,
                                     callee_name,
-                                    func_name_map,
-                                    file_func_ids,
-                                    file_imported_names,
-                                    rel_path,
-                                    package_dir,
-                                    class_init_map,
-                                    node_pkg_map,
+                                    ctx,
                                     false,
                                     edges,
                                 );
@@ -620,23 +652,14 @@ pub(crate) fn extract_calls_from_tree(
                                         caller_id,
                                         method_name,
                                         caller_class.as_deref(),
-                                        func_name_map,
-                                        method_to_class,
-                                        class_parents,
-                                        file_func_ids,
+                                        ctx,
                                         edges,
                                     );
                                 } else if !method_name.is_empty() && !is_python_builtin(method_name) {
                                     resolve_and_add_call_edge(
                                         caller_id,
                                         method_name,
-                                        func_name_map,
-                                        file_func_ids,
-                                        file_imported_names,
-                                        rel_path,
-                                        package_dir,
-                                        class_init_map,
-                                        node_pkg_map,
+                                        ctx,
                                         true,
                                         edges,
                                     );
@@ -803,16 +826,18 @@ pub(crate) fn is_common_dunder(name: &str) -> bool {
 pub(crate) fn resolve_and_add_call_edge(
     caller_id: &str,
     callee_name: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    rel_path: &str,
-    package_dir: &str,
-    class_init_map: &HashMap<String, Vec<(String, String)>>,
-    node_pkg_map: &HashMap<String, String>,
+    ctx: &PyCallCtx<'_>,
     is_attribute_call: bool,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let func_name_map = ctx.func_name_map;
+    let file_func_ids = ctx.file_func_ids;
+    let file_imported_names = ctx.file_imported_names;
+    let rel_path = ctx.rel_path;
+    let package_dir = ctx.package_dir;
+    let class_init_map = ctx.class_init_map;
+    let node_pkg_map = ctx.node_pkg_map;
+
     if let Some(callee_ids) = func_name_map.get(callee_name) {
         let same_file: Vec<&String> = callee_ids
             .iter()
@@ -843,10 +868,20 @@ pub(crate) fn resolve_and_add_call_edge(
             3
         };
 
+        // Confidence ladder for resolved-target calls (graduated by scope):
+        //   same_file = 0.8  >  imported = 0.75  >  same_pkg = 0.7
+        // Mirrors the Rust extractor's ladder (rust_lang.rs:1855 — 0.9/0.8/0.7)
+        // for consistent cross-language semantics. ISS-043 fix: previously
+        // `imported` was 0.8 (same as same_file — typo), collapsing the top
+        // two tiers; restored to a strict descent with imported=0.75.
+        // The trailing `attribute = 0.3` and `unknown = 0.5` rungs are
+        // *unresolved*-target heuristics and intentionally not part of the
+        // resolved-scope ladder above (attribute calls signal a strong
+        // wrong-target risk, hence ranked below generic unknown names).
         let confidence = if !same_file.is_empty() {
             0.8_f32
         } else if !imported.is_empty() {
-            0.8
+            0.75
         } else if !same_pkg.is_empty() {
             0.7
         } else if is_attribute_call {
@@ -914,7 +949,7 @@ pub(crate) fn resolve_and_add_call_edge(
             };
             let same_pkg: Vec<&str> = init_entries
                 .iter()
-                .filter(|(fp, _)| fp.rsplitn(2, '/').nth(1).unwrap_or("") == package_dir)
+                .filter(|(fp, _)| fp.rsplit_once('/').map(|x| x.0).unwrap_or("") == package_dir)
                 .map(|(_, id)| id.as_str())
                 .collect();
 
@@ -953,12 +988,14 @@ pub(crate) fn resolve_self_method_call(
     caller_id: &str,
     method_name: &str,
     caller_class: Option<&str>,
-    func_name_map: &HashMap<String, Vec<String>>,
-    method_to_class: &HashMap<String, String>,
-    class_parents: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
+    ctx: &PyCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let func_name_map = ctx.func_name_map;
+    let method_to_class = ctx.method_to_class;
+    let class_parents = ctx.class_parents;
+    let file_func_ids = ctx.file_func_ids;
+
     if let Some(callee_ids) = func_name_map.get(method_name) {
         if let Some(class_id) = caller_class {
             let mut valid_classes = vec![class_id.to_string()];
@@ -1188,5 +1225,132 @@ pub(crate) fn is_stdlib(module: &str) -> bool {
 
     let first_part = module.split('.').next().unwrap_or(module);
     stdlib_prefixes.contains(&first_part)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the Python call-resolution confidence ladder.
+    //!
+    //! Regression tests for ISS-043: prior to the fix, the `imported` branch in
+    //! `resolve_and_add_call_edge` returned the same 0.8 confidence as `same_file`,
+    //! collapsing the top two tiers of the resolution ladder. These tests assert
+    //! strict ordering — `same_file > imported > same_pkg` — by driving the
+    //! resolver through scenarios where exactly one tier should win, and inspecting
+    //! the confidence on the produced `Calls` edge.
+    use super::*;
+
+    /// Drive `resolve_and_add_call_edge` for a single callee that lives in
+    /// `defining_file` (with optional package), called from `caller_file`, and
+    /// optionally imported into `caller_file`. Returns the confidence written
+    /// onto the produced edge.
+    fn confidence_for(
+        caller_file: &str,
+        caller_pkg: &str,
+        defining_file: &str,
+        defining_pkg: &str,
+        imported_in_caller: bool,
+    ) -> f32 {
+        let callee_name = "do_thing";
+        let caller_id = format!("func:{}:caller", caller_file);
+        let callee_id = format!("func:{}:{}", defining_file, callee_name);
+
+        let mut func_name_map: HashMap<String, Vec<String>> = HashMap::new();
+        func_name_map.insert(callee_name.to_string(), vec![callee_id.clone()]);
+
+        // file_func_ids is the set of function ids defined in the *caller's* file.
+        // Same-file resolution wins iff the callee_id is also in this set.
+        let mut file_func_ids: HashSet<String> = HashSet::new();
+        if caller_file == defining_file {
+            file_func_ids.insert(callee_id.clone());
+        }
+
+        let mut file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
+        if imported_in_caller {
+            let mut names = HashSet::new();
+            names.insert(callee_name.to_string());
+            file_imported_names.insert(caller_file.to_string(), names);
+        }
+
+        let class_init_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut node_pkg_map: HashMap<String, String> = HashMap::new();
+        node_pkg_map.insert(callee_id.clone(), defining_pkg.to_string());
+
+        let mut edges: Vec<CodeEdge> = Vec::new();
+
+        let empty_method_to_class: HashMap<String, String> = HashMap::new();
+        let empty_class_parents: HashMap<String, Vec<String>> = HashMap::new();
+
+        let py_call_ctx = PyCallCtx {
+            source: b"",
+            rel_path: caller_file,
+            package_dir: caller_pkg,
+            func_name_map: &func_name_map,
+            method_to_class: &empty_method_to_class,
+            class_parents: &empty_class_parents,
+            file_func_ids: &file_func_ids,
+            file_imported_names: &file_imported_names,
+            class_init_map: &class_init_map,
+            node_pkg_map: &node_pkg_map,
+        };
+
+        resolve_and_add_call_edge(
+            &caller_id,
+            callee_name,
+            &py_call_ctx,
+            /* is_attribute_call = */ false,
+            &mut edges,
+        );
+
+        let edge = edges
+            .iter()
+            .find(|e| e.relation == EdgeRelation::Calls && e.to == callee_id)
+            .expect("expected a Calls edge to the resolved callee");
+        edge.confidence
+    }
+
+    /// ISS-043 regression: same_file resolution must outrank imported, which
+    /// must in turn outrank same_pkg. Prior to the fix, same_file and imported
+    /// both produced 0.8, collapsing the ladder.
+    #[test]
+    fn iss_043_call_confidence_ladder_is_strictly_ordered() {
+        // same_file: callee defined in the very file the caller lives in.
+        let same_file = confidence_for(
+            "pkg/mod.py", "pkg", "pkg/mod.py", "pkg", /* imported = */ false,
+        );
+
+        // imported: callee defined in a *different* file, but imported into
+        // the caller's file. To isolate this from same_pkg, put the definer
+        // in a different package directory.
+        let imported = confidence_for(
+            "pkg/mod.py", "pkg", "other/lib.py", "other", /* imported = */ true,
+        );
+
+        // same_pkg: callee in a sibling file in the same package directory,
+        // not imported.
+        let same_pkg = confidence_for(
+            "pkg/mod.py", "pkg", "pkg/sibling.py", "pkg", /* imported = */ false,
+        );
+
+        assert!(
+            same_file > imported,
+            "same_file ({}) must be strictly greater than imported ({}) — \
+             ISS-043 regression: ladder has collapsed",
+            same_file,
+            imported,
+        );
+        assert!(
+            imported > same_pkg,
+            "imported ({}) must be strictly greater than same_pkg ({}) — \
+             ISS-043 regression: ladder has collapsed",
+            imported,
+            same_pkg,
+        );
+
+        // Pin the exact ladder values so accidental future edits to the
+        // numerics surface immediately.
+        assert_eq!(same_file, 0.8_f32, "same_file confidence drifted from 0.8");
+        assert_eq!(imported, 0.75_f32, "imported confidence drifted from 0.75");
+        assert_eq!(same_pkg, 0.7_f32, "same_pkg confidence drifted from 0.7");
+    }
 }
 

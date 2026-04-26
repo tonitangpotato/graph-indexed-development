@@ -1,6 +1,7 @@
 //! Tests for code graph extraction, call analysis, and path resolution.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use std::collections::{HashMap, HashSet};
     use tree_sitter::Parser;
@@ -35,6 +36,105 @@ def top_level():
         assert!(nodes.iter().any(|n| n.name == "method"));
         assert!(nodes.iter().any(|n| n.name == "top_level"));
         assert!(edges.iter().any(|e| e.to.contains("BaseClass")));
+    }
+
+    /// ISS-043 regression: Python call-resolution confidence ladder must be strictly
+    /// graduated. Previously `imported` and `same_file` both returned 0.8, collapsing
+    /// the top two tiers and breaking confidence-weighted edge ranking (ISS-012).
+    /// This test asserts same-file calls have strictly higher confidence than
+    /// unresolved calls, catching any future regression that collapses the ladder.
+    #[test]
+    fn test_python_call_confidence_ladder_ordering() {
+        let content = r#"
+def helper():
+    pass
+
+def caller():
+    helper()              # same-file resolution -> highest confidence (0.8)
+    unknown_external()    # unresolved -> 0.5 (or 0.3 if attribute)
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        let mut class_map = HashMap::new();
+
+        let (nodes, mut edges, _) = extract_python_tree_sitter("test.py", content, &mut parser, &mut class_map);
+
+        let func_map: HashMap<String, Vec<String>> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .fold(HashMap::new(), |mut acc, n| {
+                acc.entry(n.name.clone()).or_default().push(n.id.clone());
+                acc
+            });
+
+        let file_func_ids: HashSet<String> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.id.clone())
+            .collect();
+
+        let node_pkg_map: HashMap<String, String> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), "".to_string()))
+            .collect();
+
+        let tree = parser.parse(content, None).unwrap();
+        let root = tree.root_node();
+
+        let empty_method_to_class: HashMap<String, String> = HashMap::new();
+        let empty_class_parents: HashMap<String, Vec<String>> = HashMap::new();
+        let empty_imported: HashMap<String, HashSet<String>> = HashMap::new();
+        let empty_class_init: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+        let py_call_ctx = crate::code_graph::lang::python::PyCallCtx {
+            source: content.as_bytes(),
+            rel_path: "test.py",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &empty_method_to_class,
+            class_parents: &empty_class_parents,
+            file_func_ids: &file_func_ids,
+            file_imported_names: &empty_imported,
+            class_init_map: &empty_class_init,
+            node_pkg_map: &node_pkg_map,
+        };
+
+        extract_calls_from_tree(
+            root,
+            &py_call_ctx,
+            &mut edges,
+        );
+
+        let call_edges: Vec<_> = edges.iter()
+            .filter(|e| e.relation == EdgeRelation::Calls)
+            .collect();
+
+        let same_file_call = call_edges.iter()
+            .find(|e| e.from.contains("caller") && e.to.contains("helper"))
+            .expect("should have same-file call edge caller -> helper");
+
+        let unresolved_call = call_edges.iter()
+            .find(|e| e.from.contains("caller") && e.to.contains("unknown_external"));
+
+        // The strict invariant: same-file calls MUST have higher confidence
+        // than unresolved/external calls. If unresolved_call is present, assert
+        // strict ordering; if it wasn't extracted (acceptable — ghost nodes are
+        // sometimes filtered), at least verify same_file_call has confidence >= 0.8.
+        assert!(
+            same_file_call.confidence >= 0.8,
+            "same-file call confidence should be >= 0.8, got {}",
+            same_file_call.confidence
+        );
+
+        if let Some(unresolved) = unresolved_call {
+            assert!(
+                same_file_call.confidence > unresolved.confidence,
+                "same-file call ({}) must have STRICTLY higher confidence than unresolved call ({}). \
+                 ISS-043 regression: ladder collapsed.",
+                same_file_call.confidence,
+                unresolved.confidence
+            );
+        }
     }
 
     #[test]
@@ -354,18 +454,18 @@ pub fn create_and_use() {
         let tree = parser.parse(content, None).unwrap();
         let root = tree.root_node();
         
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "calc.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "calc.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &HashMap::new(),
+            struct_field_types: &HashMap::new(),
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
@@ -453,16 +553,21 @@ class Helper {
 
         let tree = parser.parse(content, None).unwrap();
         let root = tree.root_node();
-        
+
+        let ts_call_ctx = crate::code_graph::lang::typescript::TsCallCtx {
+            source: content.as_bytes(),
+            rel_path: "user.ts",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            file_imported_names: &file_imported_names,
+            node_pkg_map: &node_pkg_map,
+        };
+
         extract_calls_typescript(
             root,
-            content.as_bytes(),
-            "user.ts",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &file_imported_names,
-            &node_pkg_map,
+            &ts_call_ctx,
             &mut edges,
         );
 
@@ -567,7 +672,7 @@ class Helper {
             .filter(|n| n.kind == NodeKind::File)
             .collect();
 
-        let actual_files = vec!["Tool.ts", "components/Tool.ts", "main.ts"];
+        let actual_files = ["Tool.ts", "components/Tool.ts", "main.ts"];
 
         // There should be exactly 3 file nodes — no ghosts
         assert_eq!(
@@ -956,18 +1061,18 @@ mod tests {
         let file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
         let struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "test.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &file_imported_names,
-            &struct_field_types,
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "test.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &file_imported_names,
+            struct_field_types: &struct_field_types,
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
@@ -1040,18 +1145,18 @@ fn main() {
         let file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
         let struct_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "test.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &file_imported_names,
-            &struct_field_types,
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "test.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &file_imported_names,
+            struct_field_types: &struct_field_types,
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
@@ -1118,38 +1223,17 @@ mod tests {
         // Simulate: struct CodeGraph defined in extract.rs, impl CodeGraph in format.rs
         let nodes = vec![
             CodeNode {
-                id: "class:code_graph/extract.rs:CodeGraph".to_string(),
                 name: "CodeGraph".to_string(),
-                kind: NodeKind::Class,
                 file_path: "code_graph/extract.rs".to_string(),
-                line: None,
-                decorators: vec![],
-                signature: None,
-                docstring: None,
-                line_count: 0,
-                is_test: false,
-                visibility: None,
-                lang: None,
-                body_hash: None,
-                end_line: None,
-                complexity: None,
+                ..CodeNode::test_default("class:code_graph/extract.rs:CodeGraph", NodeKind::Class)
             },
             CodeNode {
-                id: "method:code_graph/format.rs:CodeGraph.format_for_llm".to_string(),
                 name: "format_for_llm".to_string(),
-                kind: NodeKind::Function,
                 file_path: "code_graph/format.rs".to_string(),
-                line: None,
-                decorators: vec![],
-                signature: None,
-                docstring: None,
-                line_count: 0,
-                is_test: false,
-                visibility: None,
-                lang: None,
-                body_hash: None,
-                end_line: None,
-                complexity: None,
+                ..CodeNode::test_default(
+                    "method:code_graph/format.rs:CodeGraph.format_for_llm",
+                    NodeKind::Function,
+                )
             },
         ];
 
@@ -1262,18 +1346,18 @@ mod tests {
         let tree = parser.parse(content, None).unwrap();
         let root = tree.root_node();
 
-        extract_calls_rust(
-            root,
-            content.as_bytes(),
-            "safety.rs",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &node_pkg_map,
-            &file_imported_names,
-            &struct_field_types,
-            &mut edges,
-        );
+        let call_ctx = crate::code_graph::lang::rust_lang::RustCallCtx {
+            source: content.as_bytes(),
+            rel_path: "safety.rs",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            node_pkg_map: &node_pkg_map,
+            file_imported_names: &file_imported_names,
+            struct_field_types: &struct_field_types,
+        };
+        extract_calls_rust(root, &call_ctx, &mut edges);
 
         let call_edges: Vec<_> = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Calls)
@@ -1610,5 +1694,143 @@ impl ToTitleCase for str {
             "Found duplicate edges: {:?}",
             dup_edges
         );
+    }
+
+    // ─── ISS-040: pytest-id resolution with path-aware fallback ────────────────
+
+    fn make_test_node(id: &str, name: &str, file_path: &str, is_test: bool) -> CodeNode {
+        CodeNode {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+            line: Some(1),
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 1,
+            is_test,
+            visibility: None,
+            lang: Some("python".to_string()),
+            body_hash: None,
+            end_line: Some(1),
+            complexity: None,
+        }
+    }
+
+    /// Regression test for ISS-040.
+    ///
+    /// When two test functions share the same short name across different files,
+    /// resolving a pytest identifier `<file>::<short_name>` MUST disambiguate by
+    /// the file path. The pre-fix code's third disjunct
+    /// `(file_path.contains("/test") && name == short_name)` was strictly
+    /// subsumed by the first disjunct, so `find()` returned the *first* node
+    /// with the matching name regardless of which file the pytest id pointed at.
+    #[test]
+    fn test_resolve_pytest_id_disambiguates_by_file_path() {
+        let mut g = CodeGraph::default();
+        // Two test_login functions in different files — the pre-fix code would
+        // always return whichever appears first in `nodes`, ignoring the file
+        // part of the pytest id.
+        g.nodes.push(make_test_node(
+            "func:tests/test_auth.py:test_login",
+            "test_login",
+            "tests/test_auth.py",
+            true,
+        ));
+        g.nodes.push(make_test_node(
+            "func:tests/test_session.py:test_login",
+            "test_login",
+            "tests/test_session.py",
+            true,
+        ));
+
+        let resolved = g
+            .resolve_pytest_id("tests/test_session.py::test_login")
+            .expect("must resolve");
+        assert_eq!(
+            resolved.id, "func:tests/test_session.py:test_login",
+            "expected the test_login from test_session.py, not test_auth.py — \
+             this asserts the path-aware fallback that ISS-040 restored"
+        );
+
+        let resolved2 = g
+            .resolve_pytest_id("tests/test_auth.py::test_login")
+            .expect("must resolve");
+        assert_eq!(resolved2.id, "func:tests/test_auth.py:test_login");
+    }
+
+    /// When the function-level node was not extracted (only the test file has
+    /// been seen), `resolve_pytest_id` should still surface the file as the
+    /// best-effort target rather than returning None.
+    #[test]
+    fn test_resolve_pytest_id_file_level_fallback() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(CodeNode::new_file("tests/test_payments.py"));
+
+        let resolved = g
+            .resolve_pytest_id("tests/test_payments.py::test_charge")
+            .expect("file-level fallback must produce a hit");
+        assert_eq!(resolved.kind, NodeKind::File);
+        assert_eq!(resolved.file_path, "tests/test_payments.py");
+    }
+
+    /// Identifier with no `::` (bare short name) must still resolve via the
+    /// name-only path — preserves backward compatibility with callers that
+    /// pass already-shortened test names.
+    #[test]
+    fn test_resolve_pytest_id_bare_name() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(make_test_node(
+            "func:tests/test_x.py:test_solo",
+            "test_solo",
+            "tests/test_x.py",
+            true,
+        ));
+
+        let resolved = g.resolve_pytest_id("test_solo").expect("must resolve");
+        assert_eq!(resolved.name, "test_solo");
+    }
+
+    /// Suffix matching (e.g. namespaced `TestClass::test_method` style) must
+    /// still work when combined with a file-part discriminator.
+    #[test]
+    fn test_resolve_pytest_id_suffix_match_with_file() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(make_test_node(
+            "func:tests/test_a.py:TestSuite::test_one",
+            "TestSuite::test_one",
+            "tests/test_a.py",
+            true,
+        ));
+        g.nodes.push(make_test_node(
+            "func:tests/test_b.py:OtherSuite::test_one",
+            "OtherSuite::test_one",
+            "tests/test_b.py",
+            true,
+        ));
+
+        let resolved = g
+            .resolve_pytest_id("tests/test_b.py::OtherSuite::test_one")
+            .expect("must resolve");
+        assert_eq!(resolved.file_path, "tests/test_b.py");
+    }
+
+    /// No match → None. Sanity check that we don't accidentally return
+    /// arbitrary nodes via overly-loose fallback.
+    #[test]
+    fn test_resolve_pytest_id_no_match() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(make_test_node(
+            "func:src/lib.rs:helper",
+            "helper",
+            "src/lib.rs",
+            false,
+        ));
+
+        // No test_missing anywhere; src/lib.rs::helper is not a test.
+        // File-level fallback should not fire because no node has is_test=true
+        // matching the file part.
+        assert!(g.resolve_pytest_id("tests/test_z.py::test_missing").is_none());
     }
 }

@@ -192,13 +192,12 @@ impl CodeGraph {
         for node in &results {
             if node.kind == NodeKind::File {
                 for edge in self.outgoing_edges(&node.id) {
-                    if edge.relation == EdgeRelation::Imports {
-                        if !current_ids.contains(&edge.to) {
+                    if edge.relation == EdgeRelation::Imports
+                        && !current_ids.contains(&edge.to) {
                             if let Some(imported) = self.node_by_id(&edge.to) {
                                 import_additions.push(imported);
                             }
                         }
-                    }
                 }
             }
         }

@@ -12,8 +12,8 @@ use gid_core::graph::{Graph, Node, Edge};
 use gid_core::infer::{
     self, InferConfig, InferLevel,
     clustering::ClusterConfig,
-    integration::{merge_into_graph, format_output, InferResult, OutputFormat},
-    labeling::{LabelingConfig, LabelingResult, SimpleLlm},
+    integration::{merge_into_graph, format_output, OutputFormat},
+    labeling::{LabelingConfig, SimpleLlm},
 };
 
 // ── Mock LLM for e2e tests ────────────────────────────────────────────────
