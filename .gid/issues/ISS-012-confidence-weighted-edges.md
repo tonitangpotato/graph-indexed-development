@@ -86,7 +86,7 @@ if direct_high_confidence_pairs.contains(&pair_key) {
 
 ## Design Decisions
 
-- **Threshold 0.7 for citers:** Generous enough to include "pretty confident" tree-sitter results but excludes wild guesses. Could be made configurable via `InferConfig` in the future (see ISS-002 for configurable edge weights).
+- **Threshold 0.7 for citers:** Generous enough to include "pretty confident" tree-sitter results but excludes wild guesses. Could be made configurable via `InferConfig` in the future (see ISS-049 for configurable edge weights).
 - **Threshold 0.9 for suppression:** Higher bar because suppressing co-citation removes signal — only do it when we're very sure the direct edge is ground truth.
 - **Geometric mean for confidence scaling:** `sqrt(conf_a × conf_b)` penalizes asymmetric confidence (one strong + one weak citer) more than arithmetic mean. If A→target is 1.0 but B→target is 0.7, the shared citation strength is 0.837, not 0.85.
 - **`unwrap_or(1.0)`:** Legacy edges without confidence are assumed reliable. This preserves existing behavior for all pre-ISS-012 graphs.

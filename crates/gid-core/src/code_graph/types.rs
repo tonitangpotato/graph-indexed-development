@@ -370,7 +370,7 @@ impl CodeNode {
     /// ```
     ///
     /// When new fields are added to `CodeNode`, only this helper needs updating —
-    /// not every test instantiation. See ISS-001.
+    /// not every test instantiation. See ISS-048.
     pub fn test_default(id: &str, kind: NodeKind) -> Self {
         Self {
             id: id.to_string(),

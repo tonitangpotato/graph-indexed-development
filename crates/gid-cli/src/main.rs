@@ -621,7 +621,7 @@ enum Commands {
         ///   --edge-weight calls=1.5 --edge-weight imports=0.5
         ///
         /// Unknown relations (not in defaults) are added; existing ones are
-        /// overridden. Set to 0 to ignore a relation entirely. (ISS-002)
+        /// overridden. Set to 0 to ignore a relation entirely. (ISS-049)
         #[arg(long = "edge-weight", value_name = "RELATION=WEIGHT")]
         edge_weights: Vec<String>,
     },
@@ -4832,7 +4832,7 @@ async fn cmd_infer(
         cluster_config.max_cluster_size = Some(n);
     }
 
-    // Parse --edge-weight RELATION=WEIGHT overrides (ISS-002).
+    // Parse --edge-weight RELATION=WEIGHT overrides (ISS-049).
     // Each entry overrides one relation's weight. Setting weight=0 effectively
     // ignores that relation (build_network skips zero-weight edges).
     for spec in &edge_weight_overrides {

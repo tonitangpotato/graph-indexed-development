@@ -1,4 +1,7 @@
-# ISS-002: Clustering Edge Weights Should Be Configurable
+# ISS-049: Clustering Edge Weights Should Be Configurable
+
+> **Renumbering note (2026-04-26):** Originally filed as ISS-002 on `iss-001-002-revive` branch, accidentally reusing a closed issue number. Renumbered to ISS-049 to preserve the historical ISS-002 (LSP client / receiver-type matching). Content unchanged.
+
 
 **Status:** closed
 **Reported:** 2026-04-05

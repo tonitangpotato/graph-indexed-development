@@ -68,7 +68,7 @@ Compare Infomap output (before orphan reassignment) at different τ values on Cl
 ## Related Issues
 
 - ISS-003: Orphan reassignment bugs (downstream — fixes symptoms ISS-004 creates)
-- ISS-002: Configurable edge weights (complementary tuning)
+- ISS-049: Configurable edge weights (complementary tuning)
 - ISS-005: Directory co-location edges (alternative signal for sparse subgraphs)
 
 ## Priority

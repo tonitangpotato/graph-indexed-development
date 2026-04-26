@@ -59,7 +59,7 @@ Default weight: **0.3** (higher than `defined_in` at 0.2, lower than `depends_on
 
 Rationale: Directory co-location is a meaningful but weaker signal than explicit code dependencies. It should influence clustering when explicit edges are absent, but not override strong import/call patterns.
 
-Should be configurable via `ClusterConfig` (ties into ISS-002).
+Should be configurable via `ClusterConfig` (ties into ISS-049).
 
 ### 3. Depth-aware weighting (optional enhancement)
 
@@ -90,7 +90,7 @@ On Claude Code's 1,902-file graph:
 
 - ISS-003: Orphan reassignment bugs (directory fallback in ISS-003 is a bandaid; ISS-005 is the proper fix upstream)
 - ISS-004: Teleportation rate (co-location edges help Infomap detect communities even at higher τ)
-- ISS-002: Configurable edge weights (co-location weight should be configurable too)
+- ISS-049: Configurable edge weights (co-location weight should be configurable too)
 
 ## Priority
 
@@ -98,6 +98,6 @@ On Claude Code's 1,902-file graph:
 
 ## Execution Order
 
-Recommended: ISS-003 (P0) → ISS-004 (P1) → ISS-005 (P1) → ISS-002 (P1, enables tuning all weights)
+Recommended: ISS-003 (P0) → ISS-004 (P1) → ISS-005 (P1) → ISS-049 (P1, enables tuning all weights)
 
 ## Status: Done

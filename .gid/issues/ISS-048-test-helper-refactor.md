@@ -1,4 +1,7 @@
-# ISS-001: CodeNode Test Helper / Builder Pattern Refactor
+# ISS-048: CodeNode Test Helper / Builder Pattern Refactor
+
+> **Renumbering note (2026-04-26):** Originally filed as ISS-001 on `iss-001-002-revive` branch, accidentally reusing a closed issue number. Renumbered to ISS-048 to preserve the historical ISS-001 (`gid extract --output` flag bug). Content unchanged.
+
 
 **Status:** closed
 **Reported:** 2026-04-02

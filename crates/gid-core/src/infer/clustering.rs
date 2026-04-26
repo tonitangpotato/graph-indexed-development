@@ -48,7 +48,7 @@ pub const SYMBOL_MIN_JACCARD: f64 = 0.15;
 ///
 /// **Note:** This is a convenience wrapper over [`default_edge_weights`].
 /// Production code paths should consult [`ClusterConfig::edge_weights`] so
-/// users can tune per-project weights via CLI / config (ISS-002).
+/// users can tune per-project weights via CLI / config (ISS-049).
 pub fn relation_weight(relation: &str) -> f64 {
     // Match the default map exactly. Inlined here to keep the function cheap
     // (no HashMap allocation per call) for hot diagnostic / display paths.
@@ -139,7 +139,7 @@ pub struct ClusterConfig {
     /// naturally has a few imports. The effective cutoff is
     /// `max(threshold * total_files, hub_min_degree)`.
     pub hub_min_degree: usize,
-    /// Per-relation edge weight overrides (ISS-002).
+    /// Per-relation edge weight overrides (ISS-049).
     ///
     /// Keys are edge `relation` strings (e.g. `"calls"`, `"imports"`,
     /// `"type_reference"`); values are the weight applied to that edge in
@@ -245,7 +245,7 @@ impl ClusterResult {
 /// Build an Infomap [`Network`] from a [`Graph`], collapsing non-file nodes
 /// onto their parent files.
 ///
-/// Edge weights are looked up from `config.edge_weights` (ISS-002). Relations
+/// Edge weights are looked up from `config.edge_weights` (ISS-049). Relations
 /// not present in the map are treated as weight `0.0` and skipped — pass
 /// [`ClusterConfig::default`] to use the built-in defaults.
 ///
@@ -304,7 +304,7 @@ pub fn build_network(graph: &Graph, config: &ClusterConfig) -> (Network, Vec<Str
     // tree-sitter heuristic edges (confidence 0.3–0.7). Edges without an
     // explicit confidence field are treated as confidence = 1.0 (legacy/manual
     // edges are assumed reliable). Relations missing from `edge_weights` are
-    // skipped (treated as weight 0.0) — see ISS-002.
+    // skipped (treated as weight 0.0) — see ISS-049.
     let mut edge_weights: HashMap<(usize, usize), f64> = HashMap::new();
 
     for edge in &graph.edges {
@@ -2409,7 +2409,7 @@ mod tests {
         );
     }
 
-    // ── 3b. test_build_network_respects_edge_weight_overrides (ISS-002) ─
+    // ── 3b. test_build_network_respects_edge_weight_overrides (ISS-049) ─
 
     #[test]
     fn test_build_network_respects_edge_weight_overrides() {
@@ -2442,7 +2442,7 @@ mod tests {
         );
     }
 
-    // ── 3c. test_build_network_zero_weight_skips_edge (ISS-002) ────────
+    // ── 3c. test_build_network_zero_weight_skips_edge (ISS-049) ────────
 
     #[test]
     fn test_build_network_zero_weight_skips_edge() {
@@ -2459,7 +2459,7 @@ mod tests {
         assert_eq!(net.num_edges(), 0, "zero-weight relations must be skipped");
     }
 
-    // ── 3d. test_default_edge_weights_matches_relation_weight (ISS-002) ─
+    // ── 3d. test_default_edge_weights_matches_relation_weight (ISS-049) ─
 
     #[test]
     fn test_default_edge_weights_matches_relation_weight() {

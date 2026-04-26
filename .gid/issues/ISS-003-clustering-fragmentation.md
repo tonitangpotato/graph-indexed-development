@@ -76,7 +76,7 @@ Re-run on Claude Code's 1,902-file graph:
 
 ## Related Issues
 
-- ISS-002: Configurable edge weights (complementary, not blocking)
+- ISS-049: Configurable edge weights (complementary, not blocking)
 - ISS-004: Teleportation rate too high (amplifies fragmentation)
 - ISS-005: Directory co-location signal missing (no fallback for sparse edges)
 
