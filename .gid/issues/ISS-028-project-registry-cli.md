@@ -1,6 +1,6 @@
 # ISS-028: gid CLI `project` subcommand + `~/.config/gid/projects.yml`
 
-**Status:** open
+**Status:** closed (2026-04-26 — `gid project` subcommand wired in main.rs:4565 `cmd_project`; `project_registry` module in gid-core; verified `gid project list` returns 7 registered projects from ~/.config/gid/projects.yml; commit f540176)
 **Created**: 2026-04-23
 **Reporter**: potato
 **Severity**: medium

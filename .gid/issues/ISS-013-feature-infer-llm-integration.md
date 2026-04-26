@@ -1,6 +1,6 @@
 # ISS-013: Feature Infer LLM Integration (CliLlm Deadlock)
 
-**Status:** open
+**Status:** closed (2026-04-26 — Layer 1 done in rustclaw `src/tools.rs:5491` `RustClawSimpleLlm` injected at gid_infer call site; Layer 2 standalone CLI `AnthropicLlm` deferred until external user files it)
 **Reported:** ~2026-04-10
 **Note**: ISS-013 number was previously used for SQLite backend extract issue (closed in commit a78b49b 2026-04-09, see issues-index.md). This file describes a separate later issue with the same number.
 
