@@ -8,6 +8,34 @@ use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
 
+// ─── Extraction Context (ISS-046) ───
+//
+// Mirrors the rust_lang.rs / python.rs pattern. Aggregates per-file
+// immutable inputs to keep extractor signatures small.
+//
+// `TsExtractCtx`: shared by `extract_typescript_node` /
+// `extract_typescript_class`.
+// `TsCallCtx`: shared by `extract_calls_typescript` /
+// `resolve_typescript_call_edge`. `edges` stays as a separate
+// `&mut` parameter so the ctx can stay shared while edges are appended.
+
+pub(crate) struct TsExtractCtx<'a> {
+    pub source: &'a [u8],
+    pub source_str: &'a str,
+    pub path: &'a str,
+}
+
+pub(crate) struct TsCallCtx<'a> {
+    pub source: &'a [u8],
+    pub rel_path: &'a str,
+    pub package_dir: &'a str,
+    pub func_name_map: &'a HashMap<String, Vec<String>>,
+    pub method_to_class: &'a HashMap<String, String>,
+    pub file_func_ids: &'a HashSet<String>,
+    pub file_imported_names: &'a HashMap<String, HashSet<String>>,
+    pub node_pkg_map: &'a HashMap<String, String>,
+}
+
 /// Determine TypeScript/JavaScript visibility based on parent context.
 fn extract_ts_visibility(node: tree_sitter::Node) -> String {
     // If parent is export_statement, it's exported
@@ -74,13 +102,17 @@ pub(crate) fn extract_typescript_tree_sitter(
     let source = content.as_bytes();
     let root = tree.root_node();
 
+    let ctx = TsExtractCtx {
+        source,
+        source_str: content,
+        path,
+    };
+
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         extract_typescript_node(
             child,
-            source,
-            content,
-            path,
+            &ctx,
             &file_id,
             &mut nodes,
             &mut edges,
@@ -95,15 +127,16 @@ pub(crate) fn extract_typescript_tree_sitter(
 /// Extract TypeScript/JavaScript nodes from AST
 pub(crate) fn extract_typescript_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &TsExtractCtx<'_>,
     file_id: &str,
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
     class_id_map: &mut HashMap<String, String>,
     imports: &mut HashSet<String>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let text = |n: tree_sitter::Node| -> String {
         n.utf8_text(source).unwrap_or("").to_string()
     };
@@ -163,11 +196,11 @@ pub(crate) fn extract_typescript_node(
         }
 
         "class_declaration" | "class" => {
-            extract_typescript_class(node, source, source_str, path, file_id, nodes, edges, class_id_map);
+            extract_typescript_class(node, ctx, file_id, nodes, edges, class_id_map);
         }
 
         "abstract_class_declaration" => {
-            extract_typescript_class(node, source, source_str, path, file_id, nodes, edges, class_id_map);
+            extract_typescript_class(node, ctx, file_id, nodes, edges, class_id_map);
         }
 
         "interface_declaration" => {
@@ -365,7 +398,7 @@ pub(crate) fn extract_typescript_node(
                     "interface_declaration" | "function_declaration" | "function" |
                     "lexical_declaration" | "variable_declaration" | "enum_declaration" |
                     "type_alias_declaration" => {
-                        extract_typescript_node(child, source, source_str, path, file_id, nodes, edges, class_id_map, imports);
+                        extract_typescript_node(child, ctx, file_id, nodes, edges, class_id_map, imports);
                     }
                     _ => {}
                 }
@@ -376,7 +409,7 @@ pub(crate) fn extract_typescript_node(
             // Handle wrapped statements like namespace (which appears as expression_statement → internal_module)
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                extract_typescript_node(child, source, source_str, path, file_id, nodes, edges, class_id_map, imports);
+                extract_typescript_node(child, ctx, file_id, nodes, edges, class_id_map, imports);
             }
         }
 
@@ -416,7 +449,7 @@ pub(crate) fn extract_typescript_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut body_cursor = body.walk();
                 for body_child in body.children(&mut body_cursor) {
-                    extract_typescript_node(body_child, source, source_str, path, file_id, nodes, edges, class_id_map, imports);
+                    extract_typescript_node(body_child, ctx, file_id, nodes, edges, class_id_map, imports);
                 }
             }
         }
@@ -428,14 +461,15 @@ pub(crate) fn extract_typescript_node(
 /// Extract TypeScript class with methods
 pub(crate) fn extract_typescript_class(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &TsExtractCtx<'_>,
     file_id: &str,
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
     class_id_map: &mut HashMap<String, String>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let name = node.child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
         .unwrap_or("")
@@ -1081,20 +1115,18 @@ pub(crate) fn build_scope_map_typescript(
 /// Extract calls from TypeScript AST
 pub(crate) fn extract_calls_typescript(
     root: tree_sitter::Node,
-    source: &[u8],
-    rel_path: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    method_to_class: &HashMap<String, String>,
-    file_func_ids: &HashSet<String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    node_pkg_map: &HashMap<String, String>,
+    ctx: &TsCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let source = ctx.source;
+    let rel_path = ctx.rel_path;
+    let func_name_map = ctx.func_name_map;
+    let method_to_class = ctx.method_to_class;
+    let file_func_ids = ctx.file_func_ids;
+
     // Build scope map
     let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
     build_scope_map_typescript(root, source, rel_path, &mut scope_map);
-
-    let package_dir = rel_path.rsplit_once('/').map(|x| x.0).unwrap_or("");
 
     // Walk tree looking for calls
     let mut stack = vec![root];
@@ -1128,12 +1160,7 @@ pub(crate) fn extract_calls_typescript(
                                     resolve_typescript_call_edge(
                                         caller_id,
                                         callee_name,
-                                        func_name_map,
-                                        file_func_ids,
-                                        file_imported_names,
-                                        rel_path,
-                                        package_dir,
-                                        node_pkg_map,
+                                        ctx,
                                         false,
                                         edges,
                                     );
@@ -1169,12 +1196,7 @@ pub(crate) fn extract_calls_typescript(
                                             resolve_typescript_call_edge(
                                                 caller_id,
                                                 method_name,
-                                                func_name_map,
-                                                file_func_ids,
-                                                file_imported_names,
-                                                rel_path,
-                                                package_dir,
-                                                node_pkg_map,
+                                                ctx,
                                                 true,
                                                 edges,
                                             );
@@ -1276,12 +1298,7 @@ pub(crate) fn extract_calls_typescript(
                         resolve_typescript_call_edge(
                             caller_id,
                             tag_name,
-                            func_name_map,
-                            file_func_ids,
-                            file_imported_names,
-                            rel_path,
-                            package_dir,
-                            node_pkg_map,
+                            ctx,
                             false,
                             edges,
                         );
@@ -1304,15 +1321,17 @@ pub(crate) fn extract_calls_typescript(
 pub(crate) fn resolve_typescript_call_edge(
     caller_id: &str,
     callee_name: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    rel_path: &str,
-    package_dir: &str,
-    node_pkg_map: &HashMap<String, String>,
+    ctx: &TsCallCtx<'_>,
     is_method_call: bool,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let func_name_map = ctx.func_name_map;
+    let file_func_ids = ctx.file_func_ids;
+    let file_imported_names = ctx.file_imported_names;
+    let rel_path = ctx.rel_path;
+    let package_dir = ctx.package_dir;
+    let node_pkg_map = ctx.node_pkg_map;
+
     if let Some(callee_ids) = func_name_map.get(callee_name) {
         let same_file: Vec<&String> = callee_ids
             .iter()

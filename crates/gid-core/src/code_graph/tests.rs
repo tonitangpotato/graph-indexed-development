@@ -553,16 +553,21 @@ class Helper {
 
         let tree = parser.parse(content, None).unwrap();
         let root = tree.root_node();
-        
+
+        let ts_call_ctx = crate::code_graph::lang::typescript::TsCallCtx {
+            source: content.as_bytes(),
+            rel_path: "user.ts",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &method_to_class,
+            file_func_ids: &file_func_ids,
+            file_imported_names: &file_imported_names,
+            node_pkg_map: &node_pkg_map,
+        };
+
         extract_calls_typescript(
             root,
-            content.as_bytes(),
-            "user.ts",
-            &func_map,
-            &method_to_class,
-            &file_func_ids,
-            &file_imported_names,
-            &node_pkg_map,
+            &ts_call_ctx,
             &mut edges,
         );
 
