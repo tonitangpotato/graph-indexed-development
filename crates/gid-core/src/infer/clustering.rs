@@ -36,11 +36,11 @@ pub const WEIGHT_SYMBOL_SIMILARITY: f64 = 0.5;
 pub const SYMBOL_MIN_SHARED_TOKENS: usize = 2;
 /// Default minimum Jaccard threshold for symbol similarity edges.
 pub const SYMBOL_MIN_JACCARD: f64 = 0.15;
-/// Legacy constant — no longer used.  Co-location edges now only apply to
-/// code-isolated files (zero edges in the network), so O(n²) explosion in
-/// large directories is structurally impossible.
-#[deprecated(note = "co-location is now isolation-gated; pairwise limit is unnecessary")]
-pub const COLOCATION_PAIRWISE_LIMIT: usize = 80;
+// COLOCATION_PAIRWISE_LIMIT removed in ISS-045 (2026-04-26). Co-location
+// edges are now isolation-gated (only emitted between code-isolated files,
+// where the network has zero edges), so the O(n²) pairwise cap is
+// structurally impossible to hit. The deprecated constant was unused
+// internally and not referenced by any downstream crate (gid-cli, rustclaw).
 
 /// Map an edge relation string to its clustering weight (uses default weights).
 ///

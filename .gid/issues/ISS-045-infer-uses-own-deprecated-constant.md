@@ -1,7 +1,8 @@
 # ISS-045: `infer/mod.rs` re-exports and uses its own deprecated constant `COLOCATION_PAIRWISE_LIMIT`
 
-**Status:** open
+**Status:** closed (2026-04-26)
 **Priority:** P2 (API hygiene — internal use of a constant we've publicly deprecated)
+**Resolution:** Migration was complete (no internal `(c)` uses, no external uses in any tracked project). Hard-removed the constant from `clustering.rs` and the re-export from `infer/mod.rs`. Clippy now clean of the deprecation warning. All 1122 lib tests pass with --all-features.
 **Component:** `crates/gid-core/src/infer/mod.rs` (line 39, re-export); `crates/gid-core/src/infer/clustering.rs` (definition + deprecation attribute)
 **Filed:** 2026-04-26
 **Discovered by:** RustClaw (clippy `deprecated`)
