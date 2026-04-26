@@ -358,6 +358,7 @@ mod tests {
     use crate::code_graph::CodeNode;
     
     #[test]
+    #[allow(deprecated)]
     fn test_build_unified_graph() {
         let mut code_graph = CodeGraph::default();
         code_graph.nodes.push(CodeNode {

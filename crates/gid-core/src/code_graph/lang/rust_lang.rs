@@ -857,6 +857,7 @@ pub(crate) fn extract_rust_regex(path: &str, content: &str) -> (Vec<CodeNode>, V
 /// For `self.client.send()`, receiver is "self.client":
 ///   - Extract field name "client" 
 ///   - Look up impl_type in struct_field_types to find field type
+///
 /// For chained calls like `self.foo.bar.baz()`, uses first field after self.
 /// Returns None if type cannot be inferred.
 pub(crate) fn infer_receiver_type(
@@ -1017,7 +1018,6 @@ pub(crate) fn is_rust_macro_builtin(name: &str) -> bool {
 }
 
 /// Check if a TypeScript/JavaScript call is a builtin to skip
-
 pub(crate) fn build_scope_map_rust(
     node: tree_sitter::Node,
     source: &[u8],

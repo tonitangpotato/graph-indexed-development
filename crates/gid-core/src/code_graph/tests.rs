@@ -1,6 +1,7 @@
 //! Tests for code graph extraction, call analysis, and path resolution.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use std::collections::{HashMap, HashSet};
     use tree_sitter::Parser;

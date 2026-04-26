@@ -950,7 +950,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
         }
 
         // Verify success → Done
-        (Verifying, ShellCompleted { exit_code, .. }) if exit_code == 0 => (
+        (Verifying, ShellCompleted { exit_code: 0, .. }) => (
             state.clone().with_phase(Done),
             vec![
                 Notify { message: "🎉 Ritual complete!".into() },

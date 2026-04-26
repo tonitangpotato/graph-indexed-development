@@ -1775,12 +1775,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    type ScriptedAction = Box<dyn FnMut(&Path) + Send>;
+
     /// Test double for `LlmClient` that runs a caller-supplied closure
     /// inside `run_skill`. The closure receives the working_dir so it can
     /// optionally write files (simulating a real LLM that called Write/Edit)
     /// or do nothing (simulating commentary-only output, the ISS-025 bug).
     struct ScriptedLlm {
-        action: Mutex<Box<dyn FnMut(&Path) + Send>>,
+        action: Mutex<ScriptedAction>,
         tokens: u64,
         tool_calls: usize,
         invocations: AtomicUsize,
@@ -1822,9 +1824,11 @@ mod tests {
     }
 
     fn make_executor_with_llm(root: &Path, llm: Arc<dyn LlmClient>) -> V2Executor {
-        let mut cfg = V2ExecutorConfig::default();
-        cfg.project_root = root.to_path_buf();
-        cfg.llm_client = Some(llm);
+        let cfg = V2ExecutorConfig {
+            project_root: root.to_path_buf(),
+            llm_client: Some(llm),
+            ..V2ExecutorConfig::default()
+        };
         // Ensure the implement skill prompt loader can find *something*.
         // run_skill calls load_skill_prompt; for the implement phase the
         // executor falls back to a built-in prompt template, so no extra

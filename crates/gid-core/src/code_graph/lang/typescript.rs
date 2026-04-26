@@ -946,7 +946,6 @@ pub(crate) fn normalize_ts_module_path(path: &str) -> String {
 // ═══ Call Extraction - Rust ═══
 
 /// Build scope map for Rust — maps line ranges to function IDs
-
 pub(crate) fn build_scope_map_typescript(
     node: tree_sitter::Node,
     source: &[u8],

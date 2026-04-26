@@ -162,6 +162,7 @@ pub trait GraphStorage {
 /// - **FTS Synchronization:** Content-sync triggers fire within the
 ///   transaction, maintaining FTS consistency even on rollback.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Boxing PutNode/SetKnowledge would be a breaking API change; batches are short-lived so the heap savings aren't worth it.
 pub enum BatchOp {
     PutNode(Node),
     DeleteNode(String),

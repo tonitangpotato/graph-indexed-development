@@ -157,8 +157,8 @@ fn extract_design_section(content: &str, design_ref: &str) -> Option<String> {
 
     // Capture until next heading of same or higher (lower number) level
     let mut end_idx = lines.len();
-    for i in (start + 1)..lines.len() {
-        if let Some((level, _)) = parse_heading(lines[i]) {
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
+        if let Some((level, _)) = parse_heading(line) {
             if level <= start_level {
                 end_idx = i;
                 break;
@@ -2154,11 +2154,13 @@ mod tests {
     #[test]
     fn test_relation_is_dominant_factor() {
         // W_RELATION (0.60) is the largest weight — relation tier should be the
-        // primary differentiator, not hop distance alone
-        assert!(W_RELATION > W_PROXIMITY,
-            "W_RELATION ({}) must be > W_PROXIMITY ({})", W_RELATION, W_PROXIMITY);
-        assert!(W_RELATION > W_WEIGHT,
-            "W_RELATION ({}) must be > W_WEIGHT ({})", W_RELATION, W_WEIGHT);
+        // primary differentiator, not hop distance alone.
+        // Compile-time enforced via const assertions below; this test exists
+        // so failures surface in test output with a clear domain message.
+        const _: () = assert!(W_RELATION > W_PROXIMITY,
+            "W_RELATION must be > W_PROXIMITY");
+        const _: () = assert!(W_RELATION > W_WEIGHT,
+            "W_RELATION must be > W_WEIGHT");
     }
 
     // --- Sorting stability: same-scored candidates maintain relative order ---
@@ -3441,6 +3443,7 @@ mod tests {
     // §9 Tests: ContextQuery + Pipeline (assemble_context)
     // =========================================================================
 
+    #[allow(dead_code)]
     fn make_code_node(id: &str, file_path: &str, sig: Option<&str>) -> Node {
         let mut n = Node::new(id, id);
         n.node_type = Some("function".to_string());

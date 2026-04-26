@@ -500,12 +500,10 @@ pub fn add_co_citation_edges(
     // For each pair of candidates, count shared importers and weight by
     // the mean confidence of the citing edges.
     let mut co_citation_edges = 0usize;
-    for i in 0..candidates.len() {
-        let a = candidates[i];
+    for (i, &a) in candidates.iter().enumerate() {
         let citers_a = &imported_by[&a];
 
-        for j in (i + 1)..candidates.len() {
-            let b = candidates[j];
+        for &b in &candidates[i + 1..] {
 
             // Skip pairs already connected by high-confidence direct edges —
             // co-citation would just redundantly echo what LSP already told us.

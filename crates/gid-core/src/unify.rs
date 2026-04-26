@@ -461,18 +461,20 @@ mod tests {
 
     #[test]
     fn test_all_node_kinds() {
-        let mut cg = CodeGraph::default();
-        cg.nodes = vec![
-            CodeNode::new_file("src/lib.rs"),
-            CodeNode::new_class("src/lib.rs", "Foo", 1),
-            CodeNode::new_function("src/lib.rs", "bar", 10, false),
-            CodeNode::new_module("src/mod"),
-            CodeNode::new_constant("src/lib.rs", "MAX", 1),
-            CodeNode::new_interface("src/lib.rs", "IService", 20),
-            CodeNode::new_enum("src/e.rs", "Color", 1),
-            CodeNode::new_type_alias("src/t.rs", "Id", 1),
-            CodeNode::new_trait("src/tr.rs", "Storage", 1),
-        ];
+        let cg = CodeGraph {
+            nodes: vec![
+                CodeNode::new_file("src/lib.rs"),
+                CodeNode::new_class("src/lib.rs", "Foo", 1),
+                CodeNode::new_function("src/lib.rs", "bar", 10, false),
+                CodeNode::new_module("src/mod"),
+                CodeNode::new_constant("src/lib.rs", "MAX", 1),
+                CodeNode::new_interface("src/lib.rs", "IService", 20),
+                CodeNode::new_enum("src/e.rs", "Color", 1),
+                CodeNode::new_type_alias("src/t.rs", "Id", 1),
+                CodeNode::new_trait("src/tr.rs", "Storage", 1),
+            ],
+            ..Default::default()
+        };
         let (nodes, _) = codegraph_to_graph_nodes(&cg, Path::new("/tmp"));
         assert_eq!(nodes.len(), 9);
         // Verify all have extract source
@@ -481,17 +483,19 @@ mod tests {
 
     #[test]
     fn test_edge_metadata_fields() {
-        let mut cg = CodeGraph::default();
-        cg.nodes = vec![
-            CodeNode::new_function("src/a.rs", "foo", 1, false),
-            CodeNode::new_function("src/b.rs", "bar", 1, false),
-        ];
         let mut edge = CodeEdge::new("func:src/a.rs:foo", "func:src/b.rs:bar", EdgeRelation::Calls);
         edge.call_count = 5;
         edge.in_error_path = true;
         edge.confidence = 0.8;
         edge.weight = 0.9;
-        cg.edges = vec![edge];
+        let cg = CodeGraph {
+            nodes: vec![
+                CodeNode::new_function("src/a.rs", "foo", 1, false),
+                CodeNode::new_function("src/b.rs", "bar", 1, false),
+            ],
+            edges: vec![edge],
+            ..CodeGraph::default()
+        };
 
         let (_, edges) = codegraph_to_graph_nodes(&cg, Path::new("/tmp"));
         assert_eq!(edges.len(), 1);

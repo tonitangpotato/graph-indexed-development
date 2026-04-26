@@ -520,7 +520,7 @@ fn remove_phantom_nodes(
 ///   method:X:FooBar.method → class:X:FooBar
 /// But the actual class node is `class:Y:FooBar`. This function remaps these
 /// dangling edges to point to the correct node.
-pub(crate) fn remap_cross_file_impl_edges(edges: &mut Vec<CodeEdge>, nodes: &[CodeNode]) {
+pub(crate) fn remap_cross_file_impl_edges(edges: &mut [CodeEdge], nodes: &[CodeNode]) {
     // Build set of valid node IDs and a map from type_name → actual class node ID
     let valid_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     let mut type_to_class_id: HashMap<&str, &str> = HashMap::new();
@@ -741,8 +741,8 @@ fn generate_rust_tests_for_edges(file_entries: &[(String, String, Language)]) ->
         // also: "src/auth/mod.rs" → "auth"
         let without_prefix = path.strip_prefix("src/").unwrap_or(path);
         let stem = without_prefix.trim_end_matches(".rs");
-        let stem = if stem.ends_with("/mod") {
-            &stem[..stem.len() - 4]
+        let stem = if let Some(stripped) = stem.strip_suffix("/mod") {
+            stripped
         } else {
             stem
         };
@@ -1603,17 +1603,6 @@ impl CodeGraph {
         Some(graph)
     }
 
-    /// Save graph as JSON.
-    fn save_graph_json(graph_path: &Path, graph: &Self) {
-        if let Some(parent) = graph_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string(graph) {
-            if let Err(e) = std::fs::write(graph_path, json) {
-                tracing::warn!("Failed to save graph: {}", e);
-            }
-        }
-    }
 }
 
 /// Compute file delta with mtime-first, hash-second strategy.

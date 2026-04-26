@@ -390,7 +390,7 @@ pub fn analyze(graph: &Graph) -> AnalysisResult {
     score -= (error_count * 25) as i32;          // -25 per error (critical)
     score -= (warning_count * 10) as i32;        // -10 per warning (significant)
     score -= (info_count.min(10) * 2) as i32;    // -2 per info, max -20 (advisory, capped)
-    let health_score = score.max(0).min(100) as u8;
+    let health_score = score.clamp(0, 100) as u8;
     
     AnalysisResult {
         items,

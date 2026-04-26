@@ -1306,6 +1306,7 @@ mod tests {
     }
 
     /// Helper: build a simple ClusterResult with given components and membership edges.
+    #[allow(dead_code)]
     fn make_cluster_result(
         components: Vec<Node>,
         edges: Vec<Edge>,

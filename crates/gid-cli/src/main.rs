@@ -2532,7 +2532,7 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
     let output_str = match format {
         "yaml" | "yml" => serde_yaml::to_string(&graph)?,
         "json" => serde_json::to_string_pretty(&graph)?,
-        "summary" | _ => {
+        "summary" => {
             if json_flag {
                 serde_json::to_string_pretty(&graph)?
             } else {
@@ -2591,6 +2591,9 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
 
                 s
             }
+        }
+        _ => {
+            anyhow::bail!("Unknown format: {} (expected: yaml, json, or summary)", format);
         }
     };
 
@@ -2710,7 +2713,7 @@ fn cmd_analyze(file: &PathBuf, show_callers: bool, show_callees: bool, show_impa
         // ISS-035: surface only high-confidence edges by default; the
         // hidden count is reported in `analysis.summary`.
         let analysis = analyze_impact_with_filters(
-            &[rel_path.clone()],
+            std::slice::from_ref(&rel_path),
             &unified,
             None,
             Some(gid_core::DEFAULT_MIN_CONFIDENCE),

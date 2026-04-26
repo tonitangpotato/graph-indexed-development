@@ -300,7 +300,7 @@ impl LspClient {
         let stderr = process.stderr.take().context("take stderr")?;
         let _stderr_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 if line.contains("error") || line.contains("Error") || line.contains("FATAL")
                     || line.contains("WARN") || line.contains("panic")
                 {
@@ -1073,6 +1073,7 @@ pub fn open_project_files(
 /// - Closes deleted files
 /// - For modified files: close + re-open with new content
 /// - Opens newly added files
+///
 /// Returns the count of files processed.
 pub fn refine_files(
     client: &mut LspClient,
