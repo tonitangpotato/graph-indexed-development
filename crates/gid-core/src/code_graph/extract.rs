@@ -319,18 +319,22 @@ fn extract_calls_for_file(
                 let source = content.as_bytes();
                 let root = tree.root_node();
 
-                extract_calls_from_tree(
-                    root,
+                let py_call_ctx = crate::code_graph::lang::python::PyCallCtx {
                     source,
                     rel_path,
-                    &state.func_map,
-                    &state.method_to_class,
-                    &state.class_parents,
-                    &file_func_ids,
-                    &state.file_imported_names,
                     package_dir,
+                    func_name_map: &state.func_map,
+                    method_to_class: &state.method_to_class,
+                    class_parents: &state.class_parents,
+                    file_func_ids: &file_func_ids,
+                    file_imported_names: &state.file_imported_names,
                     class_init_map,
                     node_pkg_map,
+                };
+
+                extract_calls_from_tree(
+                    root,
+                    &py_call_ctx,
                     edges,
                 );
             }

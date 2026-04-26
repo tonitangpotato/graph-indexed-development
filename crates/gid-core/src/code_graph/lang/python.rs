@@ -8,6 +8,37 @@ use tree_sitter::Parser;
 
 use crate::code_graph::types::*;
 
+// ─── Extraction Context (ISS-046) ───
+//
+// Mirrors the design used in `rust_lang.rs`: split the long extractor
+// argument lists into immutable/mutable contexts.
+//
+// `PyExtractCtx` is the per-file immutable input shared by the
+// `extract_class_node` / `extract_method_node` / `extract_function_node`
+// helpers. `PyCallCtx` is the per-file immutable lookup state shared by
+// `extract_calls_from_tree` / `resolve_and_add_call_edge` /
+// `resolve_self_method_call`. `edges` stays as a separate `&mut`
+// parameter so the ctx can stay shared while edges are appended.
+
+pub(crate) struct PyExtractCtx<'a> {
+    pub source: &'a [u8],
+    pub source_str: &'a str,
+    pub path: &'a str,
+}
+
+pub(crate) struct PyCallCtx<'a> {
+    pub source: &'a [u8],
+    pub rel_path: &'a str,
+    pub package_dir: &'a str,
+    pub func_name_map: &'a HashMap<String, Vec<String>>,
+    pub method_to_class: &'a HashMap<String, String>,
+    pub class_parents: &'a HashMap<String, Vec<String>>,
+    pub file_func_ids: &'a HashSet<String>,
+    pub file_imported_names: &'a HashMap<String, HashSet<String>>,
+    pub class_init_map: &'a HashMap<String, Vec<(String, String)>>,
+    pub node_pkg_map: &'a HashMap<String, String>,
+}
+
 /// Module-level cache for the import-statement regex.
 ///
 /// Compiled exactly once per process. Previously this was constructed via
@@ -155,6 +186,12 @@ pub(crate) fn extract_python_tree_sitter(
     let source = content.as_bytes();
     let root = tree.root_node();
 
+    let ctx = PyExtractCtx {
+        source,
+        source_str: content,
+        path,
+    };
+
     let text = |node: tree_sitter::Node| -> String {
         node.utf8_text(source).unwrap_or("").to_string()
     };
@@ -165,9 +202,7 @@ pub(crate) fn extract_python_tree_sitter(
             "class_definition" => {
                 extract_class_node(
                     child,
-                    source,
-                    content,
-                    path,
+                    &ctx,
                     &file_id,
                     &[],
                     &mut nodes,
@@ -176,7 +211,7 @@ pub(crate) fn extract_python_tree_sitter(
                 );
             }
             "function_definition" => {
-                extract_function_node(child, source, content, path, &file_id, &[], &mut nodes, &mut edges);
+                extract_function_node(child, &ctx, &file_id, &[], &mut nodes, &mut edges);
             }
             "decorated_definition" => {
                 let decorators = collect_decorators(child, source);
@@ -186,9 +221,7 @@ pub(crate) fn extract_python_tree_sitter(
                         "class_definition" => {
                             extract_class_node(
                                 inner,
-                                source,
-                                content,
-                                path,
+                                &ctx,
                                 &file_id,
                                 &decorators,
                                 &mut nodes,
@@ -198,7 +231,7 @@ pub(crate) fn extract_python_tree_sitter(
                         }
                         "function_definition" => {
                             extract_function_node(
-                                inner, source, content, path, &file_id, &decorators, &mut nodes, &mut edges,
+                                inner, &ctx, &file_id, &decorators, &mut nodes, &mut edges,
                             );
                         }
                         _ => {}
@@ -284,15 +317,16 @@ pub(crate) fn extract_python_tree_sitter(
 
 pub(crate) fn extract_class_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &PyExtractCtx<'_>,
     file_id: &str,
     decorators: &[String],
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
     class_id_map: &mut HashMap<String, String>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let class_name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
@@ -383,7 +417,7 @@ pub(crate) fn extract_class_node(
         for body_child in body.children(&mut body_cursor) {
             match body_child.kind() {
                 "function_definition" => {
-                    extract_method_node(body_child, source, source_str, path, &class_id, &[], nodes, edges);
+                    extract_method_node(body_child, ctx, &class_id, &[], nodes, edges);
                 }
                 "decorated_definition" => {
                     let method_decorators = collect_decorators(body_child, source);
@@ -392,9 +426,7 @@ pub(crate) fn extract_class_node(
                         if inner.kind() == "function_definition" {
                             extract_method_node(
                                 inner,
-                                source,
-                                source_str,
-                                path,
+                                ctx,
                                 &class_id,
                                 &method_decorators,
                                 nodes,
@@ -411,14 +443,15 @@ pub(crate) fn extract_class_node(
 
 pub(crate) fn extract_method_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &PyExtractCtx<'_>,
     class_id: &str,
     decorators: &[String],
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let func_name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
@@ -486,14 +519,15 @@ pub(crate) fn extract_method_node(
 
 pub(crate) fn extract_function_node(
     node: tree_sitter::Node,
-    source: &[u8],
-    source_str: &str,
-    path: &str,
+    ctx: &PyExtractCtx<'_>,
     file_id: &str,
     decorators: &[String],
     nodes: &mut Vec<CodeNode>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let source = ctx.source;
+    let source_str = ctx.source_str;
+    let path = ctx.path;
     let func_name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
@@ -556,18 +590,12 @@ pub(crate) fn extract_function_node(
 /// Extract call edges from tree-sitter AST
 pub(crate) fn extract_calls_from_tree(
     root: tree_sitter::Node,
-    source: &[u8],
-    rel_path: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    method_to_class: &HashMap<String, String>,
-    class_parents: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    package_dir: &str,
-    class_init_map: &HashMap<String, Vec<(String, String)>>,
-    node_pkg_map: &HashMap<String, String>,
+    ctx: &PyCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let source = ctx.source;
+    let rel_path = ctx.rel_path;
+
     // Build scope map
     let mut scope_map: Vec<(usize, usize, String, Option<String>)> = Vec::new();
     build_scope_map(root, source, rel_path, &mut scope_map);
@@ -604,13 +632,7 @@ pub(crate) fn extract_calls_from_tree(
                                 resolve_and_add_call_edge(
                                     caller_id,
                                     callee_name,
-                                    func_name_map,
-                                    file_func_ids,
-                                    file_imported_names,
-                                    rel_path,
-                                    package_dir,
-                                    class_init_map,
-                                    node_pkg_map,
+                                    ctx,
                                     false,
                                     edges,
                                 );
@@ -630,23 +652,14 @@ pub(crate) fn extract_calls_from_tree(
                                         caller_id,
                                         method_name,
                                         caller_class.as_deref(),
-                                        func_name_map,
-                                        method_to_class,
-                                        class_parents,
-                                        file_func_ids,
+                                        ctx,
                                         edges,
                                     );
                                 } else if !method_name.is_empty() && !is_python_builtin(method_name) {
                                     resolve_and_add_call_edge(
                                         caller_id,
                                         method_name,
-                                        func_name_map,
-                                        file_func_ids,
-                                        file_imported_names,
-                                        rel_path,
-                                        package_dir,
-                                        class_init_map,
-                                        node_pkg_map,
+                                        ctx,
                                         true,
                                         edges,
                                     );
@@ -813,16 +826,18 @@ pub(crate) fn is_common_dunder(name: &str) -> bool {
 pub(crate) fn resolve_and_add_call_edge(
     caller_id: &str,
     callee_name: &str,
-    func_name_map: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
-    file_imported_names: &HashMap<String, HashSet<String>>,
-    rel_path: &str,
-    package_dir: &str,
-    class_init_map: &HashMap<String, Vec<(String, String)>>,
-    node_pkg_map: &HashMap<String, String>,
+    ctx: &PyCallCtx<'_>,
     is_attribute_call: bool,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let func_name_map = ctx.func_name_map;
+    let file_func_ids = ctx.file_func_ids;
+    let file_imported_names = ctx.file_imported_names;
+    let rel_path = ctx.rel_path;
+    let package_dir = ctx.package_dir;
+    let class_init_map = ctx.class_init_map;
+    let node_pkg_map = ctx.node_pkg_map;
+
     if let Some(callee_ids) = func_name_map.get(callee_name) {
         let same_file: Vec<&String> = callee_ids
             .iter()
@@ -973,12 +988,14 @@ pub(crate) fn resolve_self_method_call(
     caller_id: &str,
     method_name: &str,
     caller_class: Option<&str>,
-    func_name_map: &HashMap<String, Vec<String>>,
-    method_to_class: &HashMap<String, String>,
-    class_parents: &HashMap<String, Vec<String>>,
-    file_func_ids: &HashSet<String>,
+    ctx: &PyCallCtx<'_>,
     edges: &mut Vec<CodeEdge>,
 ) {
+    let func_name_map = ctx.func_name_map;
+    let method_to_class = ctx.method_to_class;
+    let class_parents = ctx.class_parents;
+    let file_func_ids = ctx.file_func_ids;
+
     if let Some(callee_ids) = func_name_map.get(method_name) {
         if let Some(class_id) = caller_class {
             let mut valid_classes = vec![class_id.to_string()];
@@ -1260,16 +1277,26 @@ mod tests {
 
         let mut edges: Vec<CodeEdge> = Vec::new();
 
+        let empty_method_to_class: HashMap<String, String> = HashMap::new();
+        let empty_class_parents: HashMap<String, Vec<String>> = HashMap::new();
+
+        let py_call_ctx = PyCallCtx {
+            source: b"",
+            rel_path: caller_file,
+            package_dir: caller_pkg,
+            func_name_map: &func_name_map,
+            method_to_class: &empty_method_to_class,
+            class_parents: &empty_class_parents,
+            file_func_ids: &file_func_ids,
+            file_imported_names: &file_imported_names,
+            class_init_map: &class_init_map,
+            node_pkg_map: &node_pkg_map,
+        };
+
         resolve_and_add_call_edge(
             &caller_id,
             callee_name,
-            &func_name_map,
-            &file_func_ids,
-            &file_imported_names,
-            caller_file,
-            caller_pkg,
-            &class_init_map,
-            &node_pkg_map,
+            &py_call_ctx,
             /* is_attribute_call = */ false,
             &mut edges,
         );

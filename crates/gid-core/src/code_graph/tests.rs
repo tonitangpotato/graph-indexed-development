@@ -81,18 +81,27 @@ def caller():
         let tree = parser.parse(content, None).unwrap();
         let root = tree.root_node();
 
+        let empty_method_to_class: HashMap<String, String> = HashMap::new();
+        let empty_class_parents: HashMap<String, Vec<String>> = HashMap::new();
+        let empty_imported: HashMap<String, HashSet<String>> = HashMap::new();
+        let empty_class_init: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+        let py_call_ctx = crate::code_graph::lang::python::PyCallCtx {
+            source: content.as_bytes(),
+            rel_path: "test.py",
+            package_dir: "",
+            func_name_map: &func_map,
+            method_to_class: &empty_method_to_class,
+            class_parents: &empty_class_parents,
+            file_func_ids: &file_func_ids,
+            file_imported_names: &empty_imported,
+            class_init_map: &empty_class_init,
+            node_pkg_map: &node_pkg_map,
+        };
+
         extract_calls_from_tree(
             root,
-            content.as_bytes(),
-            "test.py",
-            &func_map,
-            &HashMap::new(),
-            &HashMap::new(),
-            &file_func_ids,
-            &HashMap::new(),
-            "",
-            &HashMap::new(),
-            &node_pkg_map,
+            &py_call_ctx,
             &mut edges,
         );
 
