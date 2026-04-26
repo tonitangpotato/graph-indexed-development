@@ -1,3 +1,28 @@
+//! gid-core graph storage backends.
+//!
+//! ## Storage Invariants (do not violate)
+//!
+//! ### SQLite Foreign-Key Enforcement (ISS-033)
+//!
+//! gid relies on SQLite foreign-key enforcement for graph integrity:
+//!
+//! - `edges.from_node` and `edges.to_node` reference `nodes(id) ON DELETE CASCADE`
+//! - `node_tags`, `node_metadata`, `knowledge` likewise cascade on node delete
+//! - Inserting an edge that references a non-existent node is rejected at write-time
+//!
+//! SQLite's `PRAGMA foreign_keys` defaults to **OFF** and is **per-connection**
+//! state — it does not persist across connection re-opens, schema, or backup.
+//! Every code path that opens a `rusqlite::Connection` to a gid graph file
+//! **must** issue `PRAGMA foreign_keys=ON` before any read/write that depends on
+//! referential integrity. `SqliteStorage::open` does this and verifies the
+//! setting took effect, returning an error if FK enforcement could not be enabled.
+//!
+//! Bypassing this — e.g., raw `sqlite3` shell access, or another tool opening
+//! the file without setting the PRAGMA — risks silent orphan-edge accumulation
+//! and dangling-edge inserts. If you add a new path that opens a gid graph
+//! file directly, replicate the PRAGMA + verify pattern from
+//! `SqliteStorage::open`.
+
 pub mod error;
 pub mod trait_def;
 pub mod schema;

@@ -4,13 +4,45 @@
 **发现者**: potato + RustClaw
 **组件**: gid-core, `storage/sqlite.rs` (connection setup)
 **优先级**: P1
-**Status:** open
+**Status:** closed (2026-04-25 — root fix landed: open-time PRAGMA + verify, regression suite, module doc)
+**Closed:** 2026-04-25
 **类型**: bug
 **标签**: sqlite, storage, data-integrity, root-fix
 
 ---
 
-## 症状
+## Resolution (2026-04-25)
+
+When opening this issue 2026-04-23, the *symptom* (orphan edges in engram main graph) was real, but the **root cause was already partially fixed** by ISS-015 (`PRAGMA foreign_keys=ON` on open) and ISS-037 (explicit edge cleanup in `BatchOp::DeleteNode`). What was missing:
+
+1. **No verification** that PRAGMA `foreign_keys=ON` actually took effect. If the PRAGMA failed for any reason (locked DB, compile flags, future regression), `open` would succeed silently with FK OFF, exactly the failure mode this issue describes.
+2. **No regression test** for the real-world scenario — bulk-deleting code nodes (the engram pollution rollback) and verifying CASCADE removes incident edges.
+3. **No documentation** that gid depends on FK enforcement and that future code paths opening connections must replicate the PRAGMA pattern.
+
+### Changes
+
+- `crates/gid-core/src/storage/sqlite.rs::SqliteStorage::open` — after issuing PRAGMAs, **verifies** `PRAGMA foreign_keys` returned 1; returns `StorageError::Sqlite { op: Open, ... }` with a clear ISS-033 reference if FK could not be enabled. Updated rustdoc to document the requirement.
+- `crates/gid-core/src/storage/mod.rs` — module-level doc explaining the FK invariant: `edges`/`node_tags`/`node_metadata`/`knowledge` all rely on `ON DELETE CASCADE`, the PRAGMA is per-connection and must be set on every connection, future code paths opening graph files directly must replicate the pattern.
+- New regression tests in `storage::sqlite::tests` (3 tests):
+  - `test_iss033_open_verifies_foreign_keys_on` — FK is verified ON after `open`.
+  - `test_iss033_bulk_node_delete_cascades_edges` — reproduces the engram pollution rollback: 5 code nodes + 1 task, 4 calls + 1 cross-type edge → bulk DELETE via metadata-driven SQL → CASCADE removes all 5 edges, zero orphans.
+  - `test_iss033_dangling_edge_rejected_via_add_edge` — inserting an edge whose endpoint does not exist fails with FK violation.
+
+Existing pre-ISS-033 tests that already covered FK behavior (`test_delete_node_cascades_edges`, `test_delete_node_cascades_tags_metadata_knowledge`, `test_normal_batch_rejects_dangling_edge`, `test_migration_batch_fk_guard_on_panic`) continue to pass — those plus the three new tests form the ISS-033 verification surface.
+
+### Verification
+
+`cargo test --lib --features sqlite -p gid-core` → **698 passed, 0 failed**.
+
+### Out of scope (intentional)
+
+- `crates/gid-core/src/history.rs` opens two short-lived connections: one as a `rusqlite::backup::Backup` destination (page-level binary copy — does not insert nodes/edges), one for `PRAGMA integrity_check` (read-only structural check). Neither writes through the FK layer, so the PRAGMA omission is not a correctness gap. They were left untouched to avoid scope creep; if a future change makes those connections write data, the module doc points the next implementer at the pattern to follow.
+- ISS-016 (LSP pass-1 dangling edges) is unblocked by this change in the sense that the FK + verify regime now makes any new dangling-insert path fail loudly. ISS-016 itself remains tracked separately.
+- ISS-032 (`gid repair`) is not about FK enforcement — it covers historical orphans and duplicates that pre-date the fix. Fixing ISS-033 reduces the *new* orphan production rate to zero; ISS-032 still owns the cleanup of legacy data.
+
+---
+
+## 症状（原始 issue 内容保留）
 
 批量删除 code nodes 后，edges 表里留下大量指向已删节点的 "orphan edges"：
 

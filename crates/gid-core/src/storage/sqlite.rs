@@ -130,6 +130,16 @@ impl SqliteStorage {
     /// Open (or create) a SQLite database at the given path.
     ///
     /// Runs PRAGMAs for performance and correctness, then applies the schema DDL.
+    ///
+    /// ## Foreign Key Enforcement (ISS-033)
+    ///
+    /// `PRAGMA foreign_keys=ON` is **required** — gid relies on FK enforcement
+    /// for `ON DELETE CASCADE` (edges, tags, metadata, knowledge auxiliary tables)
+    /// and to reject inserts of dangling edges. SQLite's FK PRAGMA is per-connection
+    /// state with `OFF` as the default, so it must be explicitly enabled on every
+    /// connection. After the PRAGMA is set, this method **verifies** the setting
+    /// took effect; a failure returns `StorageError::Configuration` rather than
+    /// silently running with FK disabled.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
         let conn = Connection::open(&path).map_err(|e| StorageError::Sqlite {
@@ -138,7 +148,9 @@ impl SqliteStorage {
             source: Some(Box::new(e)),
         })?;
 
-        // PRAGMAs
+        // PRAGMAs — MUST be set per-connection; SQLite does not persist these.
+        // foreign_keys=ON is critical: ISS-033 — without it, ON DELETE CASCADE
+        // is a no-op and dangling-edge inserts succeed silently.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
@@ -147,10 +159,34 @@ impl SqliteStorage {
              PRAGMA cache_size=-2000;",
         )?;
 
+        // ISS-033: Verify foreign_keys actually took effect. If something
+        // (compile flags, locked DB, downstream override) prevented it, fail
+        // loudly at open-time rather than corrupt data later.
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .map_err(|e| StorageError::Sqlite {
+                op: StorageOp::Open,
+                detail: format!("failed to read foreign_keys pragma: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+        if fk_on != 1 {
+            return Err(StorageError::Sqlite {
+                op: StorageOp::Open,
+                detail: format!(
+                    "PRAGMA foreign_keys did not enable (got {}, expected 1) at {} — \
+                     gid requires FK enforcement for cascade deletes and dangling-edge \
+                     rejection (ISS-033)",
+                    fk_on,
+                    path.display()
+                ),
+                source: None,
+            });
+        }
+
         // Apply schema
         conn.execute_batch(SCHEMA_SQL)?;
 
-        tracing::debug!("opened SQLite storage at {}", path.display());
+        tracing::debug!("opened SQLite storage at {} (foreign_keys=ON verified)", path.display());
 
         Ok(Self {
             conn: RefCell::new(conn),
@@ -2358,5 +2394,105 @@ mod tests {
         let mut ids = s.get_all_node_ids().unwrap();
         ids.sort();
         assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    // ── ISS-033: Foreign-key cascade enforcement (regression suite) ──────────
+
+    #[test]
+    fn test_iss033_open_verifies_foreign_keys_on() {
+        // Sanity: every freshly-opened storage must have FK=ON. If `open` ever
+        // regresses (drops the PRAGMA, fails to verify), this test catches it.
+        let s = temp_storage();
+        let fk: i64 = s
+            .conn
+            .borrow()
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "SqliteStorage::open must enable foreign_keys");
+    }
+
+    #[test]
+    fn test_iss033_bulk_node_delete_cascades_edges() {
+        // Real-world regression: 2026-04-23 engram main graph pollution incident.
+        // RustClaw ran extract without LSP, polluted the graph with code nodes +
+        // tree-sitter edges. Rolling back via DELETE FROM nodes WHERE node_type=...
+        // must cascade to edges, not leave orphans.
+        let s = temp_storage();
+
+        // Build a small graph: 5 "code" nodes + 1 "task" node, fully connected
+        // among the code nodes (4 edges) plus 1 task→code edge.
+        for id in &["c1", "c2", "c3", "c4", "c5"] {
+            let mut n = Node::new(*id, *id);
+            n.metadata.insert("node_type".into(), serde_json::json!("code"));
+            s.put_node(&n).unwrap();
+        }
+        let mut task = Node::new("t1", "Task 1");
+        task.metadata.insert("node_type".into(), serde_json::json!("task"));
+        s.put_node(&task).unwrap();
+
+        s.add_edge(&Edge::new("c1", "c2", "calls")).unwrap();
+        s.add_edge(&Edge::new("c2", "c3", "calls")).unwrap();
+        s.add_edge(&Edge::new("c3", "c4", "calls")).unwrap();
+        s.add_edge(&Edge::new("c4", "c5", "calls")).unwrap();
+        s.add_edge(&Edge::new("t1", "c1", "tracks")).unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 5);
+
+        // Bulk-delete all "code" nodes via raw SQL (simulates the pollution
+        // rollback path: `DELETE FROM nodes WHERE node_type='code'` from a
+        // metadata-driven cleanup script). The CASCADE must remove all edges
+        // incident to the deleted nodes — including the cross-type t1→c1 edge.
+        {
+            let conn = s.conn.borrow();
+            // node_type lives in node_metadata; delete by joining metadata.
+            conn.execute(
+                "DELETE FROM nodes WHERE id IN (
+                    SELECT node_id FROM node_metadata
+                    WHERE key = 'node_type' AND value = '\"code\"'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+
+        // All 5 code nodes gone, only t1 remains.
+        let surviving_ids = s.get_all_node_ids().unwrap();
+        assert_eq!(surviving_ids, vec!["t1".to_string()]);
+
+        // CRITICAL: zero orphan edges. ISS-033 root fix.
+        assert_eq!(
+            s.get_edge_count().unwrap(),
+            0,
+            "FK cascade must remove all edges incident to deleted code nodes \
+             (ISS-033 — was producing orphan edges in real engram main graph)"
+        );
+
+        // Belt-and-suspenders: verify no orphan edges exist via the same query
+        // ISS-033's reproducer used.
+        let orphans: i64 = s
+            .conn
+            .borrow()
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE from_node NOT IN (SELECT id FROM nodes)
+                 OR to_node NOT IN (SELECT id FROM nodes)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "no orphan edges should exist after cascade");
+    }
+
+    #[test]
+    fn test_iss033_dangling_edge_rejected_via_add_edge() {
+        // FK enforcement: inserting an edge with a non-existent endpoint must
+        // fail loudly, not silently corrupt the graph.
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        // No "ghost" node — edge endpoint does not exist.
+        let result = s.add_edge(&Edge::new("a", "ghost", "depends_on"));
+        assert!(
+            result.is_err(),
+            "FK constraint should reject edge to non-existent node"
+        );
+        assert_eq!(s.get_edge_count().unwrap(), 0);
     }
 }

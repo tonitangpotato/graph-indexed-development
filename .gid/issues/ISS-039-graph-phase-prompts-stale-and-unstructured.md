@@ -1,10 +1,11 @@
 # ISS-039: Graph Phase Prompts Are Stale, Hardcoded, and Pollution-Prone
 
-**Status:** open
+**Status:** closed (2026-04-25 — Fixes 1-5 landed across 5 commits c481826..7f55c46; ISS-031 and ISS-036 closed as duplicates)
 **Severity:** critical (every project running ritual v2 hits this; silent graph corruption + wasted token spend; blocks ISS-032 and any other ritual-driven work)
 **Reported:** 2026-04-25
+**Closed:** 2026-04-25
 **Reporter:** potato + RustClaw (during pre-flight investigation for engram ISS-032 ritual run)
-**Supersedes:** ISS-031, ISS-036 (will close as duplicates of this when ISS-039 lands)
+**Supersedes:** ISS-031, ISS-036 (closed as duplicates)
 **Related:** ISS-038 (implement-phase-no-output — sibling root-cause fix in same subsystem)
 
 ## Summary
