@@ -706,3 +706,31 @@ ISS-031 / ISS-036 都是症状，根因是同一个：graph phase 子系统在 v
 - ISS-031, ISS-036（被本 issue 取代，将在 ISS-039 完成后 close 为 duplicate）
 - ISS-038（同子系统兄弟 root-fix — implement-phase no-output postcondition）
 - ISS-037（cascade-delete 问题影响 Fix 4 的 rollback path）
+
+---
+
+## ISS-040 [bug] [P0] [closed]
+**发现日期**: 2026-04-26
+**关闭日期**: 2026-04-26
+**发现者**: RustClaw (proactive scan via `cargo clippy`)
+**组件**: `gid-core/src/code_graph/{analysis.rs, test_analysis.rs}`
+
+**描述**:
+Causal analysis 的 pytest-id → graph node 查找有死代码分支：
+
+```rust
+n.name == short_name
+    || n.name.ends_with(short_name)
+    || (n.file_path.contains("/test") && n.name == short_name)  // dead — strictly subsumed by branch 1
+```
+
+第三个分支被 clippy `overly_complex_bool_expr` 标为 logic bug，作者意图的 path-aware fallback 整个丢失了。后果：当多个 test 文件里有同名的 test 函数时，`analyze_test_failures` 和 `trace_causal_chains` 用 `find()` 返回第一个匹配，**忽略 pytest id 里的文件部分**，导致 causal chain 指向错误的测试或显示 "no analysis"。
+
+**修复** (commit on `iss-001-002-revive`):
+- 新增 `CodeGraph::resolve_pytest_id()` helper，5 级 lookup（exact name+path → suffix name+path → exact name → suffix name → file-level fallback）
+- `analysis.rs:436` + `test_analysis.rs:41` 两个 buggy call site 替换为 helper 调用
+- 5 个 regression test (`code_graph::tests::tests::test_resolve_pytest_id_*`)
+
+**验证**: 1238 → 1243 tests pass (+5)，clippy `overly_complex_bool_expr` errors 消失。
+
+详见 `.gid/issues/ISS-040-test-node-lookup-dead-branch.md`

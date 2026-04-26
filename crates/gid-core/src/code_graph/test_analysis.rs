@@ -9,6 +9,78 @@ use std::path::Path;
 use super::types::*;
 
 impl CodeGraph {
+    /// Resolve a pytest-style test identifier (e.g. `tests/test_foo.py::TestClass::test_bar`)
+    /// to a node in the graph.
+    ///
+    /// Lookup order (first non-empty match wins):
+    /// 1. **Exact name + file match** — `n.name == short_name` AND `n.file_path` ends with
+    ///    the file part of the identifier. Wins over name-only matches when several test
+    ///    nodes share the same `short_name` across different files.
+    /// 2. **Suffix name + file match** — `n.name.ends_with(short_name)` AND `n.file_path`
+    ///    ends with the file part. Handles namespaced names like `TestClass::test_bar`.
+    /// 3. **Exact name match anywhere** — `n.name == short_name`. Used when the identifier
+    ///    has no file part (no `::`) or the file part doesn't match any node.
+    /// 4. **Suffix name match anywhere** — `n.name.ends_with(short_name)`.
+    /// 5. **File-level fallback** — a test node (`is_test == true`) whose `file_path`
+    ///    ends with the file part. Used when the function-level node was not extracted.
+    ///
+    /// Returns `None` only if no test node matches under any rule.
+    ///
+    /// Note: this previously had a buggy third disjunct
+    /// `(file_path.contains("/test") && name == short_name)` which was strictly subsumed
+    /// by the first disjunct (dead code). The path-based discrimination it was meant to
+    /// provide is now implemented above. See ISS-040.
+    pub(crate) fn resolve_pytest_id(&self, test_name: &str) -> Option<&CodeNode> {
+        // Split "<file>::<...>::<short_name>" into file part + short name.
+        // If there's no `::`, file_part is empty and short_name is the whole string.
+        let (file_part, short_name) = match test_name.rsplit_once("::") {
+            Some((prefix, last)) => {
+                // The prefix may itself contain more `::` (e.g. file::Class::method).
+                // The file part is everything up to the first `::`.
+                let file = prefix.split("::").next().unwrap_or("");
+                (file, last)
+            }
+            None => ("", test_name),
+        };
+
+        let file_part_nonempty = !file_part.is_empty();
+
+        // Rule 1: exact name + file match
+        if file_part_nonempty {
+            if let Some(n) = self.nodes.iter().find(|n| {
+                n.name == short_name && n.file_path.ends_with(file_part)
+            }) {
+                return Some(n);
+            }
+            // Rule 2: suffix name + file match
+            if let Some(n) = self.nodes.iter().find(|n| {
+                n.name.ends_with(short_name) && n.file_path.ends_with(file_part)
+            }) {
+                return Some(n);
+            }
+        }
+
+        // Rule 3: exact name match anywhere
+        if let Some(n) = self.nodes.iter().find(|n| n.name == short_name) {
+            return Some(n);
+        }
+        // Rule 4: suffix name match anywhere
+        if let Some(n) = self.nodes.iter().find(|n| n.name.ends_with(short_name)) {
+            return Some(n);
+        }
+
+        // Rule 5: file-level fallback (any test node in the matching file)
+        if file_part_nonempty {
+            if let Some(n) = self.nodes.iter().find(|n| {
+                n.is_test && n.file_path.ends_with(file_part)
+            }) {
+                return Some(n);
+            }
+        }
+
+        None
+    }
+
     /// Analyze test failures by tracing call chains from changed code to failed tests.
     pub fn analyze_test_failures(
         &self,
@@ -35,13 +107,9 @@ impl CodeGraph {
             // Extract the short function name from test ID
             // e.g., "tests/test_foo.py::test_bar" → "test_bar"
             let short_name = test_name.split("::").last().unwrap_or(test_name);
-            
-            // Find this test in the graph
-            let test_node = self.nodes.iter().find(|n| {
-                n.name == short_name
-                    || n.name.ends_with(short_name)
-                    || (n.file_path.contains("/test") && n.name == short_name)
-            });
+
+            // Find this test in the graph (path-aware lookup, see ISS-040)
+            let test_node = self.resolve_pytest_id(test_name);
 
             analysis.push_str(&format!("### ❌ {}\n", short_name));
 

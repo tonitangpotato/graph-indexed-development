@@ -1590,4 +1590,142 @@ impl ToTitleCase for str {
             dup_edges
         );
     }
+
+    // ─── ISS-040: pytest-id resolution with path-aware fallback ────────────────
+
+    fn make_test_node(id: &str, name: &str, file_path: &str, is_test: bool) -> CodeNode {
+        CodeNode {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+            line: Some(1),
+            decorators: Vec::new(),
+            signature: None,
+            docstring: None,
+            line_count: 1,
+            is_test,
+            visibility: None,
+            lang: Some("python".to_string()),
+            body_hash: None,
+            end_line: Some(1),
+            complexity: None,
+        }
+    }
+
+    /// Regression test for ISS-040.
+    ///
+    /// When two test functions share the same short name across different files,
+    /// resolving a pytest identifier `<file>::<short_name>` MUST disambiguate by
+    /// the file path. The pre-fix code's third disjunct
+    /// `(file_path.contains("/test") && name == short_name)` was strictly
+    /// subsumed by the first disjunct, so `find()` returned the *first* node
+    /// with the matching name regardless of which file the pytest id pointed at.
+    #[test]
+    fn test_resolve_pytest_id_disambiguates_by_file_path() {
+        let mut g = CodeGraph::default();
+        // Two test_login functions in different files — the pre-fix code would
+        // always return whichever appears first in `nodes`, ignoring the file
+        // part of the pytest id.
+        g.nodes.push(make_test_node(
+            "func:tests/test_auth.py:test_login",
+            "test_login",
+            "tests/test_auth.py",
+            true,
+        ));
+        g.nodes.push(make_test_node(
+            "func:tests/test_session.py:test_login",
+            "test_login",
+            "tests/test_session.py",
+            true,
+        ));
+
+        let resolved = g
+            .resolve_pytest_id("tests/test_session.py::test_login")
+            .expect("must resolve");
+        assert_eq!(
+            resolved.id, "func:tests/test_session.py:test_login",
+            "expected the test_login from test_session.py, not test_auth.py — \
+             this asserts the path-aware fallback that ISS-040 restored"
+        );
+
+        let resolved2 = g
+            .resolve_pytest_id("tests/test_auth.py::test_login")
+            .expect("must resolve");
+        assert_eq!(resolved2.id, "func:tests/test_auth.py:test_login");
+    }
+
+    /// When the function-level node was not extracted (only the test file has
+    /// been seen), `resolve_pytest_id` should still surface the file as the
+    /// best-effort target rather than returning None.
+    #[test]
+    fn test_resolve_pytest_id_file_level_fallback() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(CodeNode::new_file("tests/test_payments.py"));
+
+        let resolved = g
+            .resolve_pytest_id("tests/test_payments.py::test_charge")
+            .expect("file-level fallback must produce a hit");
+        assert_eq!(resolved.kind, NodeKind::File);
+        assert_eq!(resolved.file_path, "tests/test_payments.py");
+    }
+
+    /// Identifier with no `::` (bare short name) must still resolve via the
+    /// name-only path — preserves backward compatibility with callers that
+    /// pass already-shortened test names.
+    #[test]
+    fn test_resolve_pytest_id_bare_name() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(make_test_node(
+            "func:tests/test_x.py:test_solo",
+            "test_solo",
+            "tests/test_x.py",
+            true,
+        ));
+
+        let resolved = g.resolve_pytest_id("test_solo").expect("must resolve");
+        assert_eq!(resolved.name, "test_solo");
+    }
+
+    /// Suffix matching (e.g. namespaced `TestClass::test_method` style) must
+    /// still work when combined with a file-part discriminator.
+    #[test]
+    fn test_resolve_pytest_id_suffix_match_with_file() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(make_test_node(
+            "func:tests/test_a.py:TestSuite::test_one",
+            "TestSuite::test_one",
+            "tests/test_a.py",
+            true,
+        ));
+        g.nodes.push(make_test_node(
+            "func:tests/test_b.py:OtherSuite::test_one",
+            "OtherSuite::test_one",
+            "tests/test_b.py",
+            true,
+        ));
+
+        let resolved = g
+            .resolve_pytest_id("tests/test_b.py::OtherSuite::test_one")
+            .expect("must resolve");
+        assert_eq!(resolved.file_path, "tests/test_b.py");
+    }
+
+    /// No match → None. Sanity check that we don't accidentally return
+    /// arbitrary nodes via overly-loose fallback.
+    #[test]
+    fn test_resolve_pytest_id_no_match() {
+        let mut g = CodeGraph::default();
+        g.nodes.push(make_test_node(
+            "func:src/lib.rs:helper",
+            "helper",
+            "src/lib.rs",
+            false,
+        ));
+
+        // No test_missing anywhere; src/lib.rs::helper is not a test.
+        // File-level fallback should not fire because no node has is_test=true
+        // matching the file part.
+        assert!(g.resolve_pytest_id("tests/test_z.py::test_missing").is_none());
+    }
 }
