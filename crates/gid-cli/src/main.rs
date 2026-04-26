@@ -84,6 +84,50 @@ enum Commands {
     /// Validate the graph (cycles, orphans, missing refs)
     Validate,
 
+    /// Repair the graph: remove orphan edges, duplicate nodes/edges, self-edges.
+    ///
+    /// By default runs in interactive mode: shows a plan and asks for confirmation
+    /// before applying. Use --dry-run to preview without applying, or --yes to skip
+    /// the prompt (CI use). At least one category flag must be selected, or use --all.
+    Repair {
+        /// Remove edges referencing missing nodes (orphan edges).
+        #[arg(long)]
+        orphan_edges: bool,
+
+        /// Remove unconnected nodes (only safe types: code, file, function, etc.).
+        /// User-authored nodes (task/issue/feature) are never auto-removed.
+        #[arg(long)]
+        orphan_nodes: bool,
+
+        /// Drop duplicate node entries (same ID appearing multiple times).
+        #[arg(long)]
+        duplicate_nodes: bool,
+
+        /// Drop duplicate edges (same from/to/relation triple).
+        #[arg(long)]
+        duplicate_edges: bool,
+
+        /// Remove self-referential edges (from == to).
+        #[arg(long)]
+        self_edges: bool,
+
+        /// Enable all repair categories.
+        #[arg(long)]
+        all: bool,
+
+        /// Show the plan but do not modify the graph.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt (for CI / scripts).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Skip the automatic backup of the graph file before applying.
+        #[arg(long)]
+        no_backup: bool,
+    },
+
     /// Show project overview: node/edge counts, languages, features
     About,
 
@@ -877,6 +921,31 @@ fn main() -> Result<()> {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_validate_ctx(&ctx, cli.json)
         }
+        Commands::Repair {
+            orphan_edges,
+            orphan_nodes,
+            duplicate_nodes,
+            duplicate_edges,
+            self_edges,
+            all,
+            dry_run,
+            yes,
+            no_backup,
+        } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            let opts = if all {
+                gid_core::RepairOptions::all()
+            } else {
+                gid_core::RepairOptions {
+                    orphan_edges,
+                    orphan_nodes,
+                    duplicate_nodes,
+                    duplicate_edges,
+                    self_edges,
+                }
+            };
+            cmd_repair_ctx(&ctx, opts, dry_run, yes, no_backup, cli.json)
+        }
         Commands::About => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_about_ctx(&ctx, cli.json)
@@ -1210,6 +1279,161 @@ fn cmd_validate_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn cmd_repair_ctx(
+    ctx: &GraphContext,
+    opts: gid_core::RepairOptions,
+    dry_run: bool,
+    yes: bool,
+    no_backup: bool,
+    json: bool,
+) -> Result<()> {
+    use std::io::{self, BufRead, Write};
+
+    if !opts.any() {
+        anyhow::bail!(
+            "No repair categories selected. Use --all or one of --orphan-edges, \
+             --orphan-nodes, --duplicate-nodes, --duplicate-edges, --self-edges."
+        );
+    }
+
+    let mut graph = ctx.load()?;
+    let plan = gid_core::plan_repair(&graph, &opts);
+
+    // JSON mode: print plan (and report if applied), no prompts.
+    if json {
+        if plan.is_empty() {
+            println!("{}", serde_json::json!({
+                "dry_run": dry_run,
+                "applied": false,
+                "plan_empty": true,
+                "total_changes": 0,
+            }));
+            return Ok(());
+        }
+        if dry_run {
+            println!("{}", serde_json::json!({
+                "dry_run": true,
+                "applied": false,
+                "plan": {
+                    "orphan_edges": plan.orphan_edges,
+                    "orphan_nodes": plan.orphan_nodes,
+                    "duplicate_node_ids": plan.duplicate_node_ids,
+                    "duplicate_edges": plan.duplicate_edges,
+                    "self_edges": plan.self_edges,
+                    "skipped_unsafe_orphan_nodes": plan.skipped_unsafe_orphan_nodes,
+                    "total_changes": plan.total_changes(),
+                },
+            }));
+            return Ok(());
+        }
+        // JSON + apply: requires --yes (no prompting in JSON mode)
+        if !yes {
+            anyhow::bail!("JSON apply mode requires --yes (cannot prompt in JSON mode).");
+        }
+        let backup = if !no_backup {
+            Some(backup_graph_file(ctx)?)
+        } else {
+            None
+        };
+        let report = gid_core::apply_repair(&mut graph, &plan);
+        ctx.save(&graph)?;
+        println!("{}", serde_json::json!({
+            "dry_run": false,
+            "applied": true,
+            "backup": backup.as_ref().map(|p| p.display().to_string()),
+            "report": {
+                "orphan_edges_removed": report.orphan_edges_removed,
+                "orphan_nodes_removed": report.orphan_nodes_removed,
+                "duplicate_nodes_merged": report.duplicate_nodes_merged,
+                "duplicate_edges_removed": report.duplicate_edges_removed,
+                "self_edges_removed": report.self_edges_removed,
+                "total": report.total(),
+            },
+        }));
+        return Ok(());
+    }
+
+    // Human-readable mode.
+    println!("{}", plan);
+
+    if plan.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("\n(dry-run — no changes applied. Re-run without --dry-run to apply.)");
+        return Ok(());
+    }
+
+    if !yes {
+        print!("\nApply these changes? [y/N]: ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        let answer = line.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let backup = if !no_backup {
+        let path = backup_graph_file(ctx)?;
+        println!("✓ Backup written to {}", path.display());
+        Some(path)
+    } else {
+        None
+    };
+
+    let report = gid_core::apply_repair(&mut graph, &plan);
+    ctx.save(&graph)?;
+    println!("\n{}", report);
+    if backup.is_some() {
+        println!("(restore from backup if anything looks wrong)");
+    }
+    Ok(())
+}
+
+/// Copy the active graph file to `<file>.backup-<timestamp>`.
+///
+/// For SQLite: copies `graph.db` (and `-wal` / `-shm` if present, just to be safe —
+/// though after a clean save these are usually merged).
+/// For YAML: copies `graph.yml`.
+fn backup_graph_file(ctx: &GraphContext) -> Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let primary = match ctx.backend {
+        StorageBackend::Sqlite => ctx.gid_dir.join("graph.db"),
+        StorageBackend::Yaml => ctx.gid_dir.join("graph.yml"),
+    };
+    if !primary.exists() {
+        anyhow::bail!(
+            "Cannot back up: graph file does not exist at {}",
+            primary.display()
+        );
+    }
+    let backup_path = primary.with_extension(format!(
+        "{}.backup-{}",
+        primary
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("graph"),
+        timestamp
+    ));
+    std::fs::copy(&primary, &backup_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to copy {} to {}: {}",
+            primary.display(),
+            backup_path.display(),
+            e
+        )
+    })?;
+    Ok(backup_path)
 }
 
 fn cmd_about_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
