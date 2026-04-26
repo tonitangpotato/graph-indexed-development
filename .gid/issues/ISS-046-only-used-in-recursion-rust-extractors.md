@@ -1,6 +1,6 @@
 # ISS-046: Recursive extractors carry unused parameters that should be hoisted to caller-shared state
 
-**Status:** open
+**Status:** closed (2026-04-26 — Option A landed across Phase A–E2)
 **Priority:** P3 (smell — wastes argument slots, masks too_many_arguments lint)
 **Component:** `crates/gid-core/src/code_graph/lang/rust_lang.rs` (`extract_rust_node` line 103, `extract_calls_from_token_tree` line 1534)
 **Filed:** 2026-04-26
@@ -97,3 +97,22 @@ While doing this, do the same for `python.rs`'s extract_* family — they have t
 ## Note on Sequencing
 
 This issue has the smallest standalone scope but the largest "natural fit" with ISS-042 Phase 2. Recommendation: do **not** schedule ISS-046 alone — bundle it into the same PR as ISS-042 Phase 2 item #1, where it gets resolved as a side effect.
+
+---
+
+## Resolution (2026-04-26)
+
+Option A applied across the whole language extractor + CLI surface. Sequenced through ISS-042 cleanup phases:
+
+- **Phase A+B** (commit `1bc55b1`) — `RustExtractCtx` / `RustExtractSink` / `RustCallCtx` introduced in `rust_lang.rs`. `extract_rust_node` collapsed from 12 params → `(node, ctx, sink, module_prefix)`. `extract_calls_from_token_tree` collapsed similarly. Both `only_used_in_recursion` warnings disappeared, as did the `too_many_arguments` warnings for these functions.
+- **Phase C** (commit `3903b77`) — sibling audit done in `python.rs`: `PyExtractCtx` / `PyCallCtx` mirror the Rust pattern.
+- **Phase D** (commit `dbedff1`) — same pattern in `typescript.rs`: `TsExtractCtx` / `TsCallCtx`.
+- **Phase E1** (commit `4ae9201`) — residual gid-core warnings cleaned.
+- **Phase E2** (commit `5e6f2b4`) — CLI handlers `cmd_context_ctx`, `cmd_extract`, `cmd_infer` packed into `ContextOpts` / `ExtractOpts` / `InferOpts`.
+
+**Verification:**
+- `cargo clippy --workspace --all-targets -- -D warnings` → clean (0 warnings).
+- `cargo test --workspace` → 1253 tests pass.
+- `extract_rust_node` and `extract_calls_from_token_tree` no longer carry parameters that are only forwarded — the relevant state lives on the sink/ctx structs.
+
+Closed together with the broader ISS-042 cleanup tracking issue.

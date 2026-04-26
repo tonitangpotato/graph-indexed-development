@@ -1,6 +1,6 @@
 # ISS-042: Clippy warnings cleanup — tracking issue (175 warnings)
 
-**Status:** open
+**Status:** closed (2026-04-26 — workspace clippy clean, 0 warnings under `-D warnings`)
 **Priority:** P3 (hygiene; no functional impact)
 **Component:** workspace-wide
 **Filed:** 2026-04-26
@@ -92,3 +92,28 @@ The cleanup is intentionally split: low-risk autofix first to shrink the noise f
     - 4 summary lines from clippy
   - Closing ISS-042 as **substantively complete** — final 32 warnings will be eliminated naturally by ISS-046 (introducing `ExtractCtx<'a>` struct + named return structs replaces nearly all flagged signatures simultaneously).
   - Tests: 1121 passed (1 flaky timing test confirmed unrelated).
+
+---
+
+## Resolution (2026-04-26)
+
+All 192 → 0 clippy warnings cleaned across the workspace through a sequenced refactor:
+
+| Phase | Commit | Scope | Warnings before → after |
+|---|---|---|---|
+| 1 (autofix sweep) | `a8dc050` | `cargo clippy --fix` mechanical | 192 → 79 |
+| 1.5 (manual) | `5b92f0f` | `matches!`, `sort_by_key`, dead code, redundant map | 79 → ~70 |
+| 1.6 (mechanical) | `eb3f77e` | `contains_key`, struct init shorthand | ~70 → 60 |
+| 2a (residual) | `2d94cda` | non-ExtractCtx residuals | 60 → 32 |
+| A+B (Rust extractors) | `1bc55b1` | `RustExtractCtx` / `RustExtractSink` / `RustCallCtx` | resolves ISS-046 |
+| C (Python extractors) | `3903b77` | `PyExtractCtx` / `PyCallCtx` (sibling audit from ISS-046) | — |
+| D (TypeScript extractors) | `dbedff1` | `TsExtractCtx` / `TsCallCtx` | — |
+| E1 (gid-core residuals) | `4ae9201` | remaining gid-core lints | — |
+| E2 (CLI) | `5e6f2b4` | `ContextOpts` / `ExtractOpts` / `InferOpts` for cmd handlers | 32 → 0 |
+
+**Verification:**
+- `cargo clippy --workspace --all-targets -- -D warnings` → clean.
+- `cargo test --workspace` → 1253 tests pass.
+- All split-out high-signal issues (ISS-043, ISS-044, ISS-045, ISS-046, ISS-047) closed.
+
+The "ExtractCtx pattern" (group flat shared state into a `*Ctx` struct, group flat output sinks into a `*Sink` struct) proved general — applied to Rust, Python, TypeScript extractors, then to CLI command handlers, with the same shape every time. Worth remembering as a default move next time `too_many_arguments` shows up on a recursive walker.
