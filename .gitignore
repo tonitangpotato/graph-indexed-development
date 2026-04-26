@@ -21,3 +21,4 @@ packages/*/dist/
 .gid/extract-meta.json
 .gid/rituals/*.json
 **/execution-log.jsonl
+.gid/graph.yml.backup
