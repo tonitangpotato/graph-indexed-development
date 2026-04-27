@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use super::hooks::CancelReason;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // States
@@ -463,6 +464,20 @@ pub enum RitualEvent {
     },
     ShellCompleted { stdout: String, exit_code: i32 },
     ShellFailed { stderr: String, exit_code: i32 },
+
+    /// Cancellation requested mid-action by the embedder via
+    /// `RitualHooks::should_cancel` (ISS-052 T02d).
+    ///
+    /// Distinct from `UserCancel`, which represents an explicit user-issued
+    /// cancel command at the *engine* surface (e.g. dispatched directly into
+    /// `transition()` by an external handler before any action runs). Both
+    /// route to the same terminal `Cancelled` phase, but `Cancelled` carries a
+    /// structured `CancelReason` (source + message) for telemetry and the
+    /// notification text, whereas `UserCancel` is reasonless by construction.
+    ///
+    /// Emitted by `V2Executor::execute` when `hooks.should_cancel()` returns
+    /// `Some(reason)` while polling between actions.
+    Cancelled { reason: CancelReason },
 }
 
 /// Structured reason a skill execution failed.
@@ -1172,6 +1187,21 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Cancelled),
             vec![
                 Notify { message: "🛑 Ritual cancelled.".into() },
+                SaveState,
+            ],
+        ),
+
+        // Hook-driven cancellation (ISS-052 T02d).
+        //
+        // `RitualEvent::Cancelled` is emitted by `V2Executor::execute` when
+        // `hooks.should_cancel()` returns `Some(reason)`. Routes to the same
+        // terminal `Cancelled` phase as `UserCancel`, but carries the
+        // structured `CancelReason` so the notify message reflects the
+        // actual cancel source (user command, timeout, daemon shutdown).
+        (_, RitualEvent::Cancelled { reason }) => (
+            state.clone().with_phase(Cancelled),
+            vec![
+                Notify { message: format!("🛑 Ritual cancelled: {}", reason.message) },
                 SaveState,
             ],
         ),
@@ -2212,6 +2242,95 @@ mod tests {
         let (s2, _) = transition(&s1, RitualEvent::UserCancel);
         assert_eq!(s2.phase, RitualPhase::Cancelled);
         assert_eq!(s2.status, RitualV2Status::Cancelled);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // ISS-052 T02d — hook-driven cancellation
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_hook_cancelled_event_routes_to_cancelled_phase() {
+        // `RitualEvent::Cancelled { reason }` (emitted by V2Executor when
+        // hooks.should_cancel() returns Some) must transition any phase to
+        // terminal `Cancelled` with `Cancelled` status — same end state as
+        // `UserCancel`, but with a reason-derived notify message.
+        let state = idle_state().with_phase(RitualPhase::Implementing);
+        let reason = crate::ritual::hooks::CancelReason {
+            source: crate::ritual::hooks::CancelSource::UserCommand,
+            message: "user requested /ritual cancel".into(),
+        };
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::Cancelled { reason: reason.clone() },
+        );
+        assert_eq!(s.phase, RitualPhase::Cancelled);
+        assert_eq!(s.status, RitualV2Status::Cancelled);
+        // Notify carries the reason message; SaveState persists terminal phase.
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            RitualAction::Notify { message } => {
+                assert!(message.contains(&reason.message),
+                    "notify must include reason message, got {:?}", message);
+            }
+            other => panic!("expected Notify, got {:?}", other),
+        }
+        assert!(matches!(&actions[1], RitualAction::SaveState));
+    }
+
+    #[test]
+    fn test_hook_cancelled_event_works_from_any_phase() {
+        // The transition arm uses `(_, Cancelled { .. })` — must work from
+        // every non-terminal phase. Spot-check a representative sample.
+        let phases = [
+            RitualPhase::Idle,
+            RitualPhase::Designing,
+            RitualPhase::Graphing,
+            RitualPhase::Implementing,
+            RitualPhase::Verifying,
+        ];
+        for phase in phases {
+            let state = idle_state().with_phase(phase.clone());
+            let reason = crate::ritual::hooks::CancelReason {
+                source: crate::ritual::hooks::CancelSource::Timeout,
+                message: "wall-clock budget exhausted".into(),
+            };
+            let (s, _a) = transition(&state, RitualEvent::Cancelled { reason });
+            assert_eq!(s.phase, RitualPhase::Cancelled,
+                "Cancelled event from {:?} must reach terminal Cancelled phase", phase);
+        }
+    }
+
+    #[test]
+    fn test_hook_cancelled_distinct_from_user_cancel_message() {
+        // `UserCancel` (engine-surface event) emits a generic "🛑 Ritual cancelled."
+        // notify. `Cancelled { reason }` (hook-driven event) emits a reason-
+        // specific notify. Both produce the same terminal state, but observers
+        // can distinguish *why* via the message.
+        let state = idle_state().with_phase(RitualPhase::Implementing);
+
+        let (_, user_actions) = transition(&state, RitualEvent::UserCancel);
+        let user_msg = match &user_actions[0] {
+            RitualAction::Notify { message } => message.clone(),
+            _ => panic!("expected Notify"),
+        };
+
+        let reason = crate::ritual::hooks::CancelReason {
+            source: crate::ritual::hooks::CancelSource::DaemonShutdown,
+            message: "daemon shutting down".into(),
+        };
+        let (_, hook_actions) = transition(
+            &state,
+            RitualEvent::Cancelled { reason },
+        );
+        let hook_msg = match &hook_actions[0] {
+            RitualAction::Notify { message } => message.clone(),
+            _ => panic!("expected Notify"),
+        };
+
+        assert_ne!(user_msg, hook_msg,
+            "UserCancel and Cancelled{{reason}} must produce distinguishable notify messages");
+        assert!(hook_msg.contains("daemon shutting down"),
+            "hook-driven cancel must surface reason in notify, got {:?}", hook_msg);
     }
 
     #[test]
