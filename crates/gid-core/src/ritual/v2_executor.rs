@@ -351,7 +351,18 @@ impl V2Executor {
                 self.hooks.notify(message).await;
                 None
             }
-            RitualAction::SaveState => {
+            RitualAction::SaveState { kind } => {
+                // ISS-052 T04: action carries the Boundary/Periodic tag.
+                // T04 leaves dispatch on the legacy fire-and-forget
+                // `save_state` (no retry, no event) — wiring to the T03
+                // `persist_state` retry wrapper happens in T08, which
+                // also extends `execute_actions` to feed the resulting
+                // `StatePersisted`/`StatePersistFailed` event back into
+                // `transition`. The state-machine arms for those events
+                // exist as of T04 (see state_machine.rs §6.3.3 table)
+                // but are not driven yet — they're tested directly via
+                // `transition()` calls.
+                let _ = kind;
                 self.save_state(state);
                 None
             }
@@ -870,7 +881,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     ///
     /// Calls `hooks.persist_state` up to `MAX_ATTEMPTS` times with backoff
     /// between attempts. Returns:
-    ///   - `RitualEvent::StatePersisted { attempt }` on first success
+    ///   - `RitualEvent::StatePersisted { attempt, .. }` on first success
     ///     (`attempt` is 1-based: 1 = first try, 2 = succeeded after one
     ///     retry, …)
     ///   - `RitualEvent::StatePersistFailed { attempt: MAX_ATTEMPTS, error }`
@@ -911,7 +922,11 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     /// lands, the only callers are the T03 unit tests; clippy would
     /// otherwise flag it as never-used. Remove this attribute in T04.
     #[allow(dead_code)]
-    pub(crate) async fn persist_state(&self, state: &RitualState) -> RitualEvent {
+    pub(crate) async fn persist_state(
+        &self,
+        state: &RitualState,
+        kind: super::state_machine::SaveStateKind,
+    ) -> RitualEvent {
         const MAX_ATTEMPTS: u32 = 3;
         // Backoffs sit *between* attempts, so we need MAX_ATTEMPTS - 1 entries.
         // No backoff after the final attempt — we exit either way.
@@ -927,7 +942,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         for attempt in 1..=MAX_ATTEMPTS {
             match self.hooks.persist_state(state).await {
                 Ok(()) => {
-                    return RitualEvent::StatePersisted { attempt };
+                    return RitualEvent::StatePersisted { attempt, kind };
                 }
                 Err(e) => {
                     last_error = e.to_string();
@@ -950,6 +965,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         RitualEvent::StatePersistFailed {
             attempt: MAX_ATTEMPTS,
             error: last_error,
+            kind,
         }
     }
 
@@ -2558,10 +2574,10 @@ mod tests {
         let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
         let state = RitualState::new();
 
-        let event = exec.persist_state(&state).await;
+        let event = exec.persist_state(&state, super::super::state_machine::SaveStateKind::Boundary).await;
 
         match event {
-            RitualEvent::StatePersisted { attempt } => {
+            RitualEvent::StatePersisted { attempt, .. } => {
                 assert_eq!(attempt, 1, "first-try success must report attempt=1");
             }
             other => panic!("expected StatePersisted, got {:?}", other),
@@ -2612,10 +2628,10 @@ mod tests {
         let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
         let state = RitualState::new();
 
-        let event = exec.persist_state(&state).await;
+        let event = exec.persist_state(&state, super::super::state_machine::SaveStateKind::Boundary).await;
 
         match event {
-            RitualEvent::StatePersisted { attempt } => {
+            RitualEvent::StatePersisted { attempt, .. } => {
                 assert_eq!(attempt, 3,
                     "success after 2 failures must report attempt=3");
             }
@@ -2635,10 +2651,10 @@ mod tests {
         let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
         let state = RitualState::new();
 
-        let event = exec.persist_state(&state).await;
+        let event = exec.persist_state(&state, super::super::state_machine::SaveStateKind::Boundary).await;
 
         match event {
-            RitualEvent::StatePersistFailed { attempt, error } => {
+            RitualEvent::StatePersistFailed { attempt, error, .. } => {
                 assert_eq!(attempt, 3,
                     "exhaustion must report attempt count = MAX_ATTEMPTS (3)");
                 // Error is from the *last* failed attempt (call 3).
@@ -2685,7 +2701,7 @@ mod tests {
         let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
         let state = RitualState::new();
 
-        let event = exec.persist_state(&state).await;
+        let event = exec.persist_state(&state, super::super::state_machine::SaveStateKind::Boundary).await;
         assert!(matches!(event, RitualEvent::StatePersistFailed { .. }));
 
         // CRITICAL: zero notifications — the arm owns user-facing comms.
@@ -2709,20 +2725,20 @@ mod tests {
             let hooks = Arc::new(FailingPersistHooks::new(tmp.clone(), fail_n));
             let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
             let state = RitualState::new();
-            let event = exec.persist_state(&state).await;
+            let event = exec.persist_state(&state, super::super::state_machine::SaveStateKind::Boundary).await;
             match (fail_n, &event) {
                 (0, RitualEvent::StatePersistFailed { attempt, .. }) => {
                     assert_eq!(*attempt, 3);
                 }
-                (1, RitualEvent::StatePersisted { attempt }) => {
+                (1, RitualEvent::StatePersisted { attempt, .. }) => {
                     // FailingPersistHooks(1): 1 succeeds (n=1 <= 1=threshold),
                     // 2,3,... fail. So persist_state's first call succeeds.
                     assert_eq!(*attempt, 1);
                 }
-                (2, RitualEvent::StatePersisted { attempt }) => {
+                (2, RitualEvent::StatePersisted { attempt, .. }) => {
                     assert_eq!(*attempt, 1);
                 }
-                (3, RitualEvent::StatePersisted { attempt }) => {
+                (3, RitualEvent::StatePersisted { attempt, .. }) => {
                     assert_eq!(*attempt, 1);
                 }
                 (_, e) => panic!("fail_n={fail_n}: unexpected event {:?}", e),
@@ -2740,7 +2756,7 @@ mod tests {
         let state = RitualState::new();
 
         let start = std::time::Instant::now();
-        let _ = exec.persist_state(&state).await;
+        let _ = exec.persist_state(&state, super::super::state_machine::SaveStateKind::Boundary).await;
         let elapsed = start.elapsed();
 
         assert!(

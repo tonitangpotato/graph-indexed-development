@@ -201,6 +201,24 @@ pub struct RitualState {
     /// remediation for zombie files.
     #[serde(default)]
     pub status: RitualV2Status,
+
+    /// ISS-052 §6.3 — persist degradation side-channel.
+    ///
+    /// `Some(_)` iff a `Periodic` `SaveState` save has failed and the
+    /// ritual is continuing in-memory while subsequent saves are being
+    /// retried. Cleared (`None`) on the next successful `StatePersisted`
+    /// event. **Never** set at phase boundaries — a failed `Boundary`
+    /// save aborts directly to `Failed` (§6.3.3).
+    ///
+    /// On 5 consecutive `Periodic` failures (`consecutive_failures == 5`
+    /// after increment), the ritual transitions to `Failed` per §6.3.3.
+    ///
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` keeps the
+    /// steady-state on-disk JSON unchanged (NG2 / §6.3.5). Older state
+    /// files without this field deserialize as `None` via
+    /// `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_degraded: Option<PersistDegradedInfo>,
 }
 
 fn default_ritual_id() -> String {
@@ -224,6 +242,44 @@ pub struct TransitionRecord {
     pub to: RitualPhase,
     pub event: String,
     pub timestamp: DateTime<Utc>,
+}
+
+/// ISS-052 §6.3.1 — side-channel info recorded when persist saves are
+/// failing mid-phase but the ritual is allowed to continue in-memory.
+///
+/// Populated/cleared by the state-machine arms for `StatePersisted` and
+/// `StatePersistFailed` events (see `transition` in this file). Inspected
+/// by post-mortem tooling and the `Notify` messages emitted by those
+/// arms.
+///
+/// **Lifecycle:**
+/// - `None` — steady state. No degraded persist.
+/// - `Some(info)` — at least one `Periodic` `SaveState` save has failed
+///   without an intervening success. `info.consecutive_failures` ranges
+///   `1..=4`; the *next* `StatePersistFailed` (which would make it 5) is
+///   the failure-mode trigger that aborts the ritual to `Failed`.
+/// - Cleared back to `None` by `StatePersisted` (recovery) or replaced
+///   by a transition to `Failed` (escalation).
+///
+/// **Why not a wrapping phase?** Per design NG1, the `RitualPhase` enum
+/// must not gain a wrapping `Degraded(_)` variant. The transition table
+/// is unchanged; degradation is observable only through this field and
+/// the dedicated event-handling arms.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistDegradedInfo {
+    /// The phase the ritual was in when degradation began. Reported in
+    /// notifications and post-mortems; **not** used for control flow.
+    pub since_phase: RitualPhase,
+    /// Human-readable last error message from the most recent failed
+    /// attempt. Updated on each `StatePersistFailed` while the ritual is
+    /// already degraded.
+    pub last_error: String,
+    /// Number of consecutive `StatePersistFailed` events without an
+    /// intervening `StatePersisted`. Reset to 0 (and the whole field to
+    /// `None`) on success. On reaching 5 (the *next* failure after
+    /// `consecutive_failures == 4`), the ritual transitions to `Failed`
+    /// per §6.3.3.
+    pub consecutive_failures: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +324,7 @@ impl RitualState {
             updated_at: now,
             adapter_pid: None,
             status: RitualV2Status::Active,
+            persist_degraded: None,
         }
     }
 
@@ -496,19 +553,26 @@ pub enum RitualEvent {
     /// Emitted by V2Executor's `persist_state` retry wrapper (T03) when
     /// `hooks.persist_state` succeeds. `attempt` is the 1-based index of
     /// the successful attempt (1 = first try, 2 = succeeded after one
-    /// retry, …). T04 will use this to clear the `persist_degraded`
-    /// side-channel flag; for now the arm is a no-op observer.
-    StatePersisted { attempt: u32 },
+    /// retry, …). `kind` is propagated from the originating
+    /// `RitualAction::SaveState { kind }` so the `transition` arm can
+    /// emit the right notify (silent for ordinary `Boundary`/`Periodic`
+    /// success, recovery message when `persist_degraded` was `Some(_)`).
+    StatePersisted { attempt: u32, kind: SaveStateKind },
 
     /// Emitted by V2Executor's `persist_state` retry wrapper (T03) after
-    /// `MAX_ATTEMPTS` consecutive `hooks.persist_state` failures. Carries
-    /// the 1-based attempt count actually run (always equal to
+    /// `MAX_ATTEMPTS` consecutive `hooks.persist_state` failures.
+    /// Carries the 1-based attempt count actually run (always equal to
     /// `MAX_ATTEMPTS` today, but kept as a field for future-proofing the
-    /// retry policy) and the human-readable last error string. T04 will
-    /// branch on `SaveStateKind` (boundary vs periodic) to either abort
-    /// to `Failed` or flip the side-channel flag; until then, this
-    /// variant escalates immediately so disk-full is never silent.
-    StatePersistFailed { attempt: u32, error: String },
+    /// retry policy), the human-readable last error string, and the
+    /// `SaveStateKind` of the action that failed. T04 branches on
+    /// `kind`: `Boundary` aborts to `Escalated` immediately; `Periodic`
+    /// flips the `persist_degraded` side-channel and lets the ritual
+    /// continue, escalating only after 5 consecutive failures.
+    StatePersistFailed {
+        attempt: u32,
+        error: String,
+        kind: SaveStateKind,
+    },
 
     /// Emitted by `run_ritual` (T08) when `hooks.resolve_workspace`
     /// returns an error before any phase action runs. Terminates the
@@ -569,11 +633,39 @@ pub enum RitualAction {
     /// Send notification (fire-and-forget).
     Notify { message: String },
     /// Persist state to disk.
-    SaveState,
+    ///
+    /// ISS-052 §6.3.2 — `kind` distinguishes phase-boundary saves
+    /// (the first save emitted right after a phase transition; failure
+    /// aborts to `Failed`) from periodic mid-phase saves (failure flips
+    /// the `persist_degraded` side-channel and lets the ritual continue).
+    /// The state machine emits `Boundary` everywhere today; `Periodic`
+    /// emission sites are added in T07 (self-review subloop port).
+    SaveState { kind: SaveStateKind },
     /// Cleanup temporary files.
     Cleanup,
     /// Apply approved review findings (fire-and-forget, runs apply-review skill).
     ApplyReview { approved: String },
+}
+
+/// ISS-052 §6.3.2 — classifier for `RitualAction::SaveState`.
+///
+/// The state-machine arms for `StatePersistFailed` (see `transition`)
+/// branch on this tag to decide whether a persist failure is fatal
+/// (`Boundary`) or recoverable via the `persist_degraded` side-channel
+/// (`Periodic`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveStateKind {
+    /// Emitted exactly once after each phase-transition event, before
+    /// the new phase produces any other actions. A failed `Boundary`
+    /// save aborts the ritual to `Failed` (§6.3.3) — we cannot guarantee
+    /// the new phase starts from a known-persisted state.
+    Boundary,
+    /// Emitted as a periodic checkpoint inside a long-running phase
+    /// (e.g. `Implementing` between LLM turns). A failed `Periodic`
+    /// save flips the `persist_degraded` side-channel and lets the
+    /// ritual continue. Wired in T07 (self-review subloop port); the
+    /// state machine itself does not emit `Periodic` today.
+    Periodic,
 }
 
 impl RitualAction {
@@ -621,7 +713,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Initializing).with_task(task.clone()),
             vec![
                 Notify { message: format!("🔧 Ritual started: \"{}\"", task) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 DetectProject,
             ],
         ),
@@ -631,7 +723,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Triaging).with_project(ps),
             vec![
                 Notify { message: "🔍 Triaging task...".into() },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunTriage { task: state.task.clone() },
             ],
         ),
@@ -655,7 +747,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     new_state.with_phase(Planning),
                     vec![
                         Notify { message: format!("⚡ Small task ({}). Skipping design & graph.", result.size) },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 )
@@ -665,7 +757,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     new_state.with_phase(Planning),
                     vec![
                         Notify { message: format!("📋 Medium task ({}). Skipping design.", result.size) },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 )
@@ -683,7 +775,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         new_state.with_phase(Designing),
                         vec![
                             Notify { message: format!("📝 Phase 2/5: {}...", skill) },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             RunSkill { name: skill.into(), context: state.task.clone() },
                         ],
                     )
@@ -693,7 +785,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         new_state.with_phase(WritingRequirements),
                         vec![
                             Notify { message: "📋 Phase 1/5: Writing requirements...".into() },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             RunSkill { name: "draft-requirements".into(), context: state.task.clone() },
                         ],
                     )
@@ -711,7 +803,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         "❓ Task needs clarification:\n• {}\n\nPlease reply with details, then /ritual retry.",
                         questions
                     )},
-                    SaveState,
+                    SaveState { kind: SaveStateKind::Boundary },
                 ],
             )
         }
@@ -723,7 +815,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 state.clone().with_phase(Triaging).with_task(enriched_task.clone()),
                 vec![
                     Notify { message: "🔍 Re-triaging with clarification...".into() },
-                    SaveState,
+                    SaveState { kind: SaveStateKind::Boundary },
                     RunTriage { task: enriched_task },
                 ],
             )
@@ -734,7 +826,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Triaging),
             vec![
                 Notify { message: "🔍 Re-triaging...".into() },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunTriage { task: state.task.clone() },
             ],
         ),
@@ -744,7 +836,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Reviewing).with_review_target("requirements"),
             vec![
                 Notify { message: "📝 Reviewing requirements...".into() },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunSkill { name: "review-requirements".into(), context: state.task.clone() },
             ],
         ),
@@ -759,7 +851,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Planning),
                     vec![
                         Notify { message: "📝 Design updated (incremental). Skipping review → Planning...".into() },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 )
@@ -769,7 +861,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Reviewing).with_review_target("design"),
                     vec![
                         Notify { message: "📝 Reviewing design document...".into() },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunSkill { name: "review-design".into(), context: state.task.clone() },
                     ],
                 )
@@ -787,7 +879,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 state.clone().with_phase(Graphing).with_strategy(strategy),
                 vec![
                     Notify { message: format!("📊 Phase 2/4: {}...", skill) },
-                    SaveState,
+                    SaveState { kind: SaveStateKind::Boundary },
                     RunSkill { name: skill.into(), context: state.task.clone() },
                 ],
             )
@@ -807,7 +899,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Implementing),
                     vec![
                         Notify { message: "📊 Graph updated (incremental). Skipping review → Implementing...".into() },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         action,
                     ],
                 )
@@ -817,7 +909,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Reviewing).with_review_target("tasks"),
                     vec![
                         Notify { message: "📝 Reviewing task breakdown...".into() },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunSkill { name: "review-tasks".into(), context: state.task.clone() },
                     ],
                 )
@@ -838,7 +930,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                          Auto-applying all findings in 3 minutes if no response.",
                         target, round
                     )},
-                    SaveState,
+                    SaveState { kind: SaveStateKind::Boundary },
                 ],
             )
         }
@@ -864,7 +956,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                             "🔄 Applied round 1 findings. Starting review round 2/2 for {}...",
                             review_target
                         )},
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunSkill { name: review_skill.into(), context: state.task.clone() },
                     ],
                 );
@@ -883,7 +975,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         vec![
                             ApplyReview { approved },
                             Notify { message: format!("✅ 2 review rounds complete. Phase 2/5: {}...", skill) },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             RunSkill { name: skill.into(), context: state.task.clone() },
                         ],
                     )
@@ -893,7 +985,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     vec![
                         ApplyReview { approved },
                         Notify { message: "✅ 2 review rounds complete. 🧠 Planning implementation strategy...".into() },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 ),
@@ -907,7 +999,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         vec![
                             ApplyReview { approved },
                             Notify { message: "✅ 2 review rounds complete. 💻 Implementing...".into() },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             action,
                         ],
                     )
@@ -917,7 +1009,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     vec![
                         ApplyReview { approved },
                         Notify { message: format!("⚠️ Unknown review_target '{}', defaulting to Planning", other) },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 ),
@@ -938,7 +1030,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         state.clone().with_phase(Designing).with_review_round(0),
                         vec![
                             Notify { message: "⏭️ Skipping review, moving to design...".into() },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             RunSkill { name: skill.into(), context: state.task.clone() },
                         ],
                     )
@@ -947,7 +1039,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Planning).with_review_round(0),
                     vec![
                         Notify { message: "⏭️ Skipping review, moving to planning...".into() },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 ),
@@ -960,7 +1052,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         state.clone().with_phase(Implementing).with_review_round(0),
                         vec![
                             Notify { message: "⏭️ Skipping review, moving to implementation...".into() },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             action,
                         ],
                     )
@@ -969,7 +1061,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Planning).with_review_round(0),
                     vec![
                         Notify { message: format!("⚠️ Skipping review (unknown review_target '{}'), defaulting to Planning", other) },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 ),
@@ -990,7 +1082,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         state.clone().with_phase(Designing),
                         vec![
                             Notify { message: format!("⚠️ Review failed ({}), continuing to design...", error) },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             RunSkill { name: skill.into(), context: state.task.clone() },
                         ],
                     )
@@ -999,7 +1091,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Planning),
                     vec![
                         Notify { message: format!("⚠️ Review failed ({}), continuing to planning...", error) },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 ),
@@ -1012,7 +1104,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         state.clone().with_phase(Implementing),
                         vec![
                             Notify { message: format!("⚠️ Review failed ({}), continuing to implementation...", error) },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             action,
                         ],
                     )
@@ -1021,7 +1113,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     state.clone().with_phase(Planning),
                     vec![
                         Notify { message: format!("⚠️ Review failed ({}) for unknown target '{}', defaulting to Planning", error, other) },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         RunPlanning,
                     ],
                 ),
@@ -1038,7 +1130,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 state.clone().with_phase(Verifying),
                 vec![
                     Notify { message: "✅ Phase 4/4: Verifying...".into() },
-                    SaveState,
+                    SaveState { kind: SaveStateKind::Boundary },
                     RunShell { command: cmd },
                 ],
             )
@@ -1050,7 +1142,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             vec![
                 Notify { message: "🎉 Ritual complete!".into() },
                 UpdateGraph { description: state.task.clone() },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 Cleanup,
             ],
         ),
@@ -1070,7 +1162,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     "🔄 Build failed (attempt {}/3), fixing...",
                     state.verify_retries + 1
                 )},
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunSkill {
                     name: "implement".into(),
                     context: format!(
@@ -1092,7 +1184,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     "❌ Build failed after 3 attempts.\nLast error: {}",
                     truncate(&stderr, 200)
                 )},
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
             ],
         ),
 
@@ -1107,7 +1199,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     "🔄 Tests returned exit code {} (attempt {}/3), fixing...",
                     exit_code, state.verify_retries + 1
                 )},
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunSkill {
                     name: "implement".into(),
                     context: format!(
@@ -1126,7 +1218,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 .with_error_context(stdout.clone()),
             vec![
                 Notify { message: format!("❌ Verify failed (exit {}) after 3 attempts.", exit_code) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
             ],
         ),
 
@@ -1135,7 +1227,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(WritingRequirements).inc_phase_retry("requirements"),
             vec![
                 Notify { message: format!("🔄 Requirements failed, retrying... ({})", truncate(&error, 100)) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunSkill {
                     name: "draft-requirements".into(),
                     context: format!("RETRY — previous error: {}\n\nOriginal task: {}", error, state.task),
@@ -1147,7 +1239,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Designing).inc_phase_retry("designing"),
             vec![
                 Notify { message: format!("🔄 Design failed, retrying... ({})", truncate(&error, 100)) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunSkill {
                     name: if state.project.as_ref().is_some_and(|p| p.has_design) {
                         "update-design"
@@ -1164,7 +1256,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Graphing).inc_phase_retry("graphing"),
             vec![
                 Notify { message: format!("🔄 Graph generation failed, retrying... ({})", truncate(&error, 100)) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunSkill {
                     name: if state.project.as_ref().is_some_and(|p| p.has_graph) {
                         "update-graph"
@@ -1181,7 +1273,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Planning).inc_phase_retry("planning"),
             vec![
                 Notify { message: format!("🔄 Planning failed, retrying... ({})", truncate(&error, 100)) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunPlanning,
             ],
         ),
@@ -1191,7 +1283,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Implementing).inc_phase_retry("implementing"),
             vec![
                 Notify { message: format!("🔄 Implementation failed, retrying... ({})", truncate(&error, 100)) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
                 RunSkill {
                     name: "implement".into(),
                     context: format!("RETRY — previous error: {}\n\nOriginal task: {}", error, state.task),
@@ -1211,7 +1303,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     phase.display_name(),
                     truncate(&error, 200)
                 )},
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
             ],
         ),
 
@@ -1224,7 +1316,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Cancelled),
             vec![
                 Notify { message: "🛑 Ritual cancelled.".into() },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
             ],
         ),
 
@@ -1239,42 +1331,159 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             state.clone().with_phase(Cancelled),
             vec![
                 Notify { message: format!("🛑 Ritual cancelled: {}", reason.message) },
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
             ],
         ),
 
-        // ── ISS-052 T05: persistence + lifecycle minimal arms ───────────────
+        // ── ISS-052 T04: persistence + lifecycle arms (final policy) ───────
         //
-        // These arms are the MINIMUM needed to keep `transition()` total
-        // for the new variants. They are intentionally conservative:
-        //   - StatePersisted: pure observer, no state change. T04 will
-        //     replace this with logic that clears `persist_degraded`.
-        //   - StatePersistFailed: escalate immediately. T04 will replace
-        //     this with the boundary-vs-periodic branch (boundary →
-        //     Failed; periodic → set side-channel flag, continue).
-        //     Escalating now keeps disk-full failures loud while the
-        //     final policy is still in flight.
-        //   - WorkspaceUnresolved: terminal Failed. T08 will emit this
-        //     from `run_ritual` before any action runs.
+        // Implements the §6.3.3 transition table. Six logical branches
+        // across two events:
+        //
+        //   StatePersisted (success):
+        //     1. persist_degraded == None  → no-op (steady-state success)
+        //     2. persist_degraded == Some  → clear flag + recovery Notify
+        //
+        //   StatePersistFailed (retries exhausted):
+        //     3. Boundary, any flag state                    → Escalated
+        //          (cannot guarantee new phase starts known-persisted)
+        //     4. Periodic, persist_degraded == None          → flip flag
+        //          (consecutive=1) + "ritual continuing in-memory" Notify
+        //     5. Periodic, persist_degraded == Some, count<4 → increment
+        //          counter + update last_error + warn Notify
+        //     6. Periodic, persist_degraded == Some, count==4 → 5th
+        //          consecutive failure → Escalated
+        //
+        // Critical invariants (preserved from the conservative T05 arm):
+        //   - Neither arm emits SaveState. Persistence is what failed; a
+        //     re-save would loop until the disk recovered, drowning the
+        //     user in notifications. The retry happens inside
+        //     V2Executor::persist_state (T03), not here.
+        //   - Periodic-failure paths leave `phase` unchanged so the
+        //     dispatcher continues whatever long-running phase is in
+        //     flight (Implementing/Verifying). Only Boundary failure and
+        //     the 5-strike escalation move to Escalated.
+        //
+        //   WorkspaceUnresolved: terminal Escalated. T08 emits this
+        //   from `run_ritual` before any phase action runs.
 
-        (_, StatePersisted { .. }) => (state.clone(), vec![]),
+        (_, StatePersisted { kind: _, .. }) => match &state.persist_degraded {
+            None => {
+                // §6.3.3 row 1 — steady-state success. No phase change,
+                // no actions. Both Boundary and Periodic successes look
+                // the same; routine save success is intentionally silent.
+                (state.clone(), vec![])
+            }
+            Some(info) => {
+                // §6.3.3 row 2 — recovery from a degraded run. Clear the
+                // side-channel and surface a recovery message.
+                let failures = info.consecutive_failures;
+                let mut new_state = state.clone();
+                new_state.persist_degraded = None;
+                (
+                    new_state,
+                    vec![Notify {
+                        message: format!(
+                            "✅ Persistence recovered after {} failed attempt{}.",
+                            failures,
+                            if failures == 1 { "" } else { "s" }
+                        ),
+                    }],
+                )
+            }
+        },
 
-        (_, StatePersistFailed { attempt, error }) => (
-            state.clone()
-                .with_phase(Escalated)
-                .with_failed_phase(state.phase.clone())
-                .with_error_context(format!(
-                    "state persist failed after {attempt} attempts: {error}"
-                )),
-            vec![
-                Notify { message: format!(
-                    "❌ State persist failed after {attempt} attempts: {}",
-                    truncate(&error, 200)
-                )},
-                // Deliberately no SaveState here — persistence is what
-                // just failed. Re-attempting would loop. T04 will refine.
-            ],
-        ),
+        (_, StatePersistFailed { attempt, error, kind }) => match kind {
+            SaveStateKind::Boundary => {
+                // §6.3.3 row 3 — boundary save failed. Cannot guarantee
+                // the next phase starts from a known-persisted state, so
+                // abort to Escalated regardless of any prior degradation.
+                (
+                    state.clone()
+                        .with_phase(Escalated)
+                        .with_failed_phase(state.phase.clone())
+                        .with_error_context(format!(
+                            "boundary persist failed after {attempt} attempts: {error}"
+                        )),
+                    vec![
+                        Notify { message: format!(
+                            "❌ Boundary persist failed after {attempt} attempts: {}",
+                            truncate(&error, 200)
+                        )},
+                        // No SaveState — persistence is what just failed.
+                    ],
+                )
+            }
+            SaveStateKind::Periodic => match &state.persist_degraded {
+                None => {
+                    // §6.3.3 row 4 — first periodic failure. Flip the
+                    // side-channel and let the ritual continue in-memory.
+                    // Phase unchanged — the dispatcher resumes whatever
+                    // long-running phase was in flight.
+                    let mut new_state = state.clone();
+                    new_state.persist_degraded = Some(PersistDegradedInfo {
+                        since_phase: state.phase.clone(),
+                        last_error: error.clone(),
+                        consecutive_failures: 1,
+                    });
+                    (
+                        new_state,
+                        vec![Notify {
+                            message: format!(
+                                "⚠️ Persist failed (attempt {attempt}); ritual continuing \
+                                 in-memory only: {}",
+                                truncate(&error, 200)
+                            ),
+                        }],
+                    )
+                }
+                Some(info) if info.consecutive_failures < 4 => {
+                    // §6.3.3 row 5 — already degraded, still under the
+                    // 5-strike threshold. Increment + refresh last_error.
+                    let mut new_info = info.clone();
+                    new_info.consecutive_failures += 1;
+                    new_info.last_error = error.clone();
+                    let new_count = new_info.consecutive_failures;
+                    let mut new_state = state.clone();
+                    new_state.persist_degraded = Some(new_info);
+                    (
+                        new_state,
+                        vec![Notify {
+                            message: format!(
+                                "⚠️ Persist failed again ({} consecutive); still continuing \
+                                 in-memory: {}",
+                                new_count,
+                                truncate(&error, 200)
+                            ),
+                        }],
+                    )
+                }
+                Some(info) => {
+                    // §6.3.3 row 6 — already at 4 consecutive failures;
+                    // this event is the 5th. Escalate to terminal.
+                    // The arm above guarantees consecutive_failures == 4.
+                    debug_assert_eq!(
+                        info.consecutive_failures, 4,
+                        "5-strike escalation expected exactly 4 prior failures"
+                    );
+                    (
+                        state.clone()
+                            .with_phase(Escalated)
+                            .with_failed_phase(state.phase.clone())
+                            .with_error_context(format!(
+                                "5 consecutive periodic persist failures: {error}"
+                            )),
+                        vec![
+                            Notify { message: format!(
+                                "❌ 5 consecutive persist failures; aborting ritual: {}",
+                                truncate(&error, 200)
+                            )},
+                            // No SaveState — persistence is what failed.
+                        ],
+                    )
+                }
+            },
+        },
 
         (_, WorkspaceUnresolved { error }) => (
             state.clone()
@@ -1320,7 +1529,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     new_state.with_phase(Initializing),
                     vec![
                         Notify { message: "🔄 Retrying — re-detecting project state...".into() },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                         DetectProject,
                     ],
                 );
@@ -1344,7 +1553,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 new_state.with_phase(retry_phase),
                 vec![
                     Notify { message: "🔄 Retrying...".into() },
-                    SaveState,
+                    SaveState { kind: SaveStateKind::Boundary },
                     action,
                 ],
             )
@@ -1363,7 +1572,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                     state.clone().with_phase(Initializing),
                                     vec![
                                         Notify { message: format!("⏭️ Skipped {}. Detecting project...", phase.display_name()) },
-                                        SaveState,
+                                        SaveState { kind: SaveStateKind::Boundary },
                                         DetectProject,
                                     ],
                                 );
@@ -1386,7 +1595,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                     .with_failed_phase(phase.clone()),
                                 vec![
                                     Notify { message: "❌ Cannot skip to WaitingClarification.".into() },
-                                    SaveState,
+                                    SaveState { kind: SaveStateKind::Boundary },
                                 ],
                             );
                         }
@@ -1404,7 +1613,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                         state.clone().with_phase(Designing),
                                         vec![
                                             Notify { message: "⏭️ Skipping review, moving to design...".into() },
-                                            SaveState,
+                                            SaveState { kind: SaveStateKind::Boundary },
                                             RunSkill { name: skill.into(), context: state.task.clone() },
                                         ],
                                     )
@@ -1413,7 +1622,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                     state.clone().with_phase(Planning),
                                     vec![
                                         Notify { message: "⏭️ Skipping review, moving to planning...".into() },
-                                        SaveState,
+                                        SaveState { kind: SaveStateKind::Boundary },
                                         RunPlanning,
                                     ],
                                 ),
@@ -1426,7 +1635,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                         state.clone().with_phase(Implementing),
                                         vec![
                                             Notify { message: "⏭️ Skipping review, moving to implementation...".into() },
-                                            SaveState,
+                                            SaveState { kind: SaveStateKind::Boundary },
                                             action,
                                         ],
                                     )
@@ -1435,7 +1644,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                     state.clone().with_phase(Planning),
                                     vec![
                                         Notify { message: "⏭️ Skipping review...".into() },
-                                        SaveState,
+                                        SaveState { kind: SaveStateKind::Boundary },
                                         RunPlanning,
                                     ],
                                 ),
@@ -1464,7 +1673,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                 state.clone().with_phase(Done),
                                 vec![
                                     Notify { message: format!("⏭️ Skipped {}. Ritual complete.", phase.display_name()) },
-                                    SaveState,
+                                    SaveState { kind: SaveStateKind::Boundary },
                                 ],
                             );
                         }
@@ -1475,7 +1684,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                                     .with_failed_phase(phase.clone()),
                                 vec![
                                     Notify { message: format!("❌ Cannot skip to {:?}.", next_phase) },
-                                    SaveState,
+                                    SaveState { kind: SaveStateKind::Boundary },
                                 ],
                             );
                         }
@@ -1484,7 +1693,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         state.clone().with_phase(next_phase.clone()),
                         vec![
                             Notify { message: format!("⏭️ Skipped {}. Moving to {}...", phase.display_name(), next_phase.display_name()) },
-                            SaveState,
+                            SaveState { kind: SaveStateKind::Boundary },
                             action,
                         ],
                     )
@@ -1495,7 +1704,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                         .with_failed_phase(phase.clone()),
                     vec![
                         Notify { message: format!("❌ Cannot skip {} — no next phase.", phase.display_name()) },
-                        SaveState,
+                        SaveState { kind: SaveStateKind::Boundary },
                     ],
                 ),
             }
@@ -1520,7 +1729,7 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                     "❌ Unexpected event in {}. Ritual paused — use /ritual retry or /ritual cancel.",
                     phase.display_name()
                 )},
-                SaveState,
+                SaveState { kind: SaveStateKind::Boundary },
             ],
         ),
     }
@@ -2359,7 +2568,7 @@ mod tests {
             }
             other => panic!("expected Notify, got {:?}", other),
         }
-        assert!(matches!(&actions[1], RitualAction::SaveState));
+        assert!(matches!(&actions[1], RitualAction::SaveState { kind: SaveStateKind::Boundary }));
     }
 
     #[test]
@@ -2569,78 +2778,193 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // ISS-052 T05: persistence + lifecycle event variants
+    // ISS-052 T04: persistence + lifecycle event arms
     //
-    // These tests pin the *minimum* contract added in T05. The arms
-    // intentionally do conservative things (no-op observer / immediate
-    // escalate). T04 will replace the StatePersist* arms with the
-    // boundary-vs-periodic branch and add `persist_degraded` side-channel
-    // assertions. T08 will exercise `WorkspaceUnresolved` end-to-end via
-    // `run_ritual`. The tests below only verify the wire-level behavior
-    // T05 owns: enum variants exist, transition() is total, and the
-    // resulting (state, action) shape is what later tasks expect to see.
+    // These tests pin the §6.3.3 transition table for `StatePersisted`
+    // and `StatePersistFailed`. Six logical branches are exercised:
+    //
+    //   StatePersisted:
+    //     1. persist_degraded == None   → no-op, no actions
+    //        → test_state_persisted_steady_state_is_noop
+    //     2. persist_degraded == Some   → clear flag + recovery Notify
+    //        → test_state_persisted_clears_degraded_flag
+    //
+    //   StatePersistFailed:
+    //     3. Boundary, any flag         → Escalated
+    //        → test_boundary_persist_failed_escalates_immediately
+    //        → test_boundary_persist_failed_escalates_even_when_degraded
+    //     4. Periodic, flag == None     → flip flag, count=1, continue
+    //        → test_first_periodic_persist_failure_flips_degraded_flag
+    //     5. Periodic, flag == Some     → increment count, refresh err
+    //          (count<4)                  → test_subsequent_periodic_failure_increments_count
+    //     6. Periodic, flag == Some     → 5th consecutive failure → Escalated
+    //          (count==4)                 → test_fifth_consecutive_periodic_failure_escalates
+    //
+    // Plus invariants preserved across all branches:
+    //   - No StatePersist* arm emits SaveState (would loop)
+    //   - WorkspaceUnresolved → Escalated (T08 pre-phase failure)
+    //   - Variant Debug repr distinguishes StatePersisted /
+    //     StatePersistFailed / WorkspaceUnresolved (tripwire test).
     // ─────────────────────────────────────────────────────────────────────
 
+    // ── Branch 1: StatePersisted, no degradation → silent no-op ─────────
     #[test]
-    fn test_state_persisted_is_pure_observer() {
-        // T05 arm: StatePersisted is a no-op (no phase change, no actions).
-        // T04 will mutate this to clear `persist_degraded` when set, but
-        // the no-op-when-flag-is-None case stays valid.
+    fn test_state_persisted_steady_state_is_noop() {
+        // §6.3.3 row 1 — when `persist_degraded` is None (the steady
+        // state), a successful persist is silent: no phase change, no
+        // actions. Routine save success would otherwise be spammy.
         let state = idle_state().with_phase(RitualPhase::Implementing);
         let phase_before = state.phase.clone();
+        assert!(state.persist_degraded.is_none(),
+            "precondition: idle_state has no degraded flag set");
+
         let (s, actions) = transition(
             &state,
-            RitualEvent::StatePersisted { attempt: 1 },
+            RitualEvent::StatePersisted {
+                attempt: 1,
+                kind: SaveStateKind::Boundary,
+            },
         );
         assert_eq!(s.phase, phase_before,
-            "StatePersisted must not change phase");
+            "StatePersisted (steady state) must not change phase");
+        assert!(s.persist_degraded.is_none(),
+            "StatePersisted (steady state) must leave persist_degraded unchanged");
         assert!(actions.is_empty(),
-            "StatePersisted must produce no actions in T05; got {:?}", actions);
+            "StatePersisted (steady state) must produce no actions; got {:?}", actions);
+
+        // Same expected behavior for Periodic kind — both are silent
+        // when not recovering from degradation.
+        let (s2, actions2) = transition(
+            &state,
+            RitualEvent::StatePersisted {
+                attempt: 1,
+                kind: SaveStateKind::Periodic,
+            },
+        );
+        assert_eq!(s2.phase, phase_before);
+        assert!(s2.persist_degraded.is_none());
+        assert!(actions2.is_empty());
     }
 
     #[test]
-    fn test_state_persisted_attempt_n_is_observer_too() {
-        // The successful-after-retry case is structurally identical to the
-        // first-try case at this stage; the attempt count is informational
-        // until T04 wires recovery notifications.
+    fn test_state_persisted_attempt_n_steady_state_still_noop() {
+        // The successful-after-retry case (`attempt > 1`) is structurally
+        // identical to first-try success when the steady-state flag is
+        // None — the attempt count is informational only.
         let state = idle_state().with_phase(RitualPhase::Verifying);
         let (s, actions) = transition(
             &state,
-            RitualEvent::StatePersisted { attempt: 3 },
+            RitualEvent::StatePersisted {
+                attempt: 3,
+                kind: SaveStateKind::Boundary,
+            },
         );
         assert_eq!(s.phase, RitualPhase::Verifying);
+        assert!(s.persist_degraded.is_none());
         assert!(actions.is_empty());
     }
 
+    // ── Branch 2: StatePersisted while degraded → recovery ──────────────
     #[test]
-    fn test_state_persist_failed_escalates_with_error_context() {
-        // T05 arm: StatePersistFailed escalates immediately. Disk-full is
-        // never silent. T04 will refine to boundary-vs-periodic; until
-        // then, immediate escalation is the safer default.
+    fn test_state_persisted_clears_degraded_flag() {
+        // §6.3.3 row 2 — recovery path. After at least one Periodic
+        // failure flipped the flag, a successful persist clears it back
+        // to None and surfaces a recovery Notify so the operator knows
+        // persistence is healthy again.
+        let mut state = idle_state().with_phase(RitualPhase::Implementing);
+        state.persist_degraded = Some(PersistDegradedInfo {
+            since_phase: RitualPhase::Implementing,
+            last_error: "ENOSPC".into(),
+            consecutive_failures: 2,
+        });
+
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::StatePersisted {
+                attempt: 1,
+                kind: SaveStateKind::Periodic,
+            },
+        );
+
+        assert_eq!(s.phase, RitualPhase::Implementing,
+            "recovery must not change phase — only clear the flag");
+        assert!(s.persist_degraded.is_none(),
+            "recovery must clear persist_degraded back to None");
+
+        assert_eq!(actions.len(), 1, "recovery emits exactly one Notify");
+        match &actions[0] {
+            RitualAction::Notify { message } => {
+                assert!(message.contains("recovered"),
+                    "recovery message must mention recovery, got {:?}", message);
+                assert!(message.contains("2"),
+                    "recovery message must surface failure count, got {:?}", message);
+            }
+            other => panic!("expected Notify, got {:?}", other),
+        }
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState { .. })),
+            "recovery must NOT emit SaveState — the persist that just succeeded              was triggered upstream, no need to re-save here");
+    }
+
+    #[test]
+    fn test_state_persisted_recovery_singular_grammar_for_one_failure() {
+        // Edge: count==1 should produce "1 failed attempt." (singular),
+        // not "1 failed attempts." This is mostly a UX nicety but worth
+        // pinning so the format string doesn't regress.
+        let mut state = idle_state().with_phase(RitualPhase::Implementing);
+        state.persist_degraded = Some(PersistDegradedInfo {
+            since_phase: RitualPhase::Implementing,
+            last_error: "EIO".into(),
+            consecutive_failures: 1,
+        });
+        let (_, actions) = transition(
+            &state,
+            RitualEvent::StatePersisted {
+                attempt: 2,
+                kind: SaveStateKind::Periodic,
+            },
+        );
+        match &actions[0] {
+            RitualAction::Notify { message } => {
+                assert!(message.contains("1 failed attempt."),
+                    "singular grammar for count=1, got {:?}", message);
+                assert!(!message.contains("attempts"),
+                    "must not pluralize for count=1, got {:?}", message);
+            }
+            other => panic!("expected Notify, got {:?}", other),
+        }
+    }
+
+    // ── Branch 3: Boundary persist failure → immediate escalation ───────
+    #[test]
+    fn test_boundary_persist_failed_escalates_immediately() {
+        // §6.3.3 row 3 — boundary save failed. We cannot guarantee the
+        // next phase starts from a known-persisted state, so abort to
+        // Escalated. This is the "fail loud" branch.
         let state = idle_state().with_phase(RitualPhase::Implementing);
         let (s, actions) = transition(
             &state,
             RitualEvent::StatePersistFailed {
                 attempt: 3,
                 error: "ENOSPC: disk full".into(),
+                kind: SaveStateKind::Boundary,
             },
         );
         assert_eq!(s.phase, RitualPhase::Escalated);
         assert_eq!(s.failed_phase, Some(RitualPhase::Implementing),
             "failed_phase must capture the phase that was running when persist died");
         let err_ctx = s.error_context.as_deref().unwrap_or("");
+        assert!(err_ctx.starts_with("boundary persist failed"),
+            "error_context must namespace boundary failures, got {:?}", err_ctx);
         assert!(err_ctx.contains("3 attempts"),
             "error_context must record attempt count, got {:?}", err_ctx);
         assert!(err_ctx.contains("ENOSPC"),
             "error_context must propagate underlying error, got {:?}", err_ctx);
 
-        // Exactly one Notify, NO SaveState — re-saving on a persist failure
-        // would loop. This is the critical contract the T04 redesign
-        // preserves under both Boundary and Periodic branches.
-        assert_eq!(actions.len(), 1,
-            "expected single Notify action, got {:?}", actions);
+        assert_eq!(actions.len(), 1, "expected single Notify, got {:?}", actions);
         match &actions[0] {
             RitualAction::Notify { message } => {
+                assert!(message.starts_with("❌ Boundary persist failed"),
+                    "notify must mark this as boundary failure, got {:?}", message);
                 assert!(message.contains("3 attempts"),
                     "notify must surface attempt count, got {:?}", message);
                 assert!(message.contains("ENOSPC"),
@@ -2648,16 +2972,38 @@ mod tests {
             }
             other => panic!("expected Notify, got {:?}", other),
         }
-        // Critical: no SaveState — if it were here, a failed persist would
-        // re-trigger persist, re-fail, infinite loop.
-        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState)),
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState { .. })),
             "StatePersistFailed must NOT emit SaveState (would loop)");
     }
 
     #[test]
-    fn test_state_persist_failed_works_from_any_phase() {
-        // Persist can fail at any non-terminal phase. The arm is `(_, ...)`
-        // — verify representative phases all escalate consistently.
+    fn test_boundary_persist_failed_escalates_even_when_degraded() {
+        // §6.3.3 row 3 — Boundary failure escalates regardless of any
+        // prior periodic-degradation state. Even mid-degradation, if a
+        // boundary save fails, we cannot enter the next phase safely.
+        let mut state = idle_state().with_phase(RitualPhase::Verifying);
+        state.persist_degraded = Some(PersistDegradedInfo {
+            since_phase: RitualPhase::Implementing,
+            last_error: "previous".into(),
+            consecutive_failures: 2,
+        });
+        let (s, _actions) = transition(
+            &state,
+            RitualEvent::StatePersistFailed {
+                attempt: 3,
+                error: "ENOSPC".into(),
+                kind: SaveStateKind::Boundary,
+            },
+        );
+        assert_eq!(s.phase, RitualPhase::Escalated,
+            "Boundary failure must escalate even when already degraded");
+    }
+
+    #[test]
+    fn test_boundary_persist_failed_works_from_any_phase() {
+        // Boundary saves can fail at any non-terminal phase. The arm is
+        // unconditional on phase; verify representative phases all
+        // escalate consistently.
         let phases = [
             RitualPhase::Designing,
             RitualPhase::Graphing,
@@ -2671,20 +3017,187 @@ mod tests {
                 RitualEvent::StatePersistFailed {
                     attempt: 3,
                     error: "io error".into(),
+                    kind: SaveStateKind::Boundary,
                 },
             );
             assert_eq!(s.phase, RitualPhase::Escalated,
-                "StatePersistFailed from {:?} must escalate", phase);
+                "Boundary StatePersistFailed from {:?} must escalate", phase);
             assert_eq!(s.failed_phase, Some(phase));
         }
     }
 
+    // ── Branch 4: First Periodic failure → flip degraded flag ───────────
+    #[test]
+    fn test_first_periodic_persist_failure_flips_degraded_flag() {
+        // §6.3.3 row 4 — first periodic failure. The ritual continues
+        // in-memory, the flag is flipped to count=1, and the operator
+        // is notified. Phase is unchanged so the dispatcher resumes
+        // whatever long-running phase was in flight.
+        let state = idle_state().with_phase(RitualPhase::Implementing);
+        assert!(state.persist_degraded.is_none(),
+            "precondition: clean steady state");
+
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::StatePersistFailed {
+                attempt: 3,
+                error: "ENOSPC: disk full".into(),
+                kind: SaveStateKind::Periodic,
+            },
+        );
+
+        assert_eq!(s.phase, RitualPhase::Implementing,
+            "Periodic failure must NOT change phase — ritual continues in-memory");
+        let info = s.persist_degraded.as_ref()
+            .expect("Periodic failure must set persist_degraded");
+        assert_eq!(info.since_phase, RitualPhase::Implementing,
+            "since_phase records the phase at which degradation began");
+        assert_eq!(info.consecutive_failures, 1,
+            "first failure → counter starts at 1");
+        assert_eq!(info.last_error, "ENOSPC: disk full",
+            "last_error captures the failing error");
+
+        assert_eq!(actions.len(), 1, "expected single Notify, got {:?}", actions);
+        match &actions[0] {
+            RitualAction::Notify { message } => {
+                assert!(message.starts_with("⚠️"),
+                    "first-failure notify is a warning, got {:?}", message);
+                assert!(message.contains("in-memory"),
+                    "notify must explain ritual is continuing in-memory, got {:?}", message);
+                assert!(message.contains("ENOSPC"),
+                    "notify must surface error, got {:?}", message);
+            }
+            other => panic!("expected Notify, got {:?}", other),
+        }
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState { .. })),
+            "Periodic-failure path must NOT emit SaveState (would loop)");
+    }
+
+    // ── Branch 5: Subsequent Periodic failure → increment counter ───────
+    #[test]
+    fn test_subsequent_periodic_failure_increments_count() {
+        // §6.3.3 row 5 — already degraded, still under the 5-strike
+        // threshold. Increment counter, refresh last_error, continue.
+        let mut state = idle_state().with_phase(RitualPhase::Implementing);
+        state.persist_degraded = Some(PersistDegradedInfo {
+            since_phase: RitualPhase::Implementing,
+            last_error: "first error".into(),
+            consecutive_failures: 1,
+        });
+
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::StatePersistFailed {
+                attempt: 3,
+                error: "second error".into(),
+                kind: SaveStateKind::Periodic,
+            },
+        );
+
+        assert_eq!(s.phase, RitualPhase::Implementing,
+            "still under threshold — phase unchanged");
+        let info = s.persist_degraded.as_ref().expect("flag still set");
+        assert_eq!(info.consecutive_failures, 2,
+            "counter incremented from 1 to 2");
+        assert_eq!(info.last_error, "second error",
+            "last_error refreshed to current failure");
+        assert_eq!(info.since_phase, RitualPhase::Implementing,
+            "since_phase preserved across consecutive failures");
+
+        match &actions[0] {
+            RitualAction::Notify { message } => {
+                assert!(message.contains("2 consecutive"),
+                    "notify must surface running count, got {:?}", message);
+            }
+            other => panic!("expected Notify, got {:?}", other),
+        }
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState { .. })));
+    }
+
+    #[test]
+    fn test_periodic_failure_counter_walks_2_3_4_without_escalating() {
+        // Walks the counter through 2 → 3 → 4 to prove the threshold is
+        // strictly `> 4` (i.e. count==4 is still continue, count would
+        // reach 5 → escalate, see test_fifth_consecutive_periodic_failure).
+        let mut state = idle_state().with_phase(RitualPhase::Verifying);
+        state.persist_degraded = Some(PersistDegradedInfo {
+            since_phase: RitualPhase::Verifying,
+            last_error: "e1".into(),
+            consecutive_failures: 1,
+        });
+
+        for expected in 2..=4 {
+            let (next, _actions) = transition(
+                &state,
+                RitualEvent::StatePersistFailed {
+                    attempt: 3,
+                    error: format!("e{}", expected),
+                    kind: SaveStateKind::Periodic,
+                },
+            );
+            assert_eq!(next.phase, RitualPhase::Verifying,
+                "count={} must not escalate", expected);
+            let info = next.persist_degraded.as_ref().unwrap();
+            assert_eq!(info.consecutive_failures, expected,
+                "count must reach exactly {}", expected);
+            state = next;
+        }
+        // After 4 failures we are still Verifying, still degraded, ready
+        // for the 5-strike test below to escalate on the *next* failure.
+        assert_eq!(state.persist_degraded.as_ref().unwrap().consecutive_failures, 4);
+    }
+
+    // ── Branch 6: 5th consecutive Periodic failure → escalate ───────────
+    #[test]
+    fn test_fifth_consecutive_periodic_failure_escalates() {
+        // §6.3.3 row 6 — already at 4 consecutive failures; this event
+        // is the 5th. Escalate to terminal Escalated.
+        let mut state = idle_state().with_phase(RitualPhase::Implementing);
+        state.persist_degraded = Some(PersistDegradedInfo {
+            since_phase: RitualPhase::Implementing,
+            last_error: "prev".into(),
+            consecutive_failures: 4,
+        });
+
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::StatePersistFailed {
+                attempt: 3,
+                error: "the fifth strike".into(),
+                kind: SaveStateKind::Periodic,
+            },
+        );
+
+        assert_eq!(s.phase, RitualPhase::Escalated,
+            "5th consecutive periodic failure must escalate");
+        assert_eq!(s.failed_phase, Some(RitualPhase::Implementing),
+            "failed_phase records the phase that was running");
+        let err_ctx = s.error_context.as_deref().unwrap_or("");
+        assert!(err_ctx.contains("5 consecutive"),
+            "error_context must mention the 5-strike rule, got {:?}", err_ctx);
+        assert!(err_ctx.contains("the fifth strike"),
+            "error_context must propagate the triggering error, got {:?}", err_ctx);
+
+        assert_eq!(actions.len(), 1, "expected single Notify, got {:?}", actions);
+        match &actions[0] {
+            RitualAction::Notify { message } => {
+                assert!(message.starts_with("❌"),
+                    "5-strike notify is fatal, got {:?}", message);
+                assert!(message.contains("5 consecutive"),
+                    "notify must mention the 5-strike rule, got {:?}", message);
+            }
+            other => panic!("expected Notify, got {:?}", other),
+        }
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState { .. })),
+            "5-strike escalation must NOT emit SaveState (would loop)");
+    }
+
+    // ── Cross-branch invariants ─────────────────────────────────────────
     #[test]
     fn test_workspace_unresolved_terminates_to_escalated() {
-        // T05 arm: WorkspaceUnresolved is a pre-phase failure — emitted by
-        // run_ritual (T08) before any phase action runs. Routes to
-        // Escalated (the failure-terminal phase) with workspace error in
-        // error_context.
+        // T05 arm: WorkspaceUnresolved is a pre-phase failure — emitted
+        // by run_ritual (T08) before any phase action runs. Routes to
+        // Escalated with workspace error in error_context.
         let state = idle_state();  // typically Idle when this fires
         let (s, actions) = transition(
             &state,
@@ -2699,26 +3212,26 @@ mod tests {
         assert!(err_ctx.contains("project 'engram' not found in registry"),
             "error_context must propagate underlying error, got {:?}", err_ctx);
 
-        // Single Notify, NO SaveState — ritual never reached an executable
-        // phase, no useful checkpoint to write.
-        assert_eq!(actions.len(), 1,
-            "expected single Notify action, got {:?}", actions);
+        assert_eq!(actions.len(), 1, "expected single Notify, got {:?}", actions);
         assert!(matches!(&actions[0], RitualAction::Notify { .. }));
-        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState)),
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState { .. })),
             "WorkspaceUnresolved must NOT emit SaveState (no executable phase reached)");
     }
 
     #[test]
-    fn test_t05_new_variants_are_distinct() {
+    fn test_t04_persist_event_variants_are_distinct() {
         // Tripwire: if these variants are merged, renamed, or restructured,
         // this test fails — forcing a deliberate update of the T03/T04/T08
         // call sites that emit them. RitualEvent doesn't derive PartialEq,
-        // so we compare via Debug repr — sufficient for a structural
-        // tripwire that catches accidental variant collapse.
-        let a = format!("{:?}", RitualEvent::StatePersisted { attempt: 1 });
+        // so we compare via Debug repr.
+        let a = format!("{:?}", RitualEvent::StatePersisted {
+            attempt: 1,
+            kind: SaveStateKind::Boundary,
+        });
         let b = format!("{:?}", RitualEvent::StatePersistFailed {
             attempt: 1,
             error: "x".into(),
+            kind: SaveStateKind::Boundary,
         });
         let c = format!("{:?}", RitualEvent::WorkspaceUnresolved {
             error: "y".into(),
