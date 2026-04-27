@@ -74,3 +74,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `persist_degraded_5_failures_aborts`. Eight pre-existing tests were
   renamed (no body changes); seven new tests close the wrapper↔state-
   machine coverage gaps for §6.3.3 boundary/periodic/5-strike branches.
+- **ISS-052 T10** — §9.2 e2e integration test added at
+  `crates/gid-core/tests/ritual_e2e.rs::full_ritual_with_noop_hooks`.
+  Drives a complete ritual through the public `run_ritual` API using
+  only the published `NoopHooks` test double, and asserts the public
+  outcome contract end-to-end: terminal `RitualOutcome` classification,
+  `state.error_context` population, canonical state-file persistence
+  at `<project_root>/.gid/ritual-state.json`, and notify-hook round-
+  trip across multiple lifecycle transitions. With no `LlmClient`
+  configured, the deterministic terminal is `Escalated`; happy-path-
+  with-real-LLM coverage lives in rustclaw's T16 integration suite.
