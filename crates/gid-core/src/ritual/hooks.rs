@@ -87,6 +87,27 @@ pub trait RitualHooks: Send + Sync {
     /// Stamp adapter-specific metadata into state at start
     /// (e.g. daemon PID, hostname, adapter version).
     /// Called once on transition into the first non-Idle state.
+    ///
+    /// # Contract
+    ///
+    /// The default no-op implementation is **semantically legal**, not a
+    /// missing TODO. `V2Executor` never consumes `state.metadata` to make
+    /// dispatch decisions — metadata exists purely for post-hoc
+    /// observability (debugging, audit, telemetry). Therefore:
+    ///
+    /// - **Short-lived / CLI embedders** (e.g. `gid` CLI): may rely on the
+    ///   default. The process identity is implicit in `state.created_at`
+    ///   and the invocation context.
+    /// - **Daemon-shaped embedders** (e.g. rustclaw): *should* override to
+    ///   stamp PID, hostname, adapter version, and any other context that
+    ///   would be useful for crash forensics. This is recommended, not
+    ///   required.
+    ///
+    /// If a future change to `V2Executor` ever needs to read stamped
+    /// metadata to drive control flow, this contract becomes a hazard and
+    /// the default must be removed (turning `stamp_metadata` into a
+    /// required method). At that point the design doc and this comment
+    /// should be updated together.
     fn stamp_metadata(&self, _state: &mut RitualState) {}
 
     // ── Lifecycle observation ──────────────────────────────────────────
