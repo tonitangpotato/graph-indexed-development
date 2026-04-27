@@ -290,6 +290,13 @@ impl V2Executor {
     /// Hook ordering contract (matches `RitualHooks` doc comments):
     /// - `on_action_start` fires for **every** action (including
     ///   fire-and-forget) before dispatch.
+    /// - **Cancellation poll** runs immediately after `on_action_start`
+    ///   and before any inner dispatch. If `hooks.should_cancel()`
+    ///   returns `Some(reason)`, the action is **not executed**; we
+    ///   short-circuit with `RitualEvent::Cancelled { reason }` and still
+    ///   fire `on_action_finish` against that event so embedders see a
+    ///   symmetric start/finish pair. This is the design §5.2 contract:
+    ///   *cancellation is polled between actions, not within them*.
     /// - `on_action_finish` fires **only** for event-producing actions,
     ///   because the trait signature requires a `&RitualEvent`. Fire-and-
     ///   forget actions return `None` and therefore have no
@@ -298,6 +305,20 @@ impl V2Executor {
     ///   machine transition hooks instead.
     pub(crate) async fn execute(&self, action: &RitualAction, state: &RitualState) -> Option<RitualEvent> {
         self.hooks.on_action_start(action, state);
+
+        // Cancellation poll happens *between* actions — i.e. after
+        // on_action_start but before any inner work. This keeps the
+        // "no mid-action cancellation" invariant from design §5.2:
+        // long-running actions (skills, shell, harness) are never
+        // interrupted partway; instead, the next action checks the flag
+        // and produces a Cancelled event that the state machine routes
+        // to the terminal Cancelled phase (see state_machine.rs T02d).
+        if let Some(reason) = self.hooks.should_cancel() {
+            let event = RitualEvent::Cancelled { reason };
+            self.hooks.on_action_finish(action, &event);
+            return Some(event);
+        }
+
         let event = self.execute_inner(action, state).await;
         if let Some(ref ev) = event {
             self.hooks.on_action_finish(action, ev);
@@ -2314,5 +2335,112 @@ mod tests {
         assert!(!V2Executor::is_graph_phase("implement"));
         assert!(!V2Executor::is_graph_phase("draft-design"));
         assert!(!V2Executor::is_graph_phase("review-design"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // ISS-052 T02e: should_cancel poll between actions
+    //
+    // execute() must poll hooks.should_cancel() AFTER on_action_start and
+    // BEFORE inner dispatch. When Some(reason) is returned:
+    //   - inner action MUST NOT run (no side effects)
+    //   - return value is Some(RitualEvent::Cancelled { reason })
+    //   - on_action_finish still fires on the Cancelled event
+    //
+    // The state-machine half (RitualEvent::Cancelled → terminal Cancelled
+    // phase) lives in state_machine.rs T02d.
+    // ─────────────────────────────────────────────────────────────────
+
+    use super::super::hooks::{CancelSource, NoopHooks};
+
+    fn cancel_test_executor() -> (V2Executor, Arc<NoopHooks>) {
+        let tmp = std::env::temp_dir();
+        let hooks = Arc::new(NoopHooks::new(tmp.clone(), tmp));
+        let exec = V2Executor::with_hooks(
+            V2ExecutorConfig::default(),
+            hooks.clone() as Arc<dyn RitualHooks>,
+        );
+        (exec, hooks)
+    }
+
+    #[tokio::test]
+    async fn execute_polls_should_cancel_and_short_circuits_to_cancelled() {
+        let (exec, hooks) = cancel_test_executor();
+        hooks.request_cancel(); // arm one-shot cancel signal
+
+        let action = RitualAction::Notify {
+            message: "should NOT be sent".into(),
+        };
+        let state = RitualState::new();
+
+        let event = exec.execute(&action, &state).await;
+
+        // Returned event must be Cancelled with the requested reason.
+        match event {
+            Some(RitualEvent::Cancelled { reason }) => {
+                assert_eq!(reason.source, CancelSource::UserCommand);
+            }
+            other => panic!("expected Some(Cancelled), got {:?}", other),
+        }
+
+        // Critical: the inner Notify dispatch must NOT have run. NoopHooks
+        // records every notify() call, so an empty snapshot proves the
+        // poll short-circuited before execute_inner() touched the action.
+        assert!(
+            hooks.notifications_snapshot().is_empty(),
+            "notify dispatch must be skipped when cancel is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_proceeds_normally_when_cancel_is_none() {
+        let (exec, hooks) = cancel_test_executor();
+        // Do NOT call request_cancel — should_cancel returns None.
+
+        let action = RitualAction::Notify {
+            message: "normal path".into(),
+        };
+        let state = RitualState::new();
+
+        let event = exec.execute(&action, &state).await;
+
+        // Notify is fire-and-forget → returns None (no state event).
+        assert!(
+            event.is_none(),
+            "Notify action must return None when not cancelled"
+        );
+
+        // The notification must have been delivered through hooks.notify.
+        assert_eq!(
+            hooks.notifications_snapshot(),
+            vec!["normal path".to_string()],
+            "hooks.notify must run when cancel flag is clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_cancel_poll_one_shot_then_normal() {
+        // NoopHooks::should_cancel is one-shot: first poll after
+        // request_cancel returns Some, subsequent polls return None.
+        // Verifies execute() honors that contract — second action
+        // proceeds normally.
+        let (exec, hooks) = cancel_test_executor();
+        hooks.request_cancel();
+        let state = RitualState::new();
+
+        // Action 1: cancel hits, short-circuit.
+        let a1 = RitualAction::Notify { message: "first".into() };
+        let e1 = exec.execute(&a1, &state).await;
+        assert!(matches!(e1, Some(RitualEvent::Cancelled { .. })));
+        assert!(hooks.notifications_snapshot().is_empty());
+
+        // Action 2: cancel one-shot already drained, normal dispatch.
+        let a2 = RitualAction::Notify { message: "second".into() };
+        let e2 = exec.execute(&a2, &state).await;
+        assert!(e2.is_none());
+        assert_eq!(
+            hooks.notifications_snapshot(),
+            vec!["second".to_string()],
+            "second action must run normally after one-shot cancel drained"
+        );
     }
 }
