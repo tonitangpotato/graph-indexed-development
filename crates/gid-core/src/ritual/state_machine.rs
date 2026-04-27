@@ -478,6 +478,43 @@ pub enum RitualEvent {
     /// Emitted by `V2Executor::execute` when `hooks.should_cancel()` returns
     /// `Some(reason)` while polling between actions.
     Cancelled { reason: CancelReason },
+
+    // ── ISS-052 T05: persistence + lifecycle events ─────────────────────────
+    //
+    // These variants are introduced ahead of the V2Executor wrappers that
+    // emit them (T03 for persist, T08 for run_ritual workspace resolution)
+    // so the enum and the state-machine match arms become available before
+    // the call sites land. Until those tasks ship, no production code emits
+    // these variants — they are tested via direct `transition()` calls.
+    //
+    // Formal handling (e.g. `persist_degraded` side-channel mutation) is
+    // deferred to T04. The arms added in this task are the minimum needed
+    // to keep `transition()` total: each event produces a deterministic
+    // (state, action) outcome with no panic / no unhandled-event silent
+    // drop.
+
+    /// Emitted by V2Executor's `persist_state` retry wrapper (T03) when
+    /// `hooks.persist_state` succeeds. `attempt` is the 1-based index of
+    /// the successful attempt (1 = first try, 2 = succeeded after one
+    /// retry, …). T04 will use this to clear the `persist_degraded`
+    /// side-channel flag; for now the arm is a no-op observer.
+    StatePersisted { attempt: u32 },
+
+    /// Emitted by V2Executor's `persist_state` retry wrapper (T03) after
+    /// `MAX_ATTEMPTS` consecutive `hooks.persist_state` failures. Carries
+    /// the 1-based attempt count actually run (always equal to
+    /// `MAX_ATTEMPTS` today, but kept as a field for future-proofing the
+    /// retry policy) and the human-readable last error string. T04 will
+    /// branch on `SaveStateKind` (boundary vs periodic) to either abort
+    /// to `Failed` or flip the side-channel flag; until then, this
+    /// variant escalates immediately so disk-full is never silent.
+    StatePersistFailed { attempt: u32, error: String },
+
+    /// Emitted by `run_ritual` (T08) when `hooks.resolve_workspace`
+    /// returns an error before any phase action runs. Terminates the
+    /// ritual to `Failed` — we cannot operate without a workspace path.
+    /// Distinct from `SkillFailed` because no skill has executed yet.
+    WorkspaceUnresolved { error: String },
 }
 
 /// Structured reason a skill execution failed.
@@ -1203,6 +1240,54 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
             vec![
                 Notify { message: format!("🛑 Ritual cancelled: {}", reason.message) },
                 SaveState,
+            ],
+        ),
+
+        // ── ISS-052 T05: persistence + lifecycle minimal arms ───────────────
+        //
+        // These arms are the MINIMUM needed to keep `transition()` total
+        // for the new variants. They are intentionally conservative:
+        //   - StatePersisted: pure observer, no state change. T04 will
+        //     replace this with logic that clears `persist_degraded`.
+        //   - StatePersistFailed: escalate immediately. T04 will replace
+        //     this with the boundary-vs-periodic branch (boundary →
+        //     Failed; periodic → set side-channel flag, continue).
+        //     Escalating now keeps disk-full failures loud while the
+        //     final policy is still in flight.
+        //   - WorkspaceUnresolved: terminal Failed. T08 will emit this
+        //     from `run_ritual` before any action runs.
+
+        (_, StatePersisted { .. }) => (state.clone(), vec![]),
+
+        (_, StatePersistFailed { attempt, error }) => (
+            state.clone()
+                .with_phase(Escalated)
+                .with_failed_phase(state.phase.clone())
+                .with_error_context(format!(
+                    "state persist failed after {attempt} attempts: {error}"
+                )),
+            vec![
+                Notify { message: format!(
+                    "❌ State persist failed after {attempt} attempts: {}",
+                    truncate(&error, 200)
+                )},
+                // Deliberately no SaveState here — persistence is what
+                // just failed. Re-attempting would loop. T04 will refine.
+            ],
+        ),
+
+        (_, WorkspaceUnresolved { error }) => (
+            state.clone()
+                .with_phase(Escalated)
+                .with_failed_phase(state.phase.clone())
+                .with_error_context(format!("workspace resolution: {error}")),
+            vec![
+                Notify { message: format!(
+                    "❌ Workspace resolution failed: {}",
+                    truncate(&error, 200)
+                )},
+                // No SaveState: ritual never reached an executable phase;
+                // there's no useful checkpoint to write.
             ],
         ),
 
@@ -2481,5 +2566,170 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ISS-052 T05: persistence + lifecycle event variants
+    //
+    // These tests pin the *minimum* contract added in T05. The arms
+    // intentionally do conservative things (no-op observer / immediate
+    // escalate). T04 will replace the StatePersist* arms with the
+    // boundary-vs-periodic branch and add `persist_degraded` side-channel
+    // assertions. T08 will exercise `WorkspaceUnresolved` end-to-end via
+    // `run_ritual`. The tests below only verify the wire-level behavior
+    // T05 owns: enum variants exist, transition() is total, and the
+    // resulting (state, action) shape is what later tasks expect to see.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_state_persisted_is_pure_observer() {
+        // T05 arm: StatePersisted is a no-op (no phase change, no actions).
+        // T04 will mutate this to clear `persist_degraded` when set, but
+        // the no-op-when-flag-is-None case stays valid.
+        let state = idle_state().with_phase(RitualPhase::Implementing);
+        let phase_before = state.phase.clone();
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::StatePersisted { attempt: 1 },
+        );
+        assert_eq!(s.phase, phase_before,
+            "StatePersisted must not change phase");
+        assert!(actions.is_empty(),
+            "StatePersisted must produce no actions in T05; got {:?}", actions);
+    }
+
+    #[test]
+    fn test_state_persisted_attempt_n_is_observer_too() {
+        // The successful-after-retry case is structurally identical to the
+        // first-try case at this stage; the attempt count is informational
+        // until T04 wires recovery notifications.
+        let state = idle_state().with_phase(RitualPhase::Verifying);
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::StatePersisted { attempt: 3 },
+        );
+        assert_eq!(s.phase, RitualPhase::Verifying);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_state_persist_failed_escalates_with_error_context() {
+        // T05 arm: StatePersistFailed escalates immediately. Disk-full is
+        // never silent. T04 will refine to boundary-vs-periodic; until
+        // then, immediate escalation is the safer default.
+        let state = idle_state().with_phase(RitualPhase::Implementing);
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::StatePersistFailed {
+                attempt: 3,
+                error: "ENOSPC: disk full".into(),
+            },
+        );
+        assert_eq!(s.phase, RitualPhase::Escalated);
+        assert_eq!(s.failed_phase, Some(RitualPhase::Implementing),
+            "failed_phase must capture the phase that was running when persist died");
+        let err_ctx = s.error_context.as_deref().unwrap_or("");
+        assert!(err_ctx.contains("3 attempts"),
+            "error_context must record attempt count, got {:?}", err_ctx);
+        assert!(err_ctx.contains("ENOSPC"),
+            "error_context must propagate underlying error, got {:?}", err_ctx);
+
+        // Exactly one Notify, NO SaveState — re-saving on a persist failure
+        // would loop. This is the critical contract the T04 redesign
+        // preserves under both Boundary and Periodic branches.
+        assert_eq!(actions.len(), 1,
+            "expected single Notify action, got {:?}", actions);
+        match &actions[0] {
+            RitualAction::Notify { message } => {
+                assert!(message.contains("3 attempts"),
+                    "notify must surface attempt count, got {:?}", message);
+                assert!(message.contains("ENOSPC"),
+                    "notify must surface underlying error, got {:?}", message);
+            }
+            other => panic!("expected Notify, got {:?}", other),
+        }
+        // Critical: no SaveState — if it were here, a failed persist would
+        // re-trigger persist, re-fail, infinite loop.
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState)),
+            "StatePersistFailed must NOT emit SaveState (would loop)");
+    }
+
+    #[test]
+    fn test_state_persist_failed_works_from_any_phase() {
+        // Persist can fail at any non-terminal phase. The arm is `(_, ...)`
+        // — verify representative phases all escalate consistently.
+        let phases = [
+            RitualPhase::Designing,
+            RitualPhase::Graphing,
+            RitualPhase::Implementing,
+            RitualPhase::Verifying,
+        ];
+        for phase in phases {
+            let state = idle_state().with_phase(phase.clone());
+            let (s, _a) = transition(
+                &state,
+                RitualEvent::StatePersistFailed {
+                    attempt: 3,
+                    error: "io error".into(),
+                },
+            );
+            assert_eq!(s.phase, RitualPhase::Escalated,
+                "StatePersistFailed from {:?} must escalate", phase);
+            assert_eq!(s.failed_phase, Some(phase));
+        }
+    }
+
+    #[test]
+    fn test_workspace_unresolved_terminates_to_escalated() {
+        // T05 arm: WorkspaceUnresolved is a pre-phase failure — emitted by
+        // run_ritual (T08) before any phase action runs. Routes to
+        // Escalated (the failure-terminal phase) with workspace error in
+        // error_context.
+        let state = idle_state();  // typically Idle when this fires
+        let (s, actions) = transition(
+            &state,
+            RitualEvent::WorkspaceUnresolved {
+                error: "project 'engram' not found in registry".into(),
+            },
+        );
+        assert_eq!(s.phase, RitualPhase::Escalated);
+        let err_ctx = s.error_context.as_deref().unwrap_or("");
+        assert!(err_ctx.starts_with("workspace resolution:"),
+            "error_context must namespace workspace failures, got {:?}", err_ctx);
+        assert!(err_ctx.contains("project 'engram' not found in registry"),
+            "error_context must propagate underlying error, got {:?}", err_ctx);
+
+        // Single Notify, NO SaveState — ritual never reached an executable
+        // phase, no useful checkpoint to write.
+        assert_eq!(actions.len(), 1,
+            "expected single Notify action, got {:?}", actions);
+        assert!(matches!(&actions[0], RitualAction::Notify { .. }));
+        assert!(!actions.iter().any(|a| matches!(a, RitualAction::SaveState)),
+            "WorkspaceUnresolved must NOT emit SaveState (no executable phase reached)");
+    }
+
+    #[test]
+    fn test_t05_new_variants_are_distinct() {
+        // Tripwire: if these variants are merged, renamed, or restructured,
+        // this test fails — forcing a deliberate update of the T03/T04/T08
+        // call sites that emit them. RitualEvent doesn't derive PartialEq,
+        // so we compare via Debug repr — sufficient for a structural
+        // tripwire that catches accidental variant collapse.
+        let a = format!("{:?}", RitualEvent::StatePersisted { attempt: 1 });
+        let b = format!("{:?}", RitualEvent::StatePersistFailed {
+            attempt: 1,
+            error: "x".into(),
+        });
+        let c = format!("{:?}", RitualEvent::WorkspaceUnresolved {
+            error: "y".into(),
+        });
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        // Variant tags are present in Debug output — guards against the
+        // case where someone reduces all three to a single carrier struct.
+        assert!(a.contains("StatePersisted"));
+        assert!(b.contains("StatePersistFailed"));
+        assert!(c.contains("WorkspaceUnresolved"));
     }
 }
