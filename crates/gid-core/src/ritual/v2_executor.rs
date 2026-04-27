@@ -26,7 +26,7 @@ use super::llm::{LlmClient, ToolDefinition};
 use super::scope::default_scope_for_phase;
 use super::work_unit::WorkUnit;
 use super::state_machine::{
-    RitualAction, RitualEvent, RitualState, ImplementStrategy,
+    RitualAction, RitualEvent, RitualState, ImplementStrategy, SkillFailureReason,
     ProjectState as V2ProjectState,
 };
 use crate::graph::{Graph, NodeStatus};
@@ -451,6 +451,7 @@ impl V2Executor {
                 return RitualEvent::SkillFailed {
                     phase: name.to_string(),
                     error: "No LLM client configured".to_string(),
+                    reason: None,
                 };
             }
         };
@@ -488,6 +489,7 @@ impl V2Executor {
                 return RitualEvent::SkillFailed {
                     phase: name.to_string(),
                     error: format!("Failed to load skill prompt: {}", e),
+                    reason: None,
                 };
             }
         };
@@ -631,6 +633,7 @@ impl V2Executor {
                                  or the LLM degenerated into analysis mode. See ISS-025.",
                                 result.tokens_used, result.tool_calls_made
                             ),
+                            reason: Some(SkillFailureReason::ZeroFileChanges),
                         };
                     }
 
@@ -657,6 +660,7 @@ impl V2Executor {
                 RitualEvent::SkillFailed {
                     phase: name.to_string(),
                     error: e.to_string(),
+                    reason: None,
                 }
             }
         }
@@ -1122,6 +1126,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
                 return Err(RitualEvent::SkillFailed {
                     phase: skill_name.to_string(),
                     error: format!("Graph phase preflight: failed to load graph at {}: {}", gid_root.display(), e),
+                    reason: None,
                 });
             }
         };
@@ -1209,6 +1214,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
                         gid_root.display(),
                         e
                     ),
+                    reason: None,
                 });
             }
         };
@@ -1237,6 +1243,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
                 Some(RitualEvent::SkillFailed {
                     phase: skill_name.to_string(),
                     error: format!("ISS-039 graph-phase contract violation: {}", msg),
+                    reason: None,
                 })
             }
         }
@@ -1381,6 +1388,7 @@ pub async fn run_ritual(
                 RitualEvent::SkillFailed {
                     phase: "engine".to_string(),
                     error: format!("Max iterations ({}) exceeded", max_iterations),
+                    reason: None,
                 },
             );
             state = final_state;
@@ -1931,7 +1939,7 @@ mod tests {
         let event = executor.run_skill("implement", "fix the bug", &state).await;
 
         match event {
-            RitualEvent::SkillFailed { phase, error } => {
+            RitualEvent::SkillFailed { phase, error, reason: _ } => {
                 assert_eq!(phase, "implement");
                 assert!(
                     error.contains("no file changes"),
@@ -2135,7 +2143,7 @@ mod tests {
 
         let event = executor.run_skill("update-graph", "", &state).await;
         match event {
-            RitualEvent::SkillFailed { phase, error } => {
+            RitualEvent::SkillFailed { phase, error, reason: _ } => {
                 assert_eq!(phase, "update-graph");
                 assert!(
                     error.contains("ISS-039"),

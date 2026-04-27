@@ -445,9 +445,52 @@ pub enum RitualEvent {
     UserApproval { approved: String },
     PlanDecided(ImplementStrategy),
     SkillCompleted { phase: String, artifacts: Vec<String> },
-    SkillFailed { phase: String, error: String },
+    /// A skill execution failed.
+    ///
+    /// `phase` and `error` are the legacy human-facing fields (kept for
+    /// back-compat with all existing match arms and emit sites).
+    ///
+    /// `reason` (ISS-052 T02b) is `None` for legacy emit sites and
+    /// `Some(SkillFailureReason)` when emitted by the new gates
+    /// (zero-file, forbidden-file, turn-limit-no-verdict, review-rejected,
+    /// explicit-claim). State-machine arms that don't care about the
+    /// structured reason can continue to use `..` rest patterns; arms that
+    /// branch on it use `if let Some(r) = reason`.
+    SkillFailed {
+        phase: String,
+        error: String,
+        reason: Option<SkillFailureReason>,
+    },
     ShellCompleted { stdout: String, exit_code: i32 },
     ShellFailed { stderr: String, exit_code: i32 },
+}
+
+/// Structured reason a skill execution failed.
+///
+/// Added by ISS-052 T02b as part of `SkillFailed.reason: Option<_>`.
+/// Existing emit sites pass `None`; new quality gates added in
+/// later T02 sub-tasks (zero-file gate, forbidden-file gate, self-review
+/// turn-limit, etc.) emit `Some(reason)` so the state machine and
+/// observers can differentiate failure modes without parsing `error`
+/// strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillFailureReason {
+    /// Skill claimed success but produced no file changes when the
+    /// configured `file_policy` required at least one file change
+    /// (ISS-038 file_snapshot gate).
+    ZeroFileChanges,
+    /// Skill produced file changes that the configured `file_policy`
+    /// forbids (e.g. a read-only / review skill wrote files).
+    UnexpectedFileChanges,
+    /// Self-review subloop (§8) hit the LLM turn limit without
+    /// producing a verdict.
+    LlmTurnLimitNoVerdict,
+    /// Self-review subloop returned an explicit `reject` verdict.
+    ReviewRejected,
+    /// The skill itself reported failure via its normal output channel.
+    /// The carried `String` is the raw claim from the skill, preserved
+    /// separately from the human-readable `error` field on `SkillFailed`.
+    ExplicitClaim(String),
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1575,7 +1618,7 @@ mod tests {
             .with_phase(RitualPhase::Designing)
             .with_task("test".into())
             .with_project(project_greenfield());
-        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "design".into(), error: "oops".into() });
+        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "design".into(), error: "oops".into(), reason: None });
         assert_eq!(s.phase, RitualPhase::Designing);
         assert_eq!(s.retries_for("designing"), 1);
         assert_invariant(&s, &a);
@@ -1587,7 +1630,7 @@ mod tests {
             .with_phase(RitualPhase::Designing)
             .with_task("test".into());
         state.phase_retries.insert("designing".into(), 2);
-        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "design".into(), error: "oops".into() });
+        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "design".into(), error: "oops".into(), reason: None });
         assert_eq!(s.phase, RitualPhase::Escalated);
         assert_invariant(&s, &a);
     }
@@ -1661,7 +1704,7 @@ mod tests {
         let state = idle_state()
             .with_phase(RitualPhase::Planning)
             .with_task("test".into());
-        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "planning".into(), error: "oops".into() });
+        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "planning".into(), error: "oops".into(), reason: None });
         assert_eq!(s.phase, RitualPhase::Planning);
         assert_eq!(s.retries_for("planning"), 1);
         assert_invariant(&s, &a);
@@ -1673,7 +1716,7 @@ mod tests {
             .with_phase(RitualPhase::Planning)
             .with_task("test".into());
         state.phase_retries.insert("planning".into(), 2);
-        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "planning".into(), error: "oops".into() });
+        let (s, a) = transition(&state, RitualEvent::SkillFailed { phase: "planning".into(), error: "oops".into(), reason: None });
         assert_eq!(s.phase, RitualPhase::Escalated);
         assert_invariant(&s, &a);
     }
@@ -2150,6 +2193,7 @@ mod tests {
             let (s, _a) = transition(&state, RitualEvent::SkillFailed {
                 phase: "design".into(),
                 error: format!("fatal {}", i),
+                reason: None,
             });
             state = s;
         }
@@ -2235,5 +2279,88 @@ mod tests {
         assert_eq!(RitualPhase::Idle.terminal_status(), None);
         assert_eq!(RitualPhase::Implementing.terminal_status(), None);
         assert_eq!(RitualPhase::WaitingApproval.terminal_status(), None);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ISS-052 T02b: SkillFailureReason wiring
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_skill_failed_reason_default_none_legacy_emit() {
+        // Legacy emit sites pass `reason: None`. The state machine MUST
+        // accept this and behave identically to pre-T02b (one retry per
+        // failure, escalate when retries exhausted).
+        let state = idle_state()
+            .with_phase(RitualPhase::Designing)
+            .with_task("test".into())
+            .with_project(project_greenfield());
+        let (s, a) = transition(
+            &state,
+            RitualEvent::SkillFailed {
+                phase: "design".into(),
+                error: "legacy emit, no structured reason".into(),
+                reason: None,
+            },
+        );
+        // Behavior is unchanged: stay in Designing, increment retry counter.
+        assert_eq!(s.phase, RitualPhase::Designing);
+        assert_eq!(s.retries_for("designing"), 1);
+        assert_invariant(&s, &a);
+    }
+
+    #[test]
+    fn test_skill_failed_reason_some_zero_file_changes_routes_same_as_none() {
+        // T02b is purely additive — the state machine does NOT yet branch
+        // on `reason`. A `Some(ZeroFileChanges)` failure must produce the
+        // same (state, actions) as `None`. This pins the behavior so
+        // future changes that branch on `reason` (T02d, T02e) are
+        // detected as intentional behavior changes, not silent regressions.
+        let state = idle_state()
+            .with_phase(RitualPhase::Designing)
+            .with_task("test".into())
+            .with_project(project_greenfield());
+        let (s_none, _) = transition(
+            &state,
+            RitualEvent::SkillFailed {
+                phase: "design".into(),
+                error: "x".into(),
+                reason: None,
+            },
+        );
+        let (s_some, _) = transition(
+            &state,
+            RitualEvent::SkillFailed {
+                phase: "design".into(),
+                error: "x".into(),
+                reason: Some(SkillFailureReason::ZeroFileChanges),
+            },
+        );
+        assert_eq!(s_none.phase, s_some.phase);
+        assert_eq!(s_none.retries_for("designing"), s_some.retries_for("designing"));
+    }
+
+    #[test]
+    fn test_skill_failure_reason_variants_constructible() {
+        // Codify the contract: all five variants exist and are
+        // distinguishable. Acts as a tripwire if a variant is renamed or
+        // removed without considering the gates that consume it
+        // (ISS-038 file_snapshot, T02d/T02e self-review).
+        let variants = [
+            SkillFailureReason::ZeroFileChanges,
+            SkillFailureReason::UnexpectedFileChanges,
+            SkillFailureReason::LlmTurnLimitNoVerdict,
+            SkillFailureReason::ReviewRejected,
+            SkillFailureReason::ExplicitClaim("skill said: failed".into()),
+        ];
+        // All variants must be Eq-distinct from each other.
+        for (i, v1) in variants.iter().enumerate() {
+            for (j, v2) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(v1, v2);
+                } else {
+                    assert_ne!(v1, v2);
+                }
+            }
+        }
     }
 }
