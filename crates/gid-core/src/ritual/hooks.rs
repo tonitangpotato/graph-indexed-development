@@ -224,8 +224,7 @@ impl RitualHooks for NoopHooks {
         std::fs::create_dir_all(&self.persist_dir)?;
         let final_path = self.persist_dir.join(format!("{}.json", state.id));
         let tmp_path = self.persist_dir.join(format!(".{}.json.tmp", state.id));
-        let json = serde_json::to_string_pretty(state)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
         std::fs::write(&tmp_path, json)?;
         std::fs::rename(&tmp_path, &final_path)?;
         Ok(())
@@ -290,10 +289,9 @@ impl RitualHooks for FailingPersistHooks {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
         let threshold = self.fail_after_n_calls.load(Ordering::SeqCst);
         if n > threshold {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("FailingPersistHooks: forced failure on call {n} (threshold {threshold})"),
-            ))
+            Err(std::io::Error::other(format!(
+                "FailingPersistHooks: forced failure on call {n} (threshold {threshold})"
+            )))
         } else {
             Ok(())
         }
