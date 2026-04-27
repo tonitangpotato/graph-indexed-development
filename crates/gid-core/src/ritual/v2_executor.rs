@@ -21,6 +21,7 @@ use super::graph_phase_mode::{
     determine_graph_mode, parse_planned_ids, render_existing_nodes, render_reserved_ids,
     snapshot_node_ids, validate_graph_phase_output, GraphPhaseMode,
 };
+use super::hooks::{NoopHooks, RitualHooks};
 use super::llm::{LlmClient, ToolDefinition};
 use super::scope::default_scope_for_phase;
 use super::work_unit::WorkUnit;
@@ -93,7 +94,20 @@ pub struct V2ExecutorConfig {
     /// LLM client for skill execution and planning.
     pub llm_client: Option<Arc<dyn LlmClient>>,
     /// Notification callback (e.g., send Telegram message).
+    ///
+    /// **DEPRECATED — prefer `hooks` (ISS-052).** When `hooks` is `Some`,
+    /// it takes precedence and this callback is ignored. When `hooks` is
+    /// `None`, this field provides backward-compatible notification
+    /// dispatch. New code should construct a `RitualHooks` impl instead.
     pub notify: Option<NotifyFn>,
+    /// Embedder hooks for IO, persistence, cancellation, and lifecycle
+    /// observation. When `Some`, the executor routes all relevant
+    /// behavior through the hooks (single source of truth for embedder
+    /// integration). When `None`, the executor falls back to the legacy
+    /// `notify` callback path and uses a `NoopHooks` for everything else
+    /// — this keeps existing call sites compiling unchanged during the
+    /// ISS-052 migration window.
+    pub hooks: Option<Arc<dyn RitualHooks>>,
     /// Model to use for skill phases.
     pub skill_model: String,
     /// Model to use for planning (cheaper).
@@ -106,6 +120,7 @@ impl Default for V2ExecutorConfig {
             project_root: PathBuf::from("."),
             llm_client: None,
             notify: None,
+            hooks: None,
             skill_model: "opus".to_string(),
             planning_model: "sonnet".to_string(),
         }
@@ -115,6 +130,11 @@ impl Default for V2ExecutorConfig {
 /// The V2 executor — executes actions, returns events.
 pub struct V2Executor {
     config: V2ExecutorConfig,
+    /// Resolved hooks for this executor instance. Always non-`None` after
+    /// construction: if `config.hooks` was `None`, this holds a shared
+    /// `NoopHooks` so action dispatch never has to branch on
+    /// hook-presence at the per-action level.
+    hooks: Arc<dyn RitualHooks>,
 }
 
 /// ISS-039: pre-flight result for graph-phase skill execution.
@@ -195,11 +215,61 @@ fn mode_label(mode: &GraphPhaseMode) -> &'static str {
 
 impl V2Executor {
     pub fn new(config: V2ExecutorConfig) -> Self {
-        Self { config }
+        let hooks: Arc<dyn RitualHooks> = config.hooks.clone().unwrap_or_else(|| {
+            // Fallback: build a NoopHooks rooted at the config's
+            // project_root, with persist_dir = `<project_root>/.gid`.
+            // This matches what the legacy `save_state` path already
+            // used, so behavior is byte-identical for embedders that
+            // never opt into custom hooks.
+            let workspace = config.project_root.clone();
+            let persist_dir = workspace.join(".gid");
+            Arc::new(NoopHooks::new(workspace, persist_dir))
+        });
+        Self { config, hooks }
+    }
+
+    /// Construct a V2Executor with explicit hooks, taking precedence over
+    /// any `hooks` already set on the config. This is the preferred entry
+    /// point for new embedders (ISS-052); `new()` remains for backward
+    /// compatibility with the legacy `config.notify` path.
+    pub fn with_hooks(mut config: V2ExecutorConfig, hooks: Arc<dyn RitualHooks>) -> Self {
+        config.hooks = Some(hooks.clone());
+        Self { config, hooks }
     }
 
     /// Execute an action. Returns Some(event) for event-producing actions, None for fire-and-forget.
+    ///
+    /// Wraps the inner dispatch in `on_action_start` / `on_action_finish`
+    /// hook calls so embedders can observe every action's lifecycle (e.g.
+    /// for tracing, metrics, or debug logging) without modifying the
+    /// executor.
+    ///
+    /// Hook ordering contract (matches `RitualHooks` doc comments):
+    /// - `on_action_start` fires for **every** action (including
+    ///   fire-and-forget) before dispatch.
+    /// - `on_action_finish` fires **only** for event-producing actions,
+    ///   because the trait signature requires a `&RitualEvent`. Fire-and-
+    ///   forget actions return `None` and therefore have no
+    ///   `on_action_finish` call. Embedders that want to observe
+    ///   side-effecting actions should use `on_action_start` + state-
+    ///   machine transition hooks instead.
     pub async fn execute(&self, action: &RitualAction, state: &RitualState) -> Option<RitualEvent> {
+        self.hooks.on_action_start(action, state);
+        let event = self.execute_inner(action, state).await;
+        if let Some(ref ev) = event {
+            self.hooks.on_action_finish(action, ev);
+        }
+        event
+    }
+
+    /// Inner dispatch — performs the actual action work without lifecycle
+    /// hook bookkeeping. Kept private so the only public entry point
+    /// (`execute`) always fires the hooks.
+    async fn execute_inner(
+        &self,
+        action: &RitualAction,
+        state: &RitualState,
+    ) -> Option<RitualEvent> {
         match action {
             RitualAction::DetectProject => Some(self.detect_project().await),
             RitualAction::RunTriage { task } => Some(self.run_triage(task, state).await),
@@ -210,7 +280,7 @@ impl V2Executor {
             RitualAction::RunPlanning => Some(self.run_planning(state).await),
             RitualAction::RunHarness { tasks } => Some(self.run_harness(tasks, state).await),
             RitualAction::Notify { message } => {
-                self.notify(message);
+                self.notify(message).await;
                 None
             }
             RitualAction::SaveState => {
@@ -720,8 +790,16 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     // Fire-and-forget actions
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn notify(&self, message: &str) {
-        if let Some(ref notify_fn) = self.config.notify {
+    async fn notify(&self, message: &str) {
+        // ISS-052: hooks are the canonical notification surface. Legacy
+        // `config.notify` is kept as a fallback when the embedder
+        // installed no custom hooks (i.e. `self.hooks` is `NoopHooks`),
+        // so existing call sites that wired `config.notify` continue to
+        // function unchanged. Once all embedders migrate to `hooks`, the
+        // `config.notify` field can be removed.
+        if self.config.hooks.is_some() {
+            self.hooks.notify(message).await;
+        } else if let Some(ref notify_fn) = self.config.notify {
             notify_fn(message.to_string());
         } else {
             info!(message = message, "Ritual notification (no handler)");
