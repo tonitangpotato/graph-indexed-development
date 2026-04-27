@@ -579,6 +579,57 @@ pub enum RitualEvent {
     /// ritual to `Failed` — we cannot operate without a workspace path.
     /// Distinct from `SkillFailed` because no skill has executed yet.
     WorkspaceUnresolved { error: String },
+
+    /// Self-review subloop produced an `Accept` verdict (ISS-052 T07, §8.2).
+    ///
+    /// Emitted by `V2Executor::run_self_review_subloop` when the LLM tags
+    /// its output with an explicit accept signal within the turn budget.
+    /// `skill` is the skill name being reviewed (e.g. `"implement"`,
+    /// `"draft-design"`); `turns_used` is the 1-based turn index on which
+    /// the verdict appeared (1..=MAX_TURNS).
+    ///
+    /// Transition semantics: forwards to the same `SkillCompleted{phase}`
+    /// arm so the ritual progresses just as if the skill had succeeded
+    /// without a self-review. The distinct event exists so observers
+    /// (telemetry, future gates) can tell self-reviewed completions
+    /// apart from raw skill completions, and so the state-machine arms
+    /// stay total when subloop runs are introduced. See §8 of ISS-052
+    /// design.
+    ///
+    /// `Reject` verdicts and turn-limit exhaustion never produce this
+    /// variant — they emit `SkillFailed { reason: ReviewRejected }` and
+    /// `SkillFailed { reason: LlmTurnLimitNoVerdict }` respectively.
+    /// `NeedsChanges` continues the subloop (no event emitted yet).
+    SelfReviewCompleted {
+        skill: String,
+        verdict: ReviewVerdict,
+        turns_used: u32,
+    },
+}
+
+/// Verdict produced by the self-review subloop (ISS-052 T07, §8.2).
+///
+/// Populated from the reviewing LLM's tagged output. Currently only
+/// `Accept` reaches the state machine via `SelfReviewCompleted` —
+/// `Reject` is folded into `SkillFailed { reason: ReviewRejected }`
+/// inside the subloop, and `NeedsChanges` causes a retry without
+/// emitting an event. The variant is retained on the public event so
+/// future gates (e.g. surfacing `NeedsChanges` for human review) can
+/// be added without re-shaping the enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    /// LLM emitted an explicit accept tag (e.g. `REVIEW_PASS`,
+    /// `verdict: accept`). The subloop terminates and the outer
+    /// `run_skill` returns `SelfReviewCompleted`.
+    Accept,
+    /// LLM emitted an explicit reject tag (e.g. `REVIEW_REJECT`,
+    /// `verdict: reject`). The subloop terminates and the outer
+    /// `run_skill` returns `SkillFailed { reason: ReviewRejected }`.
+    Reject,
+    /// LLM signalled it made changes and wants another review pass
+    /// (e.g. `verdict: needs-changes`). The subloop continues to the
+    /// next turn (if budget allows). Reserved for future surfacing.
+    NeedsChanges,
 }
 
 /// Structured reason a skill execution failed.
@@ -1499,6 +1550,63 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 // there's no useful checkpoint to write.
             ],
         ),
+
+        // ── ISS-052 T07: self-review subloop completion ────────────────────
+        //
+        // Forward `Accept` verdicts to the corresponding `SkillCompleted`
+        // arm so the ritual progresses identically to a non-self-reviewed
+        // skill. Prepend a notify so the subloop's outcome is visible in
+        // the channel. `Reject` and turn-limit exhaustion never reach this
+        // arm — the subloop converts them to `SkillFailed` directly. See
+        // §8.2 of ISS-052 design.
+        //
+        // `NeedsChanges` is reserved (currently the subloop continues
+        // without emitting an event); if a future gate ever surfaces it
+        // here, the catch-all below routes it to `SkillFailed` so the
+        // ritual fails closed rather than silently skipping the verdict.
+        (_, SelfReviewCompleted { skill, verdict, turns_used }) => match verdict {
+            ReviewVerdict::Accept => {
+                let (next_state, mut actions) = transition(
+                    state,
+                    SkillCompleted {
+                        phase: skill.clone(),
+                        artifacts: vec![],
+                    },
+                );
+                let notify = Notify {
+                    message: format!(
+                        "✅ Self-review accepted `{skill}` (turn {turns_used})."
+                    ),
+                };
+                // Prepend the notify so it lands before whatever the
+                // forwarded SkillCompleted arm emitted (typically a
+                // phase-transition notify).
+                actions.insert(0, notify);
+                (next_state, actions)
+            }
+            ReviewVerdict::Reject | ReviewVerdict::NeedsChanges => {
+                // Defensive: subloop folds Reject into SkillFailed and
+                // re-loops on NeedsChanges. Reaching this arm means a
+                // future gate surfaced the variant directly. Fail closed
+                // by routing through SkillFailed with ReviewRejected
+                // (verdict-specific reason was added in T05).
+                let reason = match verdict {
+                    ReviewVerdict::Reject => SkillFailureReason::ReviewRejected,
+                    ReviewVerdict::NeedsChanges => SkillFailureReason::ReviewRejected,
+                    ReviewVerdict::Accept => unreachable!(),
+                };
+                transition(
+                    state,
+                    SkillFailed {
+                        phase: skill,
+                        error: format!(
+                            "self-review returned {verdict:?} after {turns_used} turn(s)"
+                        ),
+                        reason: Some(reason),
+                    },
+                )
+            }
+        },
 
         // Retry from Escalated
         // Root fix: reset retry counters + re-detect project state for Design/Graph phases

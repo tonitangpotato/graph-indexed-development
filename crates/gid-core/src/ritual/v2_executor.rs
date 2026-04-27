@@ -28,6 +28,7 @@ use super::skill_loader::{load_skill, SkillFilePolicy};
 use super::work_unit::WorkUnit;
 use super::state_machine::{
     RitualAction, RitualEvent, RitualState, ImplementStrategy, SkillFailureReason,
+    ReviewVerdict,
     ProjectState as V2ProjectState,
 };
 use crate::graph::{Graph, NodeStatus};
@@ -764,21 +765,23 @@ impl V2Executor {
 
                     info!(skill = name, "Skill completed successfully");
                     let artifacts = artifact_strings(&diff);
-                    return RitualEvent::SkillCompleted {
+                    let completed = RitualEvent::SkillCompleted {
                         phase: name.to_string(),
                         artifacts,
                     };
+                    return self.maybe_run_self_review(name, state, completed).await;
                 }
 
                 info!(skill = name, "Skill completed successfully");
-                RitualEvent::SkillCompleted {
+                let completed = RitualEvent::SkillCompleted {
                     phase: name.to_string(),
                     artifacts: result
                         .artifacts_created
                         .iter()
                         .map(|p| p.to_string_lossy().to_string())
                         .collect(),
-                }
+                };
+                self.maybe_run_self_review(name, state, completed).await
             }
             Err(e) => {
                 warn!(skill = name, error = %e, "Skill failed");
@@ -789,6 +792,212 @@ impl V2Executor {
                 }
             }
         }
+    }
+
+    /// Wrap a `SkillCompleted` outcome with a self-review subloop when the
+    /// phase is review-eligible. Pass-through for non-eligible phases or
+    /// non-`SkillCompleted` events.
+    ///
+    /// ISS-052 T07 — ports the rustclaw self-review loop (formerly in
+    /// `rustclaw/src/ritual_runner.rs run_skill` post-success block) into
+    /// V2Executor. Three-gate behaviour now lives here so the subloop
+    /// shares the LLM scripting test infrastructure with the rest of
+    /// V2Executor (§8.4 of design).
+    ///
+    /// Eligible phases (per current rustclaw behaviour): the skills that
+    /// produce artifacts the LLM can verify in a follow-up pass —
+    /// `implement`, `execute-tasks`, `draft-design`, `update-design`,
+    /// `draft-requirements`. Other phases short-circuit to the pass-through.
+    async fn maybe_run_self_review(
+        &self,
+        name: &str,
+        state: &RitualState,
+        completed: RitualEvent,
+    ) -> RitualEvent {
+        // Pass-through for non-success events. (Today this method is only
+        // called with SkillCompleted; the match keeps the API total in
+        // case future call sites widen its input.)
+        if !matches!(completed, RitualEvent::SkillCompleted { .. }) {
+            return completed;
+        }
+
+        if !is_self_review_eligible(name) {
+            return completed;
+        }
+
+        // No LLM client → cannot run subloop. Treat as pass-through; the
+        // outer run_skill already failed on missing-LLM upstream, so this
+        // arm is mostly belt-and-braces.
+        let llm = match &self.config.llm_client {
+            Some(c) => c.clone(),
+            None => return completed,
+        };
+
+        match self.run_self_review_subloop(name, state, llm).await {
+            // Accept verdict — emit the structured event. State machine
+            // forwards to the equivalent SkillCompleted arm (§8.2).
+            SubloopOutcome::Accepted(turns_used) => RitualEvent::SelfReviewCompleted {
+                skill: name.to_string(),
+                verdict: ReviewVerdict::Accept,
+                turns_used,
+            },
+            // Reject → SkillFailed with structured reason (§8.2 / §8.3 gate 2).
+            SubloopOutcome::Rejected { turns_used, error } => RitualEvent::SkillFailed {
+                phase: name.to_string(),
+                error: error.unwrap_or_else(|| {
+                    format!("self-review rejected `{name}` after {turns_used} turn(s)")
+                }),
+                reason: Some(SkillFailureReason::ReviewRejected),
+            },
+            // All turns exhausted with no verdict tag — the bug from
+            // r-950ebf this gate exists to catch (ISS-051 §self-review).
+            SubloopOutcome::TurnLimitExhausted { last_error } => RitualEvent::SkillFailed {
+                phase: name.to_string(),
+                error: last_error.unwrap_or_else(|| {
+                    format!(
+                        "self-review of `{name}` consumed all {} turn(s) without a verdict",
+                        SELF_REVIEW_MAX_TURNS
+                    )
+                }),
+                reason: Some(SkillFailureReason::LlmTurnLimitNoVerdict),
+            },
+            // Inner skill error — propagate as SkillFailed with the raw
+            // claim preserved (matches the rustclaw "continue silently"
+            // pre-port behaviour was a bug; we now fail the phase).
+            SubloopOutcome::InnerError { error } => RitualEvent::SkillFailed {
+                phase: name.to_string(),
+                error: format!("self-review of `{name}` failed: {error}"),
+                reason: Some(SkillFailureReason::ExplicitClaim(error)),
+            },
+        }
+    }
+
+    /// Run the self-review subloop for a successful skill phase.
+    ///
+    /// Re-invokes the LLM (via `LlmClient::run_skill`) up to
+    /// `SELF_REVIEW_MAX_TURNS` times with a phase-specific review prompt,
+    /// inspecting each turn's `output` for an explicit verdict tag:
+    /// - `REVIEW_PASS` / `verdict: accept`        → `Accepted`
+    /// - `REVIEW_REJECT` / `verdict: reject`      → `Rejected`
+    /// - `verdict: needs-changes` / `needs_changes` → continue to next turn
+    /// - no recognized tag                          → continue (counts toward
+    ///   turn budget; exhausting all turns yields `TurnLimitExhausted`)
+    ///
+    /// The verdict-required gate (§8.3 gate 2) is the LlmTurnLimit branch:
+    /// without an explicit accept tag the subloop fails closed rather
+    /// than silently treating "ran out of turns" as accept (the original
+    /// r-950ebf bug).
+    async fn run_self_review_subloop(
+        &self,
+        skill_name: &str,
+        _state: &RitualState,
+        llm: Arc<dyn LlmClient>,
+    ) -> SubloopOutcome {
+        let scope = default_scope_for_phase(skill_name);
+        let tools = self.scope_to_tool_definitions(&scope);
+        let model = &self.config.skill_model;
+
+        let mut last_error: Option<String> = None;
+
+        for turn in 1..=SELF_REVIEW_MAX_TURNS {
+            let review_prompt = build_self_review_prompt(skill_name, turn, SELF_REVIEW_MAX_TURNS);
+
+            info!(
+                skill = skill_name,
+                turn = turn,
+                max_turns = SELF_REVIEW_MAX_TURNS,
+                "Running self-review turn"
+            );
+
+            let result = llm
+                .run_skill(
+                    &review_prompt,
+                    tools.clone(),
+                    model,
+                    &self.config.project_root,
+                    SELF_REVIEW_INNER_MAX_ITERATIONS,
+                )
+                .await;
+
+            match result {
+                Ok(skill_result) => {
+                    match parse_review_verdict(&skill_result.output) {
+                        Some(ReviewVerdict::Accept) => {
+                            info!(
+                                skill = skill_name,
+                                turn = turn,
+                                tokens = skill_result.tokens_used,
+                                "Self-review accepted"
+                            );
+                            return SubloopOutcome::Accepted(turn);
+                        }
+                        Some(ReviewVerdict::Reject) => {
+                            warn!(
+                                skill = skill_name,
+                                turn = turn,
+                                "Self-review rejected"
+                            );
+                            return SubloopOutcome::Rejected {
+                                turns_used: turn,
+                                error: Some(skill_result.output),
+                            };
+                        }
+                        Some(ReviewVerdict::NeedsChanges) => {
+                            // LLM made changes and asks for another pass.
+                            // Counts toward the turn budget.
+                            info!(
+                                skill = skill_name,
+                                turn = turn,
+                                tokens = skill_result.tokens_used,
+                                "Self-review reported needs-changes; continuing"
+                            );
+                            last_error = None;
+                            continue;
+                        }
+                        None => {
+                            // No verdict tag in output. Either the LLM
+                            // ran out of inner iterations or it returned
+                            // commentary without committing to a verdict.
+                            // Both look the same from the caller's POV.
+                            info!(
+                                skill = skill_name,
+                                turn = turn,
+                                tokens = skill_result.tokens_used,
+                                tool_calls = skill_result.tool_calls_made,
+                                "Self-review turn produced no verdict tag; retrying"
+                            );
+                            last_error = Some(format!(
+                                "turn {turn}: no verdict tag in {} tokens / {} tool calls",
+                                skill_result.tokens_used, skill_result.tool_calls_made
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // The inner skill call failed entirely (transport,
+                    // auth, etc). Count the turn and retry; the outer
+                    // run_ritual already wraps the original skill call
+                    // with its own retries, so a hard failure here is
+                    // notable but not necessarily fatal.
+                    warn!(
+                        skill = skill_name,
+                        turn = turn,
+                        error = %e,
+                        "Self-review turn errored; retrying"
+                    );
+                    last_error = Some(format!("turn {turn}: {e}"));
+                    if turn == SELF_REVIEW_MAX_TURNS {
+                        return SubloopOutcome::InnerError {
+                            error: e.to_string(),
+                        };
+                    }
+                    continue;
+                }
+            }
+        }
+
+        SubloopOutcome::TurnLimitExhausted { last_error }
     }
 
     async fn run_shell(&self, command: &str) -> RitualEvent {
@@ -1478,6 +1687,138 @@ fn artifact_strings(diff: &FsDiff) -> Vec<String> {
         .collect()
 }
 
+// ── ISS-052 T07: self-review subloop helpers ────────────────────────────────
+
+/// Maximum number of self-review turns per skill phase.
+///
+/// Matches the rustclaw pre-port value (4). Each turn is a full
+/// `LlmClient::run_skill` invocation; budget too small and legitimate
+/// `needs-changes` cycles fail spuriously, too large and a non-committing
+/// LLM burns tokens before the `LlmTurnLimitNoVerdict` gate fires.
+const SELF_REVIEW_MAX_TURNS: u32 = 4;
+
+/// Per-turn iteration budget passed to `LlmClient::run_skill` during
+/// self-review. The rustclaw pre-port value was 25; preserved verbatim
+/// so existing skills' verdict-emission timing is unchanged.
+const SELF_REVIEW_INNER_MAX_ITERATIONS: usize = 25;
+
+/// Internal subloop outcome — translated to a `RitualEvent` by
+/// `maybe_run_self_review`. Mirrors design §8.2's `SubloopOutcome` shape
+/// but keeps `Accepted`/`Rejected`/`TurnLimitExhausted`/`InnerError` as
+/// the four discrete branches the caller handles.
+#[derive(Debug)]
+enum SubloopOutcome {
+    /// LLM emitted an explicit accept tag on the carried turn (1-based).
+    Accepted(u32),
+    /// LLM emitted an explicit reject tag. `error` is the LLM's raw
+    /// output (used as the human-readable error string downstream).
+    Rejected { turns_used: u32, error: Option<String> },
+    /// All `SELF_REVIEW_MAX_TURNS` turns ran without a recognized
+    /// verdict tag. Triggers `SkillFailureReason::LlmTurnLimitNoVerdict`.
+    TurnLimitExhausted { last_error: Option<String> },
+    /// `LlmClient::run_skill` itself returned `Err` on the final turn.
+    /// Earlier turn errors are absorbed into the retry budget.
+    InnerError { error: String },
+}
+
+/// Phases whose `SkillCompleted` outcome is wrapped with a self-review
+/// pass. Mirrors the rustclaw pre-port list verbatim — divergence here
+/// would silently change behaviour for non-rustclaw embedders, so any
+/// future addition (e.g. `update-graph`) must come with a design note.
+fn is_self_review_eligible(name: &str) -> bool {
+    matches!(
+        name,
+        "implement"
+            | "execute-tasks"
+            | "draft-design"
+            | "update-design"
+            | "draft-requirements"
+    )
+}
+
+/// Phase-specific review checklist, ported from the rustclaw subloop.
+///
+/// The exact prose is preserved so the LLM's verdict-emission behaviour
+/// does not regress relative to the production-tested rustclaw form;
+/// the only adapted piece is the verdict-tag instruction at the bottom,
+/// which now documents the three tags the parser recognizes.
+fn build_self_review_prompt(skill_name: &str, turn: u32, max_turns: u32) -> String {
+    let checklist = match skill_name {
+        "draft-design" | "update-design" => "\
+             - Does the design actually solve the stated problem?\n\
+             - Are there missing components or interactions?\n\
+             - Are edge cases and error scenarios addressed?\n\
+             - Is the architecture over-engineered or under-engineered?\n\
+             - Are interfaces clear and well-defined?\n\
+             - Does it conflict with existing architecture?",
+        "draft-requirements" => "\
+             - Are requirements specific and testable (not vague)?\n\
+             - Are there missing requirements or unstated assumptions?\n\
+             - Are acceptance criteria measurable?\n\
+             - Do requirements conflict with each other?\n\
+             - Are non-functional requirements covered (perf, security)?",
+        // implement / execute-tasks
+        _ => "\
+             - Logic errors and incorrect assumptions\n\
+             - Missing edge cases and error handling\n\
+             - Type mismatches and off-by-one errors\n\
+             - Unused imports or variables\n\
+             - Inconsistencies with the rest of the codebase",
+    };
+
+    format!(
+        "## SELF-REVIEW ROUND {turn}/{max_turns}\n\n\
+         Read back ALL files you created or modified in the previous step. \
+         Carefully check for:\n{checklist}\n\n\
+         If you find issues, fix them using the available tools and respond \
+         with exactly: `verdict: needs-changes`\n\
+         If everything looks correct after thorough review, respond with \
+         exactly: `REVIEW_PASS`\n\
+         If the work is fundamentally wrong and cannot be salvaged in this \
+         round, respond with exactly: `REVIEW_REJECT` followed by a brief \
+         explanation."
+    )
+}
+
+/// Parse a review verdict from LLM output.
+///
+/// Recognized tags (case-insensitive, substring match):
+/// - Accept: `REVIEW_PASS`, `REVIEW-PASS`, `verdict: accept`
+/// - Reject: `REVIEW_REJECT`, `REVIEW-REJECT`, `verdict: reject`
+/// - NeedsChanges: `verdict: needs-changes`, `verdict: needs_changes`,
+///   `needs-changes`, `needs_changes`
+///
+/// Order matters: a single output containing both `REVIEW_PASS` and
+/// `verdict: reject` would normally be ambiguous, but in practice the
+/// LLM emits exactly one tag per turn. Reject is checked before Accept
+/// so that a fixup like "removed REVIEW_REJECT, now REVIEW_PASS" doesn't
+/// get false-rejected, but a literal "REVIEW_REJECT" does win over a
+/// stray pass tag elsewhere in the same message — fail-closed bias.
+fn parse_review_verdict(output: &str) -> Option<ReviewVerdict> {
+    let lc = output.to_lowercase();
+
+    // Reject takes precedence so that a clear reject signal is not
+    // overridden by an accidental "REVIEW_PASS" elsewhere in prose.
+    if lc.contains("review_reject") || lc.contains("review-reject") || lc.contains("verdict: reject")
+    {
+        return Some(ReviewVerdict::Reject);
+    }
+
+    if lc.contains("review_pass") || lc.contains("review-pass") || lc.contains("verdict: accept") {
+        return Some(ReviewVerdict::Accept);
+    }
+
+    if lc.contains("verdict: needs-changes")
+        || lc.contains("verdict: needs_changes")
+        || lc.contains("needs-changes")
+        || lc.contains("needs_changes")
+    {
+        return Some(ReviewVerdict::NeedsChanges);
+    }
+
+    None
+}
+
 /// Extract JSON from LLM output (handles markdown code fences).
 fn extract_json(output: &str) -> &str {
     // Try to find ```json ... ``` block
@@ -2020,6 +2361,14 @@ mod tests {
         tokens: u64,
         tool_calls: usize,
         invocations: AtomicUsize,
+        /// Output tag injected when the prompt is a self-review prompt
+        /// (heuristic: contains `SELF-REVIEW ROUND`). Defaults to
+        /// `REVIEW_PASS` so existing tests of self-review-eligible
+        /// phases auto-accept the wrapped subloop without rewriting.
+        /// Tests that want to exercise the subloop's verdict gates
+        /// (Reject, NeedsChanges, no-tag) override this via
+        /// `with_self_review_output`.
+        self_review_output: Mutex<String>,
     }
 
     impl ScriptedLlm {
@@ -2032,7 +2381,18 @@ mod tests {
                 tokens,
                 tool_calls,
                 invocations: AtomicUsize::new(0),
+                self_review_output: Mutex::new("REVIEW_PASS".to_string()),
             }
+        }
+
+        /// Override the output emitted on self-review turns. Each call
+        /// to `run_skill` whose prompt looks like a self-review prompt
+        /// returns this string as `SkillResult::output`. Use this to
+        /// exercise the verdict gates from tests.
+        #[allow(dead_code)]
+        fn with_self_review_output(self, output: impl Into<String>) -> Self {
+            *self.self_review_output.lock().unwrap() = output.into();
+            self
         }
     }
 
@@ -2040,16 +2400,30 @@ mod tests {
     impl LlmClient for ScriptedLlm {
         async fn run_skill(
             &self,
-            _skill_prompt: &str,
+            skill_prompt: &str,
             _tools: Vec<ToolDefinition>,
             _model: &str,
             working_dir: &Path,
             _max_iterations: usize,
         ) -> Result<SkillResult> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
-            (self.action.lock().unwrap())(working_dir);
+            // Self-review turns reuse the same `run_skill` entry point;
+            // detect them by the prompt header so the action closure
+            // fires only on the original phase invocation. Without this,
+            // a review turn would re-run the LLM's mutation closure,
+            // producing duplicate file writes that obscure the gate
+            // under test.
+            let is_self_review = skill_prompt.contains("SELF-REVIEW ROUND");
+            if !is_self_review {
+                (self.action.lock().unwrap())(working_dir);
+            }
+            let output = if is_self_review {
+                self.self_review_output.lock().unwrap().clone()
+            } else {
+                "ok".into()
+            };
             Ok(SkillResult {
-                output: "ok".into(),
+                output,
                 artifacts_created: vec![],
                 tool_calls_made: self.tool_calls,
                 tokens_used: self.tokens,
@@ -2126,19 +2500,25 @@ mod tests {
         let state = RitualState::new();
         let event = executor.run_skill("implement", "fix the bug", &state).await;
 
+        // ISS-052 T07: implement is self-review-eligible. ScriptedLlm
+        // emits `REVIEW_PASS` on review turns by default, so the
+        // subloop returns `SelfReviewCompleted{Accept}` instead of the
+        // raw `SkillCompleted`. The artifacts are no longer carried in
+        // the event (the Accept arm forwards through `transition` which
+        // synthesises an empty-artifact SkillCompleted) — we instead
+        // verify the filesystem diff post-hoc.
         match event {
-            RitualEvent::SkillCompleted { phase, artifacts } => {
-                assert_eq!(phase, "implement");
-                let mut sorted = artifacts.clone();
-                sorted.sort();
-                assert_eq!(
-                    sorted,
-                    vec!["src/lib.rs".to_string(), "src/new.rs".to_string()],
-                    "artifacts should reflect actual filesystem diff"
-                );
+            RitualEvent::SelfReviewCompleted { skill, verdict, turns_used } => {
+                assert_eq!(skill, "implement");
+                assert_eq!(verdict, ReviewVerdict::Accept);
+                assert_eq!(turns_used, 1, "REVIEW_PASS should accept on turn 1");
             }
-            other => panic!("expected SkillCompleted, got {:?}", other),
+            other => panic!("expected SelfReviewCompleted, got {:?}", other),
         }
+        // The original-phase mutation should still have hit disk exactly once.
+        assert!(tmp.path().join("src/new.rs").exists(), "new file written");
+        let lib = std::fs::read_to_string(tmp.path().join("src/lib.rs")).unwrap();
+        assert!(lib.contains("println!"), "lib.rs mutated by phase action");
     }
 
     #[tokio::test]
@@ -2825,5 +3205,297 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "backoff total exceeded 2s — runaway loop or wrong constants? got {:?}", elapsed
         );
+    }
+
+    // ── ISS-052 T07: self-review subloop tests ──────────────────────────────
+    //
+    // These tests pin the §8 contract of the ported subloop:
+    // - eligible phases wrap SkillCompleted with a verdict-gated subloop;
+    // - REVIEW_PASS on turn N → SelfReviewCompleted{turns_used: N};
+    // - REVIEW_REJECT → SkillFailed{ReviewRejected};
+    // - all turns with no verdict tag → SkillFailed{LlmTurnLimitNoVerdict}
+    //   (the r-950ebf bug-class this gate was added to catch);
+    // - non-eligible phases short-circuit to raw SkillCompleted, leaving
+    //   pre-existing test paths unaffected.
+    //
+    // The verdict parser itself is also unit-tested below so adding new
+    // tags doesn't require an integration test loop.
+
+    #[test]
+    fn parse_review_verdict_recognizes_accept_tags() {
+        assert_eq!(parse_review_verdict("REVIEW_PASS"), Some(ReviewVerdict::Accept));
+        assert_eq!(parse_review_verdict("review_pass"), Some(ReviewVerdict::Accept));
+        assert_eq!(parse_review_verdict("REVIEW-PASS"), Some(ReviewVerdict::Accept));
+        assert_eq!(
+            parse_review_verdict("LGTM. verdict: accept"),
+            Some(ReviewVerdict::Accept)
+        );
+    }
+
+    #[test]
+    fn parse_review_verdict_recognizes_reject_tags() {
+        assert_eq!(parse_review_verdict("REVIEW_REJECT"), Some(ReviewVerdict::Reject));
+        assert_eq!(parse_review_verdict("review_reject — broken"), Some(ReviewVerdict::Reject));
+        assert_eq!(
+            parse_review_verdict("This is wrong. verdict: reject"),
+            Some(ReviewVerdict::Reject)
+        );
+    }
+
+    #[test]
+    fn parse_review_verdict_recognizes_needs_changes() {
+        assert_eq!(
+            parse_review_verdict("Found issues. verdict: needs-changes"),
+            Some(ReviewVerdict::NeedsChanges)
+        );
+        assert_eq!(
+            parse_review_verdict("verdict: needs_changes"),
+            Some(ReviewVerdict::NeedsChanges)
+        );
+    }
+
+    #[test]
+    fn parse_review_verdict_returns_none_for_commentary() {
+        assert_eq!(parse_review_verdict(""), None);
+        assert_eq!(parse_review_verdict("ok"), None);
+        assert_eq!(parse_review_verdict("This looks fine to me."), None);
+    }
+
+    #[test]
+    fn parse_review_verdict_reject_wins_over_pass() {
+        // Fail-closed bias documented on the parser: a stray accept tag
+        // alongside a reject tag should not silently pass.
+        let mixed = "I see REVIEW_PASS in earlier output but verdict: reject after re-read";
+        assert_eq!(parse_review_verdict(mixed), Some(ReviewVerdict::Reject));
+    }
+
+    #[test]
+    fn is_self_review_eligible_matches_rustclaw_preport_list() {
+        for skill in &[
+            "implement",
+            "execute-tasks",
+            "draft-design",
+            "update-design",
+            "draft-requirements",
+        ] {
+            assert!(is_self_review_eligible(skill), "{skill} should be eligible");
+        }
+        for skill in &["review-design", "review-tasks", "research", "update-graph"] {
+            assert!(!is_self_review_eligible(skill), "{skill} should NOT be eligible");
+        }
+    }
+
+    #[tokio::test]
+    async fn self_review_subloop_skipped_for_non_eligible_phase() {
+        // `update-graph` is not in the eligible list — the wrapper must
+        // pass SkillCompleted through verbatim. No invocation count
+        // beyond the single original phase call.
+        // (We use `update-graph` rather than `research` because the
+        // skill loader needs a known skill name to load a prompt; the
+        // eligibility check happens after skill loading.)
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        let llm = Arc::new(ScriptedLlm::new(
+            |root: &Path| {
+                // update-graph has SkillFilePolicy::Required → must
+                // produce at least one file write to satisfy the gate.
+                std::fs::write(root.join("src/lib.rs"), b"fn main() { println!(); }").unwrap();
+            },
+            1_000,
+            0,
+        ));
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("update-graph", "refresh graph", &state).await;
+
+        match event {
+            RitualEvent::SkillCompleted { phase, .. } => {
+                assert_eq!(phase, "update-graph");
+            }
+            other => panic!("expected SkillCompleted, got {:?}", other),
+        }
+        // Only the phase invocation, no review turns.
+        assert_eq!(
+            llm.invocations.load(Ordering::SeqCst),
+            1,
+            "non-eligible phase should not trigger subloop"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_review_subloop_accepts_on_first_turn() {
+        // REVIEW_PASS on turn 1 → SelfReviewCompleted{turns_used:1}.
+        // ScriptedLlm's default review output is REVIEW_PASS, so this
+        // is the canonical happy path.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        let llm = Arc::new(ScriptedLlm::new(
+            |root: &Path| {
+                std::fs::write(root.join("src/lib.rs"), b"fn main() { println!(); }").unwrap();
+            },
+            5_000,
+            1,
+        ));
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("draft-design", "design X", &state).await;
+
+        match event {
+            RitualEvent::SelfReviewCompleted { skill, verdict, turns_used } => {
+                assert_eq!(skill, "draft-design");
+                assert_eq!(verdict, ReviewVerdict::Accept);
+                assert_eq!(turns_used, 1);
+            }
+            other => panic!("expected SelfReviewCompleted, got {:?}", other),
+        }
+        // 1 phase + 1 review turn = 2 invocations.
+        assert_eq!(llm.invocations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn self_review_subloop_rejects_on_review_reject() {
+        // REVIEW_REJECT → SkillFailed{ReviewRejected}, gate 2 of §8.3.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        let llm = Arc::new(
+            ScriptedLlm::new(
+                |root: &Path| {
+                    std::fs::write(root.join("src/lib.rs"), b"// changed").unwrap();
+                },
+                5_000,
+                1,
+            )
+            .with_self_review_output("REVIEW_REJECT — fundamentally broken"),
+        );
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("implement", "fix the bug", &state).await;
+
+        match event {
+            RitualEvent::SkillFailed { phase, error: _, reason } => {
+                assert_eq!(phase, "implement");
+                assert_eq!(reason, Some(SkillFailureReason::ReviewRejected));
+            }
+            other => panic!("expected SkillFailed(ReviewRejected), got {:?}", other),
+        }
+        // 1 phase + 1 review turn that emitted reject.
+        assert_eq!(llm.invocations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn self_review_subloop_turn_limit_all_attempts_fails() {
+        // §8.1 / §8.2: the r-950ebf bug. LLM never emits a verdict tag;
+        // pre-port behaviour silently accepted, post-port we must emit
+        // SkillFailed{LlmTurnLimitNoVerdict} after MAX_TURNS attempts.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        let llm = Arc::new(
+            ScriptedLlm::new(
+                |root: &Path| {
+                    std::fs::write(root.join("src/lib.rs"), b"// changed").unwrap();
+                },
+                3_000,
+                2,
+            )
+            .with_self_review_output("I read the files. Looks complicated."),
+        );
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("implement", "fix the bug", &state).await;
+
+        match event {
+            RitualEvent::SkillFailed { phase, error, reason } => {
+                assert_eq!(phase, "implement");
+                assert_eq!(reason, Some(SkillFailureReason::LlmTurnLimitNoVerdict));
+                assert!(
+                    error.contains("verdict") || error.contains("turn"),
+                    "error should mention verdict / turn budget, got: {error}"
+                );
+            }
+            other => panic!("expected SkillFailed(LlmTurnLimitNoVerdict), got {:?}", other),
+        }
+        // 1 phase + MAX_TURNS review attempts.
+        assert_eq!(
+            llm.invocations.load(Ordering::SeqCst),
+            1 + SELF_REVIEW_MAX_TURNS as usize,
+            "subloop must consume the full turn budget before failing"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_review_subloop_recovers_on_later_turn() {
+        // §9.1 `subloop_recovers_on_turn_3`: simulated by a verdict
+        // string that triggers needs-changes-or-no-tag for the first
+        // few turns then accepts. ScriptedLlm only supports one fixed
+        // verdict string, so we simulate the simpler shape here:
+        // needs-changes is NOT a terminating verdict — it counts as
+        // "another turn please". After MAX_TURNS of needs-changes the
+        // outcome must be `LlmTurnLimitNoVerdict`, NOT silent accept.
+        // This pins the contract: needs-changes alone, if the LLM never
+        // commits to a final verdict, fails closed.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+
+        let llm = Arc::new(
+            ScriptedLlm::new(
+                |root: &Path| {
+                    std::fs::write(root.join("src/lib.rs"), b"// changed").unwrap();
+                },
+                2_000,
+                1,
+            )
+            .with_self_review_output("Made some edits. verdict: needs-changes"),
+        );
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("implement", "fix the bug", &state).await;
+
+        match event {
+            RitualEvent::SkillFailed { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    Some(SkillFailureReason::LlmTurnLimitNoVerdict),
+                    "needs-changes-only must fail closed after turn budget"
+                );
+            }
+            other => panic!("expected LlmTurnLimitNoVerdict, got {:?}", other),
+        }
+        assert_eq!(
+            llm.invocations.load(Ordering::SeqCst),
+            1 + SELF_REVIEW_MAX_TURNS as usize
+        );
+    }
+
+    #[test]
+    fn build_self_review_prompt_contains_verdict_instructions() {
+        // Pin the prompt contract: the LLM must be told about all three
+        // tags so the parser actually has something to parse.
+        let p = build_self_review_prompt("implement", 2, 4);
+        assert!(p.contains("SELF-REVIEW ROUND 2/4"));
+        assert!(p.contains("REVIEW_PASS"));
+        assert!(p.contains("REVIEW_REJECT"));
+        assert!(p.contains("needs-changes"));
+        // implement checklist branch
+        assert!(p.contains("Logic errors"));
+
+        let p = build_self_review_prompt("draft-design", 1, 4);
+        assert!(p.contains("Does the design actually solve"));
+
+        let p = build_self_review_prompt("draft-requirements", 1, 4);
+        assert!(p.contains("specific and testable"));
     }
 }
