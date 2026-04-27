@@ -24,6 +24,7 @@ use super::graph_phase_mode::{
 use super::hooks::{NoopHooks, RitualHooks, WorkspaceError};
 use super::llm::{LlmClient, ToolDefinition};
 use super::scope::default_scope_for_phase;
+use super::skill_loader::{load_skill, SkillFilePolicy};
 use super::work_unit::WorkUnit;
 use super::state_machine::{
     RitualAction, RitualEvent, RitualState, ImplementStrategy, SkillFailureReason,
@@ -565,9 +566,10 @@ impl V2Executor {
             .map(|pf| pf.effective_skill_name.as_str())
             .unwrap_or(name);
 
-        // Load skill prompt
-        let base_prompt = match self.load_skill_prompt(effective_name) {
-            Ok(p) => p,
+        // Load skill prompt + file_policy (ISS-052 T06). Falls back to
+        // built-in prompts for core phases when no SKILL.md is found.
+        let loaded_skill = match load_skill(effective_name, &self.config.project_root) {
+            Ok(s) => s,
             Err(e) => {
                 return RitualEvent::SkillFailed {
                     phase: name.to_string(),
@@ -576,6 +578,8 @@ impl V2Executor {
                 };
             }
         };
+        let base_prompt = loaded_skill.prompt.clone();
+        let file_policy = loaded_skill.file_policy;
 
         // Enrich context for implement phases
         let effective_context = if name == "implement" {
@@ -655,7 +659,14 @@ impl V2Executor {
                 "Cross-workspace ritual: LLM cwd != target. Verify post-conditions still apply at target_root."
             );
         }
-        let snapshot_before = if Self::phase_requires_file_changes(name) {
+        // ISS-052 T06: file-policy-driven snapshot. Required and Forbidden
+        // both need a snapshot/diff (Required to detect zero-change
+        // failures, Forbidden to detect any-change violations). Optional
+        // skips the snapshot to avoid the IO cost when no gate runs.
+        let snapshot_before = if matches!(
+            file_policy,
+            SkillFilePolicy::Required | SkillFilePolicy::Forbidden
+        ) {
             Some(snapshot_dir(&mutation_root))
         } else {
             None
@@ -683,41 +694,72 @@ impl V2Executor {
                     }
                 }
 
-                // ISS-025 #1+#2: For phases that must produce file changes,
-                // diff the tree and override the SkillResult's empty
-                // `artifacts_created` (the api_llm_client returns vec![]
-                // because tracking was deferred to the engine layer — this
-                // is that layer). If no files changed in an `implement`
-                // phase, treat it as failure regardless of LLM exit status.
+                // ISS-052 T06: policy-driven post-condition gates.
+                // Required → empty diff is failure (the ISS-038 gate).
+                // Forbidden → non-empty diff is failure (review/triage
+                //   skills must not write code).
+                // Optional → snapshot wasn't taken; we fall through to
+                //   the claim-driven success path below.
                 if let Some(before) = snapshot_before {
                     let after = snapshot_dir(&mutation_root);
                     let diff = diff_snapshots(&before, &after);
                     info!(
                         skill = name,
+                        policy = ?file_policy,
                         added = diff.added.len(),
                         modified = diff.modified.len(),
                         deleted = diff.deleted.len(),
                         "Phase file-change diff"
                     );
 
-                    if name == "implement" && diff.is_empty() {
-                        warn!(
-                            skill = name,
-                            tokens = result.tokens_used,
-                            tool_calls = result.tool_calls_made,
-                            "implement phase produced no file changes (ISS-025 post-condition violation)"
-                        );
-                        return RitualEvent::SkillFailed {
-                            phase: name.to_string(),
-                            error: format!(
-                                "implement phase produced no file changes — \
-                                 LLM consumed {} tokens across {} tool calls but did not call Write/Edit. \
-                                 This usually means the prompt was too vague (missing design.md) \
-                                 or the LLM degenerated into analysis mode. See ISS-025.",
-                                result.tokens_used, result.tool_calls_made
-                            ),
-                            reason: Some(SkillFailureReason::ZeroFileChanges),
-                        };
+                    match file_policy {
+                        SkillFilePolicy::Required if diff.is_empty() => {
+                            warn!(
+                                skill = name,
+                                tokens = result.tokens_used,
+                                tool_calls = result.tool_calls_made,
+                                "Required-policy skill produced no file changes (ISS-038 post-condition violation)"
+                            );
+                            return RitualEvent::SkillFailed {
+                                phase: name.to_string(),
+                                error: format!(
+                                    "skill `{}` declares file_policy=required but produced no file changes — \
+                                     LLM consumed {} tokens across {} tool calls but did not call Write/Edit. \
+                                     This usually means the prompt was too vague (missing design.md) \
+                                     or the LLM degenerated into analysis mode. See ISS-038/ISS-052.",
+                                    name, result.tokens_used, result.tool_calls_made
+                                ),
+                                reason: Some(SkillFailureReason::ZeroFileChanges),
+                            };
+                        }
+                        SkillFilePolicy::Forbidden if !diff.is_empty() => {
+                            warn!(
+                                skill = name,
+                                added = diff.added.len(),
+                                modified = diff.modified.len(),
+                                deleted = diff.deleted.len(),
+                                "Forbidden-policy skill mutated files (ISS-052 §5.4 violation)"
+                            );
+                            let artifacts = artifact_strings(&diff);
+                            return RitualEvent::SkillFailed {
+                                phase: name.to_string(),
+                                error: format!(
+                                    "skill `{}` declares file_policy=forbidden but mutated {} files \
+                                     (+{} -{} ~{}). Review/inspection skills must not write code; \
+                                     if this skill should produce files, change its file_policy to \
+                                     required or optional in its SKILL.md frontmatter. \
+                                     Affected paths: {}",
+                                    name,
+                                    diff.added.len() + diff.modified.len() + diff.deleted.len(),
+                                    diff.added.len(),
+                                    diff.deleted.len(),
+                                    diff.modified.len(),
+                                    artifacts.join(", "),
+                                ),
+                                reason: Some(SkillFailureReason::UnexpectedFileChanges),
+                            };
+                        }
+                        _ => {}
                     }
 
                     info!(skill = name, "Skill completed successfully");
@@ -1081,47 +1123,6 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     // Private helpers (existing)
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn load_skill_prompt(&self, skill_name: &str) -> Result<String> {
-        // Priority: .gid/skills/{name}.md → built-in prompts
-
-        let gid_skill = self
-            .config
-            .project_root
-            .join(".gid")
-            .join("skills")
-            .join(format!("{}.md", skill_name));
-
-        if gid_skill.exists() {
-            return Ok(std::fs::read_to_string(&gid_skill)?);
-        }
-
-        // Check home-relative skills directories (RustClaw, etc.)
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            let rustclaw_skill = home
-                .join("rustclaw")
-                .join("skills")
-                .join(skill_name)
-                .join("SKILL.md");
-
-            if rustclaw_skill.exists() {
-                return Ok(std::fs::read_to_string(&rustclaw_skill)?);
-            }
-        }
-
-        // Built-in fallback prompts (extracted to prompts/*.txt — ISS-039 Fix 1)
-        match skill_name {
-            "draft-design" => Ok(include_str!("prompts/draft_design.txt").to_string()),
-            "update-design" => Ok(include_str!("prompts/update_design.txt").to_string()),
-            "generate-graph" | "design-to-graph" => {
-                Ok(include_str!("prompts/generate_graph.txt").to_string())
-            }
-            "update-graph" => Ok(include_str!("prompts/update_graph.txt").to_string()),
-            "implement" => Ok(include_str!("prompts/implement.txt").to_string()),
-            _ => anyhow::bail!("Unknown skill: {}", skill_name),
-        }
-    }
-
     fn read_verify_command(&self) -> Option<String> {
         let config_path = self.config.project_root.join(".gid").join("config.yml");
         if !config_path.exists() {
@@ -1225,18 +1226,6 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         } else {
             self.config.project_root.clone()
         }
-    }
-
-    /// Phases whose success is defined as "the filesystem changed."
-    ///
-    /// Currently only `implement` qualifies — design/requirements skills
-    /// also write files but their failure modes are different (and they
-    /// already have artifact-existence checks elsewhere). Keeping this
-    /// list narrow avoids false positives on phases that are *allowed*
-    /// to be no-ops (e.g. review skills that may legitimately conclude
-    /// "no changes needed").
-    fn phase_requires_file_changes(name: &str) -> bool {
-        matches!(name, "implement")
     }
 
     /// True if this skill name corresponds to the Graphing ritual phase.
@@ -2075,9 +2064,9 @@ mod tests {
             ..V2ExecutorConfig::default()
         };
         // Ensure the implement skill prompt loader can find *something*.
-        // run_skill calls load_skill_prompt; for the implement phase the
-        // executor falls back to a built-in prompt template, so no extra
-        // file setup is needed here.
+        // run_skill calls load_skill (skill_loader); for the implement
+        // phase the loader falls back to the built-in prompt template
+        // (file_policy = Required), so no extra file setup is needed.
         V2Executor::new(cfg)
     }
 
@@ -2153,12 +2142,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_implement_phase_does_not_enforce_file_change_postcondition() {
-        // Review phases are allowed to be no-ops (e.g. "no findings"). The
-        // post-condition must NOT fire for them.
+    async fn forbidden_policy_skill_with_no_file_changes_succeeds() {
+        // A skill declared with file_policy=forbidden should pass when
+        // it leaves the tree untouched (the canonical review-skill
+        // scenario). We pin the policy via a project-local SKILL.md so
+        // the test doesn't depend on $HOME's bundled skills.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".gid").join("skills")).unwrap();
+        std::fs::write(
+            tmp.path().join(".gid/skills/review-design.md"),
+            "---\nfile_policy: forbidden\n---\nReview only — do not edit files.",
+        )
+        .unwrap();
 
         let llm = Arc::new(ScriptedLlm::new(|_: &Path| {}, 1_000, 0));
         let executor = make_executor_with_llm(tmp.path(), llm.clone());
@@ -2171,19 +2168,78 @@ mod tests {
                 assert_eq!(phase, "review-design");
             }
             other => panic!(
-                "non-implement phase with zero file changes must still complete; got {:?}",
+                "forbidden-policy skill with zero file changes must complete; got {:?}",
                 other
             ),
         }
     }
 
-    #[test]
-    fn phase_requires_file_changes_only_implement() {
-        assert!(V2Executor::phase_requires_file_changes("implement"));
-        assert!(!V2Executor::phase_requires_file_changes("review-design"));
-        assert!(!V2Executor::phase_requires_file_changes("draft-design"));
-        assert!(!V2Executor::phase_requires_file_changes("triage"));
-        assert!(!V2Executor::phase_requires_file_changes("verify"));
+    #[tokio::test]
+    async fn forbidden_policy_skill_that_writes_files_emits_skill_failed() {
+        // ISS-052 §5.4: a review/triage skill that mutates the workspace
+        // must fail with SkillFailureReason::UnexpectedFileChanges.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".gid").join("skills")).unwrap();
+        std::fs::write(
+            tmp.path().join(".gid/skills/review-design.md"),
+            "---\nfile_policy: forbidden\n---\nReview only.",
+        )
+        .unwrap();
+
+        // LLM misbehaves and writes a file despite the forbidden policy.
+        let llm = Arc::new(ScriptedLlm::new(
+            |root: &Path| {
+                std::fs::write(root.join("src/sneaky.rs"), b"// should not be here").unwrap();
+            },
+            1_000,
+            1,
+        ));
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("review-design", "review", &state).await;
+
+        match event {
+            RitualEvent::SkillFailed { phase, error, reason } => {
+                assert_eq!(phase, "review-design");
+                assert_eq!(reason, Some(SkillFailureReason::UnexpectedFileChanges));
+                assert!(
+                    error.contains("forbidden") && error.contains("sneaky.rs"),
+                    "error should name the policy + the offending path, got: {}",
+                    error
+                );
+            }
+            other => panic!("expected SkillFailed UnexpectedFileChanges, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_policy_skill_skips_snapshot_and_succeeds() {
+        // Optional-policy skills don't snapshot the tree at all; success
+        // is claim-driven from the LLM result.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), b"fn main() {}").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".gid").join("skills")).unwrap();
+        std::fs::write(
+            tmp.path().join(".gid/skills/research.md"),
+            "---\nfile_policy: optional\n---\nResearch.",
+        )
+        .unwrap();
+
+        let llm = Arc::new(ScriptedLlm::new(|_: &Path| {}, 1_000, 0));
+        let executor = make_executor_with_llm(tmp.path(), llm.clone());
+
+        let state = RitualState::new();
+        let event = executor.run_skill("research", "look stuff up", &state).await;
+
+        assert!(
+            matches!(event, RitualEvent::SkillCompleted { .. }),
+            "optional-policy skill must succeed regardless of file changes; got {:?}",
+            event
+        );
     }
 
     // ── ISS-039 wiring smoke tests ──

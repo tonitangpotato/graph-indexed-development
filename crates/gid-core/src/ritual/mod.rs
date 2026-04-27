@@ -27,6 +27,7 @@ pub mod gating;
 pub mod work_unit;
 pub mod graph_phase_mode;
 pub mod hooks;
+pub mod skill_loader;
 
 // Re-export key types
 pub use definition::{
