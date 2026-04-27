@@ -27,7 +27,7 @@ use super::scope::default_scope_for_phase;
 use super::skill_loader::{load_skill, SkillFilePolicy};
 use super::work_unit::WorkUnit;
 use super::state_machine::{
-    RitualAction, RitualEvent, RitualState, ImplementStrategy, SkillFailureReason,
+    RitualAction, RitualEvent, RitualState, RitualPhase, ImplementStrategy, SkillFailureReason,
     ReviewVerdict,
     ProjectState as V2ProjectState,
 };
@@ -1848,30 +1848,189 @@ fn extract_json(output: &str) -> &str {
 // V2 Engine Loop — drives the state machine to completion
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Outcome of a `run_ritual` invocation.
+///
+/// Carries the final ritual state and a coarse-grained terminal status
+/// summarising how the ritual ended. Used by embedders (rustclaw, CLI tools)
+/// to decide what to do next: archive the state file, notify the user with a
+/// final summary, set process exit codes, etc.
+///
+/// **Why this type, not `Result<RitualState>`?**
+/// - "Failure" in the ritual sense is **terminal but not an error** — an
+///   `Escalated` ritual ran to completion, the operator just needs to act.
+///   Conflating it with `Result::Err` muddles the embedder's match logic.
+/// - Pre-phase failures (workspace resolution) need to surface as a ritual
+///   outcome too, not a panic — same recovery path as any other terminal
+///   state.
+/// - Carrying the full `RitualState` lets the embedder inspect retries,
+///   `persist_degraded`, phase history, etc. without separate ceremony.
+#[derive(Debug, Clone)]
+pub struct RitualOutcome {
+    /// Final ritual state when the loop exited.
+    pub state: RitualState,
+    /// Coarse-grained terminal classification.
+    pub status: RitualOutcomeStatus,
+}
+
+/// Terminal classification of a ritual run.
+///
+/// Mirrors the terminal phases of the state machine plus a synthetic
+/// `WorkspaceFailed` for the pre-phase resolution error case (since we never
+/// reach the state machine in that path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RitualOutcomeStatus {
+    /// Ritual reached `RitualPhase::Done`.
+    Completed,
+    /// Ritual was cancelled (user, adapter shutdown, etc.).
+    Cancelled,
+    /// Ritual escalated (skill failure, persistence exhausted, etc.).
+    Escalated,
+    /// Ritual paused waiting for clarification or human input — embedder
+    /// must persist state and resume later.
+    Paused,
+    /// Ritual exceeded the engine iteration safety limit. Treated as
+    /// distinct from `Escalated` because the underlying cause is a
+    /// state-machine bug or pathological input, not an embedder-actionable
+    /// error.
+    IterationLimitExceeded,
+    /// `hooks.resolve_workspace` returned an error before any phase ran.
+    /// The carried `RitualState` will be in its initial pre-`Start` form;
+    /// the error message lives in `error_context`.
+    WorkspaceFailed,
+}
+
+impl RitualOutcome {
+    /// Classify a terminal `RitualState` into an outcome.
+    fn from_state(state: RitualState) -> Self {
+        let status = match state.phase {
+            RitualPhase::Done => RitualOutcomeStatus::Completed,
+            RitualPhase::Cancelled => RitualOutcomeStatus::Cancelled,
+            RitualPhase::Escalated => RitualOutcomeStatus::Escalated,
+            RitualPhase::WaitingClarification => RitualOutcomeStatus::Paused,
+            // Defensive: if we exited the loop on a non-terminal phase,
+            // treat it as an iteration-limit escape hatch. State machine
+            // guarantees this branch is unreachable in practice, but a
+            // bug in `is_terminal`/`is_paused` would otherwise silently
+            // misclassify.
+            _ => RitualOutcomeStatus::IterationLimitExceeded,
+        };
+        Self { state, status }
+    }
+
+    /// Construct a `WorkspaceFailed` outcome from a fresh state and an
+    /// error message. Sets `state.error_context` so embedders following
+    /// `RitualState`'s usual error-inspection conventions still see the
+    /// message in the same place.
+    fn workspace_failed(mut state: RitualState, error: String) -> Self {
+        state.error_context = Some(error);
+        Self {
+            state,
+            status: RitualOutcomeStatus::WorkspaceFailed,
+        }
+    }
+}
+
 /// Run the full ritual state machine to completion.
 ///
-/// This is the main entry point: takes a task string, creates the initial state,
-/// and runs transition() + executor in a loop until terminal state.
+/// **ISS-052 T08 — breaking signature change.** The previous `(task: &str,
+/// executor: &V2Executor) -> Result<RitualState>` form is gone. New embedders
+/// pass an initial state (with `work_unit` set per ISS-029), an executor
+/// config, and a `RitualHooks` implementation — see design.md §5.6.2.
+///
+/// Lifecycle (matches design §5.6.2):
+/// 1. Construct an internal `V2Executor` from `config + hooks`.
+/// 2. Resolve workspace via `hooks.resolve_workspace`. On failure, emit
+///    `RitualEvent::WorkspaceUnresolved` (state machine routes it to
+///    `Escalated`) and return early — no phase ever ran.
+/// 3. Stamp metadata once via `hooks.stamp_metadata` (FINDING-12).
+/// 4. Drive the state machine: each `transition` produces an action set,
+///    each action goes through `executor.execute()` (the canonical single
+///    dispatcher), the resulting event is folded back via `transition`.
+/// 5. After every applied event, if the phase changed, fire
+///    `hooks.on_phase_transition(prev, current)`.
+/// 6. Loop until terminal phase, paused phase, or iteration limit.
+///
+/// Cancellation is **not** polled here — `V2Executor::execute` polls
+/// `hooks.should_cancel()` itself and emits `RitualEvent::Cancelled` which
+/// routes to the terminal `Cancelled` phase. Adding a second poll point in
+/// `run_ritual` would create racy duplicate cancellation events.
 pub async fn run_ritual(
-    task: &str,
-    executor: &V2Executor,
-) -> Result<RitualState> {
+    initial_state: RitualState,
+    config: V2ExecutorConfig,
+    hooks: Arc<dyn RitualHooks>,
+) -> RitualOutcome {
     use super::state_machine::transition;
 
-    let mut state = RitualState::new();
-    let (new_state, actions) = transition(&state, RitualEvent::Start { task: task.to_string() });
-    state = new_state;
+    let executor = V2Executor::with_hooks(config, hooks.clone());
+    let mut state = initial_state;
 
-    // Execute initial actions
+    // ── Step 1: resolve workspace BEFORE any phase action runs ──
+    // Per design §5.6.2, workspace resolution is the first thing
+    // `run_ritual` does. Failure routes through the state machine
+    // (WorkspaceUnresolved → Escalated) so that even pre-phase failures
+    // produce a coherent ritual state — not a thrown error that would
+    // bypass notify hooks and leave the operator with no record of what
+    // happened.
+    if let Some(work_unit) = state.work_unit.clone() {
+        match hooks.resolve_workspace(&work_unit) {
+            Ok(path) => {
+                // Cache resolved path on state for downstream phase actions
+                // (preserves backwards compat with `target_root`-only state
+                // files per design §7.5).
+                state.target_root = Some(path.to_string_lossy().into_owned());
+            }
+            Err(e) => {
+                let error_msg = format!("workspace resolution: {e}");
+                error!(error = %error_msg, "Ritual workspace resolution failed");
+                let (failed_state, _actions) = transition(
+                    &state,
+                    RitualEvent::WorkspaceUnresolved { error: error_msg.clone() },
+                );
+                // We do NOT execute the produced actions: WorkspaceUnresolved
+                // by design emits no SaveState (no executable phase reached
+                // — see state_machine.rs:3326 invariant). Notify, if any,
+                // is intentionally skipped — embedders observe the failure
+                // via the returned RitualOutcome, not via mid-flight hooks.
+                return RitualOutcome::workspace_failed(failed_state, error_msg);
+            }
+        }
+    }
+    // If `work_unit` is None, we're in legacy `task`-only mode — the caller
+    // is responsible for any workspace setup. This path is kept for state
+    // file backwards compat (ISS-029 deprecation window).
+
+    // ── Step 2: stamp metadata exactly once at the very start ──
+    // Per FINDING-12 / design §4: stamp_metadata is called *once* when the
+    // ritual begins, NOT on every state mutation. Embedders use this to
+    // record pid, adapter id, host info — facts that don't change during
+    // the run.
+    hooks.stamp_metadata(&mut state);
+
+    // ── Step 3: kick off the state machine with `Start` ──
+    let task = state.task.clone();
+    let (new_state, actions) = transition(&state, RitualEvent::Start { task });
+    let prev_phase = state.phase.clone();
+    state = new_state;
+    if prev_phase != state.phase {
+        hooks.on_phase_transition(&prev_phase, &state.phase);
+    }
+
     let mut event = executor.execute_actions(&actions, &state).await;
 
-    let max_iterations = 50; // Safety limit
+    // ── Step 4: main event loop ──
+    // Each iteration: feed the produced event back through `transition`,
+    // execute the resulting actions, capture the next event. Phase changes
+    // fire `on_phase_transition` exactly once per actual change.
+    let max_iterations = 50; // Safety limit (state-machine bug guard)
     let mut iteration = 0;
 
     while let Some(ev) = event {
         iteration += 1;
         if iteration > max_iterations {
-            error!("Ritual exceeded max iterations ({}), escalating", max_iterations);
+            error!(
+                max = max_iterations,
+                "Ritual exceeded max iterations, escalating"
+            );
             let (final_state, final_actions) = transition(
                 &state,
                 RitualEvent::SkillFailed {
@@ -1880,16 +2039,37 @@ pub async fn run_ritual(
                     reason: None,
                 },
             );
+            let prev = state.phase.clone();
             state = final_state;
+            if prev != state.phase {
+                hooks.on_phase_transition(&prev, &state.phase);
+            }
+            // Drain the final fire-and-forget actions (Notify, SaveState)
+            // through the canonical dispatcher so the escalation is
+            // observable via hooks (G3: no silent swallow).
             executor.execute_actions(&final_actions, &state).await;
-            break;
+            // Re-classify as iteration-limit rather than generic Escalated
+            // by overriding status after `from_state`. We still went through
+            // the state machine to keep all the bookkeeping consistent.
+            return RitualOutcome {
+                state,
+                status: RitualOutcomeStatus::IterationLimitExceeded,
+            };
         }
 
         let (new_state, actions) = transition(&state, ev);
+        let prev = state.phase.clone();
         state = new_state;
+        if prev != state.phase {
+            hooks.on_phase_transition(&prev, &state.phase);
+        }
 
         if state.phase.is_terminal() || state.phase.is_paused() {
             // Execute remaining fire-and-forget actions (Notify, SaveState)
+            // — these emit final-status notifications, persist the terminal
+            // state file, etc. By going through `execute_actions` (not
+            // skipping them) we keep the contract that every action is
+            // dispatched through the canonical hook-instrumented path.
             executor.execute_actions(&actions, &state).await;
             break;
         }
@@ -1903,7 +2083,7 @@ pub async fn run_ritual(
         "Ritual completed"
     );
 
-    Ok(state)
+    RitualOutcome::from_state(state)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3497,5 +3677,285 @@ mod tests {
 
         let p = build_self_review_prompt("draft-requirements", 1, 4);
         assert!(p.contains("specific and testable"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ISS-052 T08: run_ritual signature & lifecycle tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    use super::super::work_unit::WorkUnit;
+
+    /// Hook fixture for T08: instruments stamp_metadata, on_phase_transition,
+    /// resolve_workspace, and should_cancel so individual tests can assert
+    /// invocation counts and ordering.
+    ///
+    /// All other hook methods are no-ops (NoopHooks defaults). `cancel_on_first_action`
+    /// lets a test drive the ritual to terminal-Cancelled in two transitions
+    /// without spinning up an LLM.
+    struct TrackingHooks {
+        workspace: PathBuf,
+        resolve_count: Mutex<u32>,
+        resolve_error: Option<String>,
+        stamp_count: Mutex<u32>,
+        phase_transitions: Mutex<Vec<(String, String)>>,
+        cancel_after_n: Mutex<Option<u32>>,
+        action_seen: Mutex<u32>,
+    }
+
+    impl TrackingHooks {
+        fn new(workspace: PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                workspace,
+                resolve_count: Mutex::new(0),
+                resolve_error: None,
+                stamp_count: Mutex::new(0),
+                phase_transitions: Mutex::new(Vec::new()),
+                cancel_after_n: Mutex::new(None),
+                action_seen: Mutex::new(0),
+            })
+        }
+
+        fn with_resolve_error(workspace: PathBuf, err: &str) -> Arc<Self> {
+            Arc::new(Self {
+                workspace,
+                resolve_count: Mutex::new(0),
+                resolve_error: Some(err.to_string()),
+                stamp_count: Mutex::new(0),
+                phase_transitions: Mutex::new(Vec::new()),
+                cancel_after_n: Mutex::new(None),
+                action_seen: Mutex::new(0),
+            })
+        }
+
+        fn cancel_on_first_action(self: &Arc<Self>) {
+            *self.cancel_after_n.lock().unwrap() = Some(0);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RitualHooks for TrackingHooks {
+        async fn notify(&self, _msg: &str) {}
+
+        async fn persist_state(&self, _: &RitualState) -> std::io::Result<()> { Ok(()) }
+
+        fn resolve_workspace(
+            &self,
+            _: &WorkUnit,
+        ) -> Result<PathBuf, super::super::hooks::WorkspaceError> {
+            *self.resolve_count.lock().unwrap() += 1;
+            if let Some(err) = &self.resolve_error {
+                return Err(super::super::hooks::WorkspaceError::RegistryError(err.clone()));
+            }
+            Ok(self.workspace.clone())
+        }
+
+        fn stamp_metadata(&self, _state: &mut RitualState) {
+            *self.stamp_count.lock().unwrap() += 1;
+        }
+
+        fn on_phase_transition(
+            &self,
+            from: &super::super::state_machine::RitualPhase,
+            to: &super::super::state_machine::RitualPhase,
+        ) {
+            self.phase_transitions
+                .lock()
+                .unwrap()
+                .push((format!("{:?}", from), format!("{:?}", to)));
+        }
+
+        fn on_action_start(&self, _action: &RitualAction, _state: &RitualState) {
+            *self.action_seen.lock().unwrap() += 1;
+        }
+
+        fn should_cancel(&self) -> Option<super::super::hooks::CancelReason> {
+            // Latching cancel: once armed (Some(_)), keeps returning Some
+            // on every poll. We can't be a one-shot because Notify/SaveState
+            // are fire-and-forget and their cancel events are discarded by
+            // execute_actions — only the next event-producing action's
+            // cancel actually flows back into the state machine. By
+            // staying armed we guarantee the cancel takes effect on the
+            // next event-producing dispatch, regardless of how many
+            // fire-and-forget actions came first.
+            let g = self.cancel_after_n.lock().unwrap();
+            if g.is_some() {
+                Some(super::super::hooks::CancelReason {
+                    source: super::super::hooks::CancelSource::UserCommand,
+                    message: "test cancellation".to_string(),
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    fn make_initial_state_with_work_unit() -> RitualState {
+        let mut s = RitualState::new();
+        s.task = "trivial test task".to_string();
+        s.work_unit = Some(WorkUnit::Task {
+            project: "test".into(),
+            task_id: "T0".into(),
+        });
+        s
+    }
+
+    /// FINDING-12 / design §5.6.2 — workspace resolution failure must NOT
+    /// panic and must NOT silently swallow. It returns a RitualOutcome
+    /// with status=WorkspaceFailed and the error in state.error_context,
+    /// so the embedder still gets a structured outcome to handle.
+    #[tokio::test]
+    async fn run_ritual_workspace_failure_returns_workspace_failed() {
+        let tmp = std::env::temp_dir();
+        let hooks = TrackingHooks::with_resolve_error(tmp.clone(), "registry not found");
+        let initial = make_initial_state_with_work_unit();
+
+        let cfg = V2ExecutorConfig {
+            project_root: tmp,
+            ..V2ExecutorConfig::default()
+        };
+
+        let outcome = run_ritual(initial, cfg, hooks.clone() as Arc<dyn RitualHooks>).await;
+
+        assert_eq!(outcome.status, RitualOutcomeStatus::WorkspaceFailed);
+        assert_eq!(*hooks.resolve_count.lock().unwrap(), 1);
+        // No phases ran, so no actions were dispatched
+        assert_eq!(*hooks.action_seen.lock().unwrap(), 0);
+        // stamp_metadata is downstream of resolve in §5.6.2; failed
+        // resolution short-circuits before stamping.
+        assert_eq!(*hooks.stamp_count.lock().unwrap(), 0);
+        assert!(outcome.state.error_context.as_deref().unwrap_or("").contains("workspace resolution"));
+        assert!(outcome.state.error_context.as_deref().unwrap_or("").contains("registry not found"));
+    }
+
+    /// FINDING-12 — stamp_metadata must fire exactly once per ritual,
+    /// at the start. A bug that called it on every state mutation would
+    /// silently rewrite metadata mid-flight.
+    #[tokio::test]
+    async fn run_ritual_calls_stamp_metadata_exactly_once() {
+        let tmp = std::env::temp_dir();
+        let hooks = TrackingHooks::new(tmp.clone());
+        // Cancel immediately so we don't run a real ritual
+        hooks.cancel_on_first_action();
+        let initial = make_initial_state_with_work_unit();
+
+        let cfg = V2ExecutorConfig {
+            project_root: tmp,
+            ..V2ExecutorConfig::default()
+        };
+
+        let _outcome = run_ritual(initial, cfg, hooks.clone() as Arc<dyn RitualHooks>).await;
+
+        assert_eq!(
+            *hooks.stamp_count.lock().unwrap(),
+            1,
+            "stamp_metadata must be called exactly once at ritual start"
+        );
+    }
+
+    /// Design §5.6.2 — workspace path must be cached on `target_root` so
+    /// downstream phase actions can use the resolved path without
+    /// re-invoking the registry. Backwards-compat with state files
+    /// written before ISS-029 (per §7.5).
+    #[tokio::test]
+    async fn run_ritual_caches_resolved_workspace_in_target_root() {
+        let tmp = std::env::temp_dir();
+        let hooks = TrackingHooks::new(tmp.clone());
+        hooks.cancel_on_first_action();
+        let mut initial = make_initial_state_with_work_unit();
+        initial.target_root = None; // explicitly empty: should be filled by run_ritual
+
+        let cfg = V2ExecutorConfig {
+            project_root: tmp.clone(),
+            ..V2ExecutorConfig::default()
+        };
+
+        let outcome = run_ritual(initial, cfg, hooks.clone() as Arc<dyn RitualHooks>).await;
+
+        assert_eq!(*hooks.resolve_count.lock().unwrap(), 1,
+            "resolve_workspace must be called exactly once");
+        assert_eq!(
+            outcome.state.target_root.as_deref(),
+            Some(tmp.to_string_lossy().as_ref()),
+            "target_root must be populated from hooks.resolve_workspace result"
+        );
+    }
+
+    /// Design §5.6.2 — on_phase_transition fires for each *actual* phase
+    /// change, not on every event/state apply. Idle (Pending/Detecting)
+    /// → first phase counts as a transition; staying in the same phase
+    /// across a state mutation does NOT.
+    #[tokio::test]
+    async fn run_ritual_phase_transition_hook_called_on_each_change() {
+        let tmp = std::env::temp_dir();
+        let hooks = TrackingHooks::new(tmp.clone());
+        hooks.cancel_on_first_action();
+        let initial = make_initial_state_with_work_unit();
+
+        let cfg = V2ExecutorConfig {
+            project_root: tmp,
+            ..V2ExecutorConfig::default()
+        };
+
+        let _outcome = run_ritual(initial, cfg, hooks.clone() as Arc<dyn RitualHooks>).await;
+
+        let transitions = hooks.phase_transitions.lock().unwrap();
+        // We expect at least one transition (initial Pending → first phase
+        // produced by Start), plus one to Cancelled (cancel was triggered
+        // on the first action). Each (from, to) pair must have from != to.
+        assert!(!transitions.is_empty(), "expected at least one phase transition, got none");
+        for (from, to) in transitions.iter() {
+            assert_ne!(from, to,
+                "phase_transition hook fired for non-change: {} -> {}", from, to);
+        }
+        // Final transition must end at Cancelled (cancellation was the
+        // intended terminator).
+        assert_eq!(transitions.last().map(|(_, t)| t.as_str()), Some("Cancelled"));
+    }
+
+    /// Cancellation via hooks.should_cancel routes through
+    /// V2Executor::execute → RitualEvent::Cancelled → terminal Cancelled
+    /// phase. RitualOutcome must classify this correctly.
+    #[tokio::test]
+    async fn run_ritual_cancellation_yields_cancelled_outcome() {
+        let tmp = std::env::temp_dir();
+        let hooks = TrackingHooks::new(tmp.clone());
+        hooks.cancel_on_first_action();
+        let initial = make_initial_state_with_work_unit();
+
+        let cfg = V2ExecutorConfig {
+            project_root: tmp,
+            ..V2ExecutorConfig::default()
+        };
+
+        let outcome = run_ritual(initial, cfg, hooks.clone() as Arc<dyn RitualHooks>).await;
+
+        assert_eq!(outcome.status, RitualOutcomeStatus::Cancelled);
+        assert!(matches!(outcome.state.phase, RitualPhase::Cancelled));
+    }
+
+    /// RitualOutcome must be a pure projection of the final state — no
+    /// side channels. Tests the from_state classifier across the
+    /// non-WorkspaceFailed terminal phases.
+    #[test]
+    fn ritual_outcome_classifies_terminal_phases() {
+        let mut s = RitualState::new();
+
+        s.phase = RitualPhase::Done;
+        assert_eq!(RitualOutcome::from_state(s.clone()).status, RitualOutcomeStatus::Completed);
+
+        s.phase = RitualPhase::Cancelled;
+        assert_eq!(RitualOutcome::from_state(s.clone()).status, RitualOutcomeStatus::Cancelled);
+
+        s.phase = RitualPhase::Escalated;
+        assert_eq!(RitualOutcome::from_state(s.clone()).status, RitualOutcomeStatus::Escalated);
+
+        s.phase = RitualPhase::WaitingClarification;
+        assert_eq!(RitualOutcome::from_state(s.clone()).status, RitualOutcomeStatus::Paused);
+
+        // Defensive: a non-terminal phase reaching from_state means the
+        // engine bailed (iteration limit / bug). We classify that as
+        // IterationLimitExceeded rather than misreport Completed.
+        s.phase = RitualPhase::Implementing;
+        assert_eq!(RitualOutcome::from_state(s.clone()).status, RitualOutcomeStatus::IterationLimitExceeded);
     }
 }
