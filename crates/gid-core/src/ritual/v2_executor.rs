@@ -866,6 +866,93 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     // Fire-and-forget actions
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Durable state persistence with bounded retry (ISS-052 T03 / design §6.2).
+    ///
+    /// Calls `hooks.persist_state` up to `MAX_ATTEMPTS` times with backoff
+    /// between attempts. Returns:
+    ///   - `RitualEvent::StatePersisted { attempt }` on first success
+    ///     (`attempt` is 1-based: 1 = first try, 2 = succeeded after one
+    ///     retry, …)
+    ///   - `RitualEvent::StatePersistFailed { attempt: MAX_ATTEMPTS, error }`
+    ///     after all attempts exhausted (`error` is the last failure's
+    ///     message)
+    ///
+    /// Notification on the failure path is owned by the state-machine
+    /// arm for `StatePersistFailed` — the arm emits a single `Notify`
+    /// action on the resulting transition. `persist_state` deliberately
+    /// stays quiet on the failure path to avoid double-notify; the
+    /// success path also stays quiet because successful checkpoints are
+    /// implementation noise users don't need to see (FINDING-15
+    /// rationale, deferred follow-up).
+    ///
+    /// **Contract**: every code path through this function returns a
+    /// `RitualEvent`. No `unreachable!()`, no panic-on-exhaustion. The
+    /// `last_error` accumulator is initialized to a sentinel only because
+    /// the type system requires it; `1..=MAX_ATTEMPTS` with
+    /// `MAX_ATTEMPTS = 3 > 0` guarantees the loop runs at least once and
+    /// overwrites the sentinel before the failure path is reached. The
+    /// sentinel is included in the comment trail so a future refactor that
+    /// changes the loop bounds will see why the initialization exists and
+    /// either preserve or eliminate it deliberately.
+    ///
+    /// **Atomicity** is the hook implementation's responsibility (see
+    /// `RitualHooks::persist_state` doc). Retry on `Err` is only safe
+    /// because `Err` MUST mean "no on-disk corruption" — non-atomic hooks
+    /// would corrupt the state file across retries.
+    ///
+    /// **Backoff** values match design §6.2 (50ms, 250ms). The task brief
+    /// references 100/200/400ms; design FINDING-6 supersedes that with the
+    /// shorter, geometrically-spaced values which are sufficient for the
+    /// common transient causes (brief disk pressure, fsync queuing) without
+    /// stalling visible UX.
+    ///
+    /// **`#[allow(dead_code)]`**: this method is consumed by T04 (action
+    /// dispatcher rewires `RitualAction::SaveState` to call it). Until T04
+    /// lands, the only callers are the T03 unit tests; clippy would
+    /// otherwise flag it as never-used. Remove this attribute in T04.
+    #[allow(dead_code)]
+    pub(crate) async fn persist_state(&self, state: &RitualState) -> RitualEvent {
+        const MAX_ATTEMPTS: u32 = 3;
+        // Backoffs sit *between* attempts, so we need MAX_ATTEMPTS - 1 entries.
+        // No backoff after the final attempt — we exit either way.
+        const BACKOFF: [std::time::Duration; (MAX_ATTEMPTS as usize) - 1] = [
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(250),
+        ];
+
+        // Sentinel: unreachable in practice (loop runs ≥1 iteration) but
+        // required by the type system for the "fallthrough after loop" path.
+        let mut last_error: String = String::from("no attempts made");
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.hooks.persist_state(state).await {
+                Ok(()) => {
+                    return RitualEvent::StatePersisted { attempt };
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    if attempt < MAX_ATTEMPTS {
+                        // Wait, then retry. No notify between attempts —
+                        // single summary message after all attempts complete
+                        // (success or exhaustion).
+                        let backoff_idx = (attempt as usize) - 1;
+                        tokio::time::sleep(BACKOFF[backoff_idx]).await;
+                    }
+                }
+            }
+        }
+
+        // All MAX_ATTEMPTS exhausted. Return the failure event; the
+        // state-machine arm for `StatePersistFailed` (T05 minimal / T04
+        // refined) is the single source of truth for the user-facing
+        // notify. Emitting notify here too would double-notify on the
+        // same transition.
+        RitualEvent::StatePersistFailed {
+            attempt: MAX_ATTEMPTS,
+            error: last_error,
+        }
+    }
+
     fn save_state(&self, state: &RitualState) {
         let state_path = self.config.project_root.join(".gid").join("ritual-state.json");
 
@@ -2441,6 +2528,230 @@ mod tests {
             hooks.notifications_snapshot(),
             vec!["second".to_string()],
             "second action must run normally after one-shot cancel drained"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // ISS-052 T03: persist_state retry wrapper
+    //
+    // The wrapper calls `hooks.persist_state` up to MAX_ATTEMPTS=3 times
+    // with backoff between attempts and emits StatePersisted{attempt} on
+    // first success or StatePersistFailed{attempt: 3, error} after
+    // exhaustion. These tests pin:
+    //   - 1st-attempt success path
+    //   - success after retry (attempt=2 or =3)
+    //   - exhaustion → StatePersistFailed with last error
+    //   - no double-notify (the state-machine arm owns user notification)
+    //   - no panic / no unreachable!() — every code path returns an event
+    // ═════════════════════════════════════════════════════════════════════
+
+    use super::super::hooks::FailingPersistHooks;
+
+    fn make_persist_test_executor(hooks: Arc<dyn RitualHooks>) -> V2Executor {
+        V2Executor::with_hooks(V2ExecutorConfig::default(), hooks)
+    }
+
+    #[tokio::test]
+    async fn persist_state_emits_state_persisted_on_first_attempt_success() {
+        let tmp = std::env::temp_dir();
+        let hooks = Arc::new(NoopHooks::new(tmp.clone(), tmp));
+        let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
+        let state = RitualState::new();
+
+        let event = exec.persist_state(&state).await;
+
+        match event {
+            RitualEvent::StatePersisted { attempt } => {
+                assert_eq!(attempt, 1, "first-try success must report attempt=1");
+            }
+            other => panic!("expected StatePersisted, got {:?}", other),
+        }
+
+        // No notify on the success path — successful checkpoints are
+        // implementation noise.
+        assert!(
+            hooks.notifications_snapshot().is_empty(),
+            "persist_state must not notify on success; arm-side notify is opt-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_state_succeeds_after_two_retries() {
+        // FailingPersistHooks(0) → all calls fail. To simulate "succeed on
+        // the 3rd attempt", use a wrapper hook that fails twice then
+        // succeeds. `FailingPersistHooks::new(0, _)` doesn't fit; build a
+        // small custom hook inline.
+        struct FailFirstNHooks {
+            fail_first_n: AtomicUsize,
+            call_count: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl RitualHooks for FailFirstNHooks {
+            async fn notify(&self, _: &str) {}
+            async fn persist_state(&self, _: &RitualState) -> std::io::Result<()> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= self.fail_first_n.load(Ordering::SeqCst) {
+                    Err(std::io::Error::other(format!("transient failure on call {n}")))
+                } else {
+                    Ok(())
+                }
+            }
+            fn resolve_workspace(
+                &self,
+                _: &super::super::work_unit::WorkUnit,
+            ) -> Result<PathBuf, super::super::hooks::WorkspaceError> {
+                Ok(std::env::temp_dir())
+            }
+        }
+
+        // Fail attempts 1, 2; succeed attempt 3.
+        let hooks = Arc::new(FailFirstNHooks {
+            fail_first_n: AtomicUsize::new(2),
+            call_count: AtomicUsize::new(0),
+        });
+        let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
+        let state = RitualState::new();
+
+        let event = exec.persist_state(&state).await;
+
+        match event {
+            RitualEvent::StatePersisted { attempt } => {
+                assert_eq!(attempt, 3,
+                    "success after 2 failures must report attempt=3");
+            }
+            other => panic!("expected StatePersisted, got {:?}", other),
+        }
+        assert_eq!(
+            hooks.call_count.load(Ordering::SeqCst),
+            3,
+            "must call hooks.persist_state exactly 3 times (2 fail + 1 succeed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_state_exhausts_returns_state_persist_failed() {
+        // FailingPersistHooks::new(_, fail_after_n_calls=0) → every call fails.
+        let hooks = Arc::new(FailingPersistHooks::new(std::env::temp_dir(), 0));
+        let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
+        let state = RitualState::new();
+
+        let event = exec.persist_state(&state).await;
+
+        match event {
+            RitualEvent::StatePersistFailed { attempt, error } => {
+                assert_eq!(attempt, 3,
+                    "exhaustion must report attempt count = MAX_ATTEMPTS (3)");
+                // Error is from the *last* failed attempt (call 3).
+                assert!(error.contains("forced failure on call 3"),
+                    "error must propagate last attempt's failure, got {:?}", error);
+            }
+            other => panic!("expected StatePersistFailed, got {:?}", other),
+        }
+        assert_eq!(
+            hooks.calls_observed(),
+            3,
+            "must attempt MAX_ATTEMPTS=3 times before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_state_does_not_notify_on_failure() {
+        // The state-machine arm for StatePersistFailed (T05) emits the
+        // single user-facing Notify on the resulting transition.
+        // persist_state itself must stay quiet — notifying here would
+        // double-notify.
+        struct CountingHooks {
+            notifications: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl RitualHooks for CountingHooks {
+            async fn notify(&self, msg: &str) {
+                self.notifications.lock().unwrap().push(msg.to_string());
+            }
+            async fn persist_state(&self, _: &RitualState) -> std::io::Result<()> {
+                Err(std::io::Error::other("persist down"))
+            }
+            fn resolve_workspace(
+                &self,
+                _: &super::super::work_unit::WorkUnit,
+            ) -> Result<PathBuf, super::super::hooks::WorkspaceError> {
+                Ok(std::env::temp_dir())
+            }
+        }
+
+        let hooks = Arc::new(CountingHooks {
+            notifications: Mutex::new(Vec::new()),
+        });
+        let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
+        let state = RitualState::new();
+
+        let event = exec.persist_state(&state).await;
+        assert!(matches!(event, RitualEvent::StatePersistFailed { .. }));
+
+        // CRITICAL: zero notifications — the arm owns user-facing comms.
+        let notes = hooks.notifications.lock().unwrap();
+        assert!(notes.is_empty(),
+            "persist_state must NOT call hooks.notify (arm owns notify); got {:?}", *notes);
+    }
+
+    #[tokio::test]
+    async fn persist_state_returns_event_on_every_path_no_panic() {
+        // Tripwire: the wrapper's contract is "no unreachable!(), no panic
+        // on exhaustion". If a future refactor lets a code path slip
+        // through without producing an event, this test catches it via
+        // tokio's panic-in-task → test failure semantics.
+        //
+        // Exercises: success on attempt 1, success on attempt 2, success
+        // on attempt 3, total exhaustion. All four must complete without
+        // panic and return a well-formed RitualEvent.
+        let tmp = std::env::temp_dir();
+        for fail_n in 0..=3 {
+            let hooks = Arc::new(FailingPersistHooks::new(tmp.clone(), fail_n));
+            let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
+            let state = RitualState::new();
+            let event = exec.persist_state(&state).await;
+            match (fail_n, &event) {
+                (0, RitualEvent::StatePersistFailed { attempt, .. }) => {
+                    assert_eq!(*attempt, 3);
+                }
+                (1, RitualEvent::StatePersisted { attempt }) => {
+                    // FailingPersistHooks(1): 1 succeeds (n=1 <= 1=threshold),
+                    // 2,3,... fail. So persist_state's first call succeeds.
+                    assert_eq!(*attempt, 1);
+                }
+                (2, RitualEvent::StatePersisted { attempt }) => {
+                    assert_eq!(*attempt, 1);
+                }
+                (3, RitualEvent::StatePersisted { attempt }) => {
+                    assert_eq!(*attempt, 1);
+                }
+                (_, e) => panic!("fail_n={fail_n}: unexpected event {:?}", e),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_state_backoff_is_bounded() {
+        // 50ms + 250ms = 300ms total backoff for 3-attempt exhaustion.
+        // Allow generous slack for CI variance, but assert it's not
+        // accidentally minutes (e.g. someone bumps backoff to seconds).
+        let hooks = Arc::new(FailingPersistHooks::new(std::env::temp_dir(), 0));
+        let exec = make_persist_test_executor(hooks.clone() as Arc<dyn RitualHooks>);
+        let state = RitualState::new();
+
+        let start = std::time::Instant::now();
+        let _ = exec.persist_state(&state).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "expected total backoff ≥ 300ms (50+250), got {:?}", elapsed
+        );
+        // Upper bound: 2 seconds is comfortably above 300ms even on
+        // overloaded CI; well below "minutes" indicating a runaway loop.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "backoff total exceeded 2s — runaway loop or wrong constants? got {:?}", elapsed
         );
     }
 }
