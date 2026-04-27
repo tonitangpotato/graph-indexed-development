@@ -21,7 +21,7 @@ use super::graph_phase_mode::{
     determine_graph_mode, parse_planned_ids, render_existing_nodes, render_reserved_ids,
     snapshot_node_ids, validate_graph_phase_output, GraphPhaseMode,
 };
-use super::hooks::{NoopHooks, RitualHooks};
+use super::hooks::{NoopHooks, RitualHooks, WorkspaceError};
 use super::llm::{LlmClient, ToolDefinition};
 use super::scope::default_scope_for_phase;
 use super::work_unit::WorkUnit;
@@ -213,17 +213,60 @@ fn mode_label(mode: &GraphPhaseMode) -> &'static str {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Legacy `config.notify` → hooks bridge (ISS-052)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Embedders that pre-date ISS-052 wire notifications via the `NotifyFn`
+// callback on `V2ExecutorConfig.notify`. The canonical surface is now
+// `hooks.notify`, so we bridge the legacy callback into a `RitualHooks`
+// impl at construction time. This lets the `Notify` action dispatch
+// stay branch-free (`self.hooks.notify(message).await`) without
+// breaking the legacy path.
+//
+// Removed when `V2ExecutorConfig.notify` is deleted.
+struct LegacyNotifyBridgeHooks {
+    inner: NoopHooks,
+    notify_fn: NotifyFn,
+}
+
+#[async_trait::async_trait]
+impl RitualHooks for LegacyNotifyBridgeHooks {
+    async fn notify(&self, message: &str) {
+        // Invoke the legacy callback. Also record into the inner
+        // NoopHooks so test introspection (`notifications_snapshot`)
+        // continues to work for embedders that mix the two paths.
+        (self.notify_fn)(message.to_string());
+        self.inner.notify(message).await;
+    }
+
+    async fn persist_state(&self, state: &RitualState) -> std::io::Result<()> {
+        self.inner.persist_state(state).await
+    }
+
+    fn resolve_workspace(&self, work_unit: &WorkUnit) -> Result<PathBuf, WorkspaceError> {
+        self.inner.resolve_workspace(work_unit)
+    }
+
+    fn should_cancel(&self) -> Option<super::hooks::CancelReason> {
+        self.inner.should_cancel()
+    }
+}
+
 impl V2Executor {
     pub fn new(config: V2ExecutorConfig) -> Self {
         let hooks: Arc<dyn RitualHooks> = config.hooks.clone().unwrap_or_else(|| {
-            // Fallback: build a NoopHooks rooted at the config's
-            // project_root, with persist_dir = `<project_root>/.gid`.
-            // This matches what the legacy `save_state` path already
-            // used, so behavior is byte-identical for embedders that
-            // never opt into custom hooks.
+            // No custom hooks → fall back to NoopHooks. If the embedder
+            // wired a legacy `config.notify` callback, bridge it into
+            // the hooks layer so the `Notify` dispatch stays branch-free
+            // (single canonical surface = `self.hooks.notify(msg)`).
             let workspace = config.project_root.clone();
             let persist_dir = workspace.join(".gid");
-            Arc::new(NoopHooks::new(workspace, persist_dir))
+            let inner = NoopHooks::new(workspace, persist_dir);
+            match config.notify.clone() {
+                Some(notify_fn) => Arc::new(LegacyNotifyBridgeHooks { inner, notify_fn }),
+                None => Arc::new(inner),
+            }
         });
         Self { config, hooks }
     }
@@ -253,7 +296,7 @@ impl V2Executor {
     ///   `on_action_finish` call. Embedders that want to observe
     ///   side-effecting actions should use `on_action_start` + state-
     ///   machine transition hooks instead.
-    pub async fn execute(&self, action: &RitualAction, state: &RitualState) -> Option<RitualEvent> {
+    pub(crate) async fn execute(&self, action: &RitualAction, state: &RitualState) -> Option<RitualEvent> {
         self.hooks.on_action_start(action, state);
         let event = self.execute_inner(action, state).await;
         if let Some(ref ev) = event {
@@ -280,7 +323,11 @@ impl V2Executor {
             RitualAction::RunPlanning => Some(self.run_planning(state).await),
             RitualAction::RunHarness { tasks } => Some(self.run_harness(tasks, state).await),
             RitualAction::Notify { message } => {
-                self.notify(message).await;
+                // ISS-052: hooks.notify is the canonical notification
+                // surface. Legacy `config.notify` is bridged at
+                // construction time (see `LegacyNotifyBridgeHooks`),
+                // so this single path covers all embedders.
+                self.hooks.notify(message).await;
                 None
             }
             RitualAction::SaveState => {
@@ -306,7 +353,11 @@ impl V2Executor {
 
     /// Execute all actions from a transition, returning the event-producing action's event.
     /// Fire-and-forget actions are executed first, then the event-producing action.
-    pub async fn execute_actions(
+    ///
+    /// `pub(crate)` (ISS-052 §5.6.3): the only public dispatcher is
+    /// `run_ritual`. External callers should drive the ritual through
+    /// that, not by hand-calling actions.
+    pub(crate) async fn execute_actions(
         &self,
         actions: &[RitualAction],
         state: &RitualState,
@@ -793,22 +844,6 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     // ═══════════════════════════════════════════════════════════════════════
     // Fire-and-forget actions
     // ═══════════════════════════════════════════════════════════════════════
-
-    async fn notify(&self, message: &str) {
-        // ISS-052: hooks are the canonical notification surface. Legacy
-        // `config.notify` is kept as a fallback when the embedder
-        // installed no custom hooks (i.e. `self.hooks` is `NoopHooks`),
-        // so existing call sites that wired `config.notify` continue to
-        // function unchanged. Once all embedders migrate to `hooks`, the
-        // `config.notify` field can be removed.
-        if self.config.hooks.is_some() {
-            self.hooks.notify(message).await;
-        } else if let Some(ref notify_fn) = self.config.notify {
-            notify_fn(message.to_string());
-        } else {
-            info!(message = message, "Ritual notification (no handler)");
-        }
-    }
 
     fn save_state(&self, state: &RitualState) {
         let state_path = self.config.project_root.join(".gid").join("ritual-state.json");
