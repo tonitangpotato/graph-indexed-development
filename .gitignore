@@ -20,5 +20,7 @@ packages/*/dist/
 .gid/code-graph.json
 .gid/extract-meta.json
 .gid/rituals/*.json
+.gid/ritual-state.json
+.gid/execution-log.jsonl
 **/execution-log.jsonl
 .gid/graph.yml.backup

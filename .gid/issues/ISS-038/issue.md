@@ -25,7 +25,7 @@ Filesystem snapshot before/after the LLM invocation in any phase that requires f
 **Tests added (10, all passing):**
 - 7 `file_snapshot` unit tests: added/modified/deleted detection, empty-diff identity, large-file head+tail+size fallback, gidignore filtering, cross-platform path handling.
 - 3 `v2_executor` end-to-end tests:
-  - `implement_phase_with_zero_changes_emits_skill_failed`
+  - `skill_required_zero_files_fails` (renamed from `implement_phase_with_zero_changes_emits_skill_failed` in ISS-052 T09)
   - `implement_phase_with_file_writes_emits_skill_completed_with_artifacts`
   - `non_implement_phase_does_not_enforce_changes`
 
