@@ -171,16 +171,16 @@ RitualEvent::SkillFailed { skill, error, reason } => { ... }
 
 ---
 
-## [0.3.2] — 2026-0X-XX
+## [0.3.2] — 2026-04-20
 
 - Switched `infomap-rs` and `agentctl-auth` from path to registry deps to satisfy
   crates.io publish requirements.
 
-## [0.3.1] — 2026-0X-XX
+## [0.3.1] — 2026-04-07
 
 - Added version specifier for `agentctl-auth` dep (publish requirement).
 
-## [0.3.0] — 2026-0X-XX
+## [0.3.0] — 2026-04-06
 
 - Merged `gid-harness` into `gid-core` behind feature flags (`harness`, `ritual`,
   `infomap`, `cli-llm`, `full`).
@@ -188,6 +188,6 @@ RitualEvent::SkillFailed { skill, error, reason } => { ... }
 - Initial crates.io publish.
 
 [0.4.0]: #040--2026-04-2x-tbd
-[0.3.2]: #032--2026-0x-xx
-[0.3.1]: #031--2026-0x-xx
-[0.3.0]: #030--2026-0x-xx
+[0.3.2]: #032--2026-04-20
+[0.3.1]: #031--2026-04-07
+[0.3.0]: #030--2026-04-06

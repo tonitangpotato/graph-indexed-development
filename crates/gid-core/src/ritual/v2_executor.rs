@@ -3801,8 +3801,10 @@ mod tests {
         // Happy path: a writable temp dir → save_state returns Ok and the
         // state file is created on disk.
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let mut config = V2ExecutorConfig::default();
-        config.project_root = tmp.path().to_path_buf();
+        let config = V2ExecutorConfig {
+            project_root: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
         let exec = V2Executor::new(config);
         let state = RitualState::new();
 
@@ -3822,8 +3824,10 @@ mod tests {
         let blocking_file = tmp.path().join("not-a-dir");
         std::fs::write(&blocking_file, b"placeholder").expect("write placeholder");
 
-        let mut config = V2ExecutorConfig::default();
-        config.project_root = blocking_file;
+        let config = V2ExecutorConfig {
+            project_root: blocking_file,
+            ..Default::default()
+        };
         let exec = V2Executor::new(config);
         let state = RitualState::new();
 
