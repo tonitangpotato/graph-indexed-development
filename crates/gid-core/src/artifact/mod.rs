@@ -20,6 +20,7 @@ pub mod artifact;
 pub mod id;
 pub mod layout;
 pub mod metadata;
+pub mod relation;
 
 pub use artifact::{Artifact, ArtifactError};
 pub use id::{ArtifactId, ArtifactIdError};
@@ -27,3 +28,4 @@ pub use layout::{
     FallbackRule, Layout, LayoutError, LayoutPattern, MatchResult, SeqScope, SlotMap,
 };
 pub use metadata::{FieldValue, MetaSourceHint, Metadata, MetadataError};
+pub use relation::{discover, Relation, RelationError, RelationSource};
