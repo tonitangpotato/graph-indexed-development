@@ -1,12 +1,54 @@
 ---
 id: "ISS-056"
 title: "implement skill agent silently fails on medium/large refactors (turn limit + tool gating + workspace scope)"
-status: open
+status: closed
 priority: P1
 created: 2026-04-27
+closed: 2026-04-28
 severity: medium
 related: ["ISS-052", "ISS-055"]
 ---
+
+## Resolution (2026-04-28)
+
+Layers 1 and 2 implemented and tested; Layer 3 explicitly out of scope per
+issue body and not pursued.
+
+- **Layer 1 — triage→implement budget** (commit `f8cc32c` — `feat: ISS-056a triage-aware turn budget`):
+  `V2Executor::implement_iterations_for_triage_size` maps small=15 / medium=30 /
+  large=50; medium is also the default for `None`/unknown. Other phases keep the
+  100 fallback. 2 unit tests cover small/medium/large/None/unknown.
+
+- **Layer 2 — STATUS self-report + ImplementIncomplete → Paused** (commit `bd67e68` —
+  `feat: ISS-056b implement-skill STATUS self-report`):
+  - `RitualPhase::Paused` added; distinct from `Escalated` (escalation) and
+    `Cancelled` (user abort) — work is unfinished but not failed.
+  - `RitualEvent::ImplementIncomplete { reason }` + `(Implementing, ImplementIncomplete) → Paused`
+    arm. Verify shell is **not** run on this path (the silent-success leak
+    closes here).
+  - `prompts/implement.txt` appends the `STATUS: complete` / `STATUS: incomplete: <reason>`
+    contract; recognised reasons cover the four documented failure modes
+    (turn limit / tool gating / unclear spec / blocked dependency).
+  - `parse_implement_status()` parses the trailing STATUS line out of the last
+    100 non-empty output lines (case-insensitive, markdown-stripped). Missing
+    STATUS treated as incomplete (fail-closed).
+  - Tests: `test_implement_incomplete_pauses_without_verify` in `state_machine.rs`
+    pins the no-verify invariant; `test_parse_implement_status_*` cover parser
+    happy paths and the missing-status case.
+  - `is_paused()` updated to include `Paused` so existing terminal/paused
+    accounting in `drive_event_loop` and `health()` continues to hold.
+
+ACs 1–4 met. AC5 (`docs/ritual/v2-pipeline.md` describing the contract) deferred
+to ISS-052 T17 release docs / general v2 pipeline doc refresh — the contract
+itself lives in `prompts/implement.txt` and the state machine, both of which
+are first-class and discoverable from the issue.
+
+Discovery context: rustclaw ISS-052 T13b silent-success incident
+(2026-04-27). T13b itself was retried in main session post-fix and landed via
+direct commits — see rustclaw `tasks/2026-04-27-night-autopilot.md`.
+
+---
+
 # ISS-056 — implement skill agent silently fails on medium/large refactors
 
 ## Problem
