@@ -1101,7 +1101,9 @@ Target: ~5 tests, ~200 LOC.
 
 ### 9.4 rustclaw integration tests (replace existing)
 
-Location: `rustclaw/tests/ritual_integration.rs`.
+Location: `rustclaw/src/ritual_integration_tests.rs` (declared as `#[cfg(test)] mod ritual_integration_tests;` from `main.rs`).
+
+> **Amendment (T16, 2026-04-28):** rustclaw is a **binary-only crate** (no `src/lib.rs`). Cargo's integration test target (`tests/*.rs`) can only import items from a *library* target, so `tests/ritual_integration.rs` cannot reach `RustclawHooks`, `ritual_runner::*`, etc. without first promoting rustclaw to lib+bin. Promotion is a non-trivial visibility refactor with no current consumer of the lib target, so it is deferred. Tests instead live in-tree under `src/`, consistent with rustclaw's existing 617-test pattern (41 files using `#[cfg(test)] mod`). Functional coverage matches the table below; only the file location differs. If rustclaw is later split into lib+bin, moving these tests is a mechanical relocation.
 
 | Test | Scenario | Critical assertion |
 |---|---|---|
@@ -1113,6 +1115,22 @@ Location: `rustclaw/tests/ritual_integration.rs`.
 | `telegram_messages_unchanged` | Run scripted ritual, capture all TelegramClient.send calls | Compare to golden snapshot |
 
 Target: ~6 tests. The `zero_file_implement_fails_in_prod` test is the **single most important test** in this design — it is the live regression for r-950ebf.
+
+> **Implementation note (T16, 2026-04-28):** While writing these tests we
+> confirmed that `RitualAction::SaveState` in the current dispatcher
+> still routes through the legacy `V2Executor::save_state` path
+> (`v2_executor.rs:1223`) — which writes to
+> `<project_root>/.gid/ritual-state.json` — *not* through
+> `hooks.persist_state`. The `persist_state` retry wrapper
+> (`v2_executor.rs:1176`) exists but is wired to a separate code path
+> not yet reached by `execute_actions`. Therefore
+> `state_file_format_unchanged` asserts against the legacy file path,
+> not `<rituals_dir>/<id>.json`. When the wrapper wiring lands (next
+> task on the gid-core side, post-T16), update the assertion path and
+> add a sibling test for the hook-routed file. The legacy path
+> assertion still pins schema backwards-compat, which is the
+> matrix-row contract.
+
 
 ### 9.5 Manual acceptance run
 
