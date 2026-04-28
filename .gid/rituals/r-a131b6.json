@@ -1,6 +1,6 @@
 {
   "id": "r-a131b6",
-  "phase": "Implementing",
+  "phase": "Done",
   "task": "Implement Path A: Post-hoc sub-clustering for mega-clusters in gid-core infer module.\n\n## Problem\nInfomap produces mega-clusters (e.g., 96 files in one component) when import/call edge density is high. Current code handles undersized clusters (orphan reassignment) but has no handling for oversized clusters.\n\n## Solution\nAdd `split_mega_clusters()` step after `run_clustering()` and before `map_to_components()`:\n\n1. After flat Infomap clustering, scan all clusters for any exceeding `max_cluster_size` threshold\n2. For each oversized cluster:\n   - Extract subgraph (only internal files + internal edges from the network)\n   - Run Infomap again on the subgraph with higher teleportation rate (e.g., 0.10) for better resolution\n   - If subgraph produces >1 cluster → replace original mega-cluster with sub-clusters\n   - If subgraph produces only 1 cluster → stop (truly monolithic, don't force-split)\n   - Recursively check sub-results for remaining oversized clusters\n3. Max recursion depth = 3 to prevent infinite loops\n\n## Key Design Decisions\n- Threshold: `max(20, file_count / 5)` — no cluster should exceed 20% of total files, minimum 20\n- Add `max_cluster_size` field to `ClusterConfig` (Option<usize>, auto-computed if None)\n- Sub-graph only keeps internal edges (cross-cluster edges naturally cut — this is correct behavior)\n- Higher teleportation rate for sub-clustering (0.10 vs default 0.05) to increase resolution on dense subgraphs\n- Log diagnostics when splitting occurs\n\n## Files to modify\n- `crates/gid-core/src/infer/clustering.rs` — main implementation + tests\n- `crates/gid-core/src/infer/mod.rs` — pass config through if needed\n\n## Verification\n- All existing tests must pass\n- Add new tests:\n  - test_split_mega_cluster: create a graph with one dense 30+ node cluster, verify it gets split\n  - test_split_preserves_small_clusters: verify clusters under threshold are untouched\n  - test_split_stops_on_monolith: create truly monolithic subgraph, verify recursion stops\n  - test_split_max_depth: verify recursion depth limit works\n- `cargo test -p gid-core` passes\n- `cargo clippy -p gid-core` clean\nProject location: /Users/potato/clawd/projects/gid-rs",
   "target_root": "/Users/potato/clawd/projects/gid-rs",
   "project": {
@@ -84,5 +84,6 @@
     }
   ],
   "started_at": "2026-04-10T04:23:11.542929Z",
-  "updated_at": "2026-04-10T04:33:43.805653Z"
+  "updated_at": "2026-04-28T12:11:35Z",
+  "closure_note": "Closed retroactively 2026-04-28: work was completed (ContextQuery, ContextFilters, ContextStats, gid context CLI, split_mega_clusters all merged); ritual state never updated."
 }

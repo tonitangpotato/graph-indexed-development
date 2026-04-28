@@ -1,6 +1,6 @@
 {
   "id": "r-86651f",
-  "phase": "Escalated",
+  "phase": "Done",
   "task": "Implement the 3 remaining context-partitioning tasks for gid-rs:\n\n1. **context-query-struct** (GOAL-4.7, 4.8): Implement `ContextQuery` and `ContextFilters` structs in `crates/gid-core/src/harness/context.rs`. ContextQuery holds target node IDs, max_tokens budget, depth limit, and filters. ContextFilters allows --include filtering by node_type, tags, file_path prefix.\n\n2. **context-cli-command** (GOAL-4.9, 4.12): Implement `gid context <node-id>` CLI command in `crates/gid-cli/src/main.rs`. Parameters: --targets (multi), --max-tokens (default 8000), --depth (default 3), --include (repeatable filter), --format json|yaml|markdown (default markdown). Command loads graph, runs assemble_task_context with ContextQuery, outputs formatted result.\n\n3. **context-traversal-stats** (GOAL-4.13): Add TraversalStats struct tracking candidates_considered, candidates_scored, items_truncated, items_dropped, budget_used, budget_total. Populate during score_candidates() and budget_fit_by_category(). Include in ContextResult.\n\nDesign doc: .gid/features/context-partitioning/design.md (793 lines)\nRequirements: .gid/features/context-partitioning/requirements.md\n\nAll P0 library code (scoring, truncation, source loading, assembly) is already implemented in crates/gid-core/src/harness/context.rs. These 3 tasks add the query/filter layer and CLI surface on top.\nProject location: /Users/potato/clawd/projects/gid-rs",
   "target_root": "/Users/potato/clawd/projects/gid-rs",
   "project": {
@@ -63,5 +63,6 @@
     }
   ],
   "started_at": "2026-04-08T14:36:57.503048Z",
-  "updated_at": "2026-04-08T14:36:58.355470Z"
+  "updated_at": "2026-04-28T12:11:35Z",
+  "closure_note": "Closed retroactively 2026-04-28: work was completed (ContextQuery, ContextFilters, ContextStats, gid context CLI, split_mega_clusters all merged); ritual state never updated."
 }
