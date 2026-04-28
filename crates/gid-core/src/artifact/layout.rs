@@ -1,32 +1,9 @@
-//! [`Layout`] — pattern-driven artifact path layout (per ISS-053 §4.4, D2).
+//! Layout — pattern-driven artifact path layout (ISS-053 §4.4, D2).
 //!
-//! `Layout` is **data, not code**: a list of [`LayoutPattern`]s that map
-//! relative paths (e.g. `issues/ISS-0042/issue.md`) to artifact kinds (e.g.
-//! `issue`) plus captured slots (e.g. `{ id: "ISS-0042", seq: "0042" }`).
-//! The same pattern is bidirectional — used for both matching (path → kind +
-//! slots) and rendering ([`Layout::resolve`] produces a path from a kind +
-//! [`SlotMap`]).
+//! Bidirectional pattern engine: same DSL is used for both matching paths
+//! to (kind + slots) and rendering paths from (kind + slots).
 //!
-//! Patterns use a small, closed-set DSL (§4.4.1):
-//!
-//! ```text
-//! issues/{id:ISS-{seq:04}}/issue.md       — sequenced ID, zero-padded
-//! features/{slug}/requirements.md          — kebab-case slug
-//! features/{slug}/reviews/{name}.md        — free-form basename
-//! issues/{parent_id}/reviews/{name}.md     — nested under parent
-//! issues/{parent_id}/{any}.md              — catch-all single segment
-//! ```
-//!
-//! ## Adding a new kind
-//!
-//! Edit `.gid/layout.yml`, add a pattern. **No code change**. This is the
-//! binding test for D2 (kind is a string, layout is data).
-//!
-//! ## Sequence overflow
-//!
-//! `{seq:NN}` allocations past `10^NN - 1` return
-//! [`LayoutError::SeqExhausted`] — no silent rollover. Callers must widen
-//! the layout (e.g. `seq:03` → `seq:04`) before creating new artifacts.
+//! Adding a new kind = edit `.gid/layout.yml`, no code change. (D2.)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,50 +11,32 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::id::ArtifactId;
 use super::metadata::MetaSourceHint;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Slot name → captured value. Populated by [`Layout::match_path`] and
-/// consumed by [`Layout::resolve`] for path rendering.
 pub type SlotMap = BTreeMap<String, String>;
 
-/// Sequence counter scope for `{seq:NN}` placeholders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeqScope {
-    /// Counter scoped to the whole project (e.g., `ISS-N`).
     Project,
-    /// Counter scoped to a parent directory (e.g., `r-N` per issue).
-    /// `rel` is the relative path of the parent that owns the counter
-    /// (typically captured via `{parent_id}` from the pattern).
     Parent { rel: String },
 }
 
-/// Default fallback when no pattern matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FallbackRule {
-    /// Default kind for unmatched files (e.g. `"note"`).
     pub kind: String,
-    /// Metadata format used when creating new fallback files.
     pub metadata_format: MetaSourceHint,
 }
 
-/// One pattern in the layout. Glob-like with named captures and ID
-/// generators. See module docs for examples and grammar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutPattern {
-    /// Pattern string, e.g. `"issues/{id:ISS-{seq:04}}/issue.md"`.
     pub pattern: String,
-    /// Kind tag emitted on match (e.g. `"issue"`).
     pub kind: String,
-    /// Metadata format used when creating new artifacts of this kind.
     pub metadata_format: MetaSourceHint,
-    /// Sequence scope for any `{seq:NN}` placeholder in `pattern`.
-    /// Defaults to [`SeqScope::Project`] when not specified.
     #[serde(default = "default_seq_scope")]
     pub seq_scope: SeqScope,
 }
@@ -87,16 +46,13 @@ fn default_seq_scope() -> SeqScope {
 }
 
 impl LayoutPattern {
-    /// Extract the inner template of any `{id:TEMPLATE}` placeholder in
-    /// this pattern, e.g. for `"issues/{id:ISS-{seq:04}}/issue.md"` returns
-    /// `Some("ISS-{seq:04}")`. Used by `ArtifactStore::next_id` to render a
-    /// bare ID without a full path.
+    /// Inner template of `{id:TEMPLATE}` if present, e.g.
+    /// `"issues/{id:ISS-{seq:04}}/issue.md"` → `Some("ISS-{seq:04}")`.
     pub fn id_template_str(&self) -> Option<String> {
         let bytes = self.pattern.as_bytes();
         let mut i = 0;
-        while i < bytes.len() {
-            // Find `{id:` then scan to matching `}` accounting for nested `{seq:NN}`.
-            if bytes[i..].starts_with(b"{id:") {
+        while i + 4 <= bytes.len() {
+            if &bytes[i..i + 4] == b"{id:" {
                 let start = i + 4;
                 let mut depth = 1usize;
                 let mut j = start;
@@ -113,7 +69,7 @@ impl LayoutPattern {
                     }
                     j += 1;
                 }
-                return None; // unterminated
+                return None;
             }
             i += 1;
         }
@@ -121,75 +77,60 @@ impl LayoutPattern {
     }
 }
 
-/// The full layout — ordered list of patterns plus fallback + relation
-/// fields. Patterns are tried in declaration order; first match wins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layout {
     pub patterns: Vec<LayoutPattern>,
     pub fallback: FallbackRule,
-    /// Frontmatter fields whose values (string or list of strings) are
-    /// interpreted as `ArtifactId` references for relation discovery.
-    /// Default via [`Layout::default`]. Overridable via `.gid/layout.yml`.
     #[serde(default = "default_relation_fields")]
     pub relation_fields: Vec<String>,
 }
 
 fn default_relation_fields() -> Vec<String> {
     vec![
-        "related".to_string(),
-        "blocks".to_string(),
-        "blocked_by".to_string(),
-        "supersedes".to_string(),
-        "derives_from".to_string(),
-        "applies_to".to_string(),
-        "references".to_string(),
-        "depends_on".to_string(),
-        "satisfies".to_string(),
+        "related".into(),
+        "blocks".into(),
+        "blocked_by".into(),
+        "supersedes".into(),
+        "derives_from".into(),
+        "applies_to".into(),
+        "references".into(),
+        "depends_on".into(),
+        "satisfies".into(),
     ]
 }
 
-/// Result of matching a path against a layout: the matched kind plus the
-/// captured slots. Returned by [`Layout::match_path`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchResult {
     pub kind: String,
     pub slots: SlotMap,
-    /// `true` if the match came from [`FallbackRule`] rather than an
-    /// explicit pattern. Callers may treat fallback matches differently
-    /// (e.g. `gid artifact list --strict` excludes them).
     pub fallback: bool,
 }
 
-/// Errors produced by [`Layout::resolve`] and sequence-allocation paths.
 #[derive(Debug, Error)]
 pub enum LayoutError {
-    /// `kind` did not match any [`LayoutPattern`] in the layout.
     #[error("unknown kind: {0}")]
     UnknownKind(String),
 
-    /// A required slot was not present in the [`SlotMap`].
     #[error("missing slot {slot:?} for kind {kind:?}")]
     MissingSlot { kind: String, slot: String },
 
-    /// `{seq:NN}` would allocate past `10^NN - 1`. Widen the layout.
     #[error("sequence exhausted for pattern {pattern:?}: max value {max}")]
     SeqExhausted { pattern: String, max: u64 },
 
-    /// Pattern itself is malformed (caught at layout-load time, not at
-    /// match time, but kept here to consolidate error reporting).
     #[error("malformed pattern {pattern:?}: {message}")]
     MalformedPattern { pattern: String, message: String },
 }
 
+// ---------------------------------------------------------------------------
+// Default layout (covers today's empirical .gid/ reality, sampled 2026-04-26)
+// ---------------------------------------------------------------------------
+
 impl Default for Layout {
-    /// The default layout, covering today's empirical `.gid/` reality
-    /// across `engram`, `gid-rs`, `rustclaw` (sampled 2026-04-26 per §2).
-    /// Projects override by writing `.gid/layout.yml`.
     fn default() -> Self {
         Self {
             patterns: default_patterns(),
             fallback: FallbackRule {
-                kind: "note".to_string(),
+                kind: "note".into(),
                 metadata_format: MetaSourceHint::None,
             },
             relation_fields: default_relation_fields(),
@@ -198,98 +139,744 @@ impl Default for Layout {
 }
 
 fn default_patterns() -> Vec<LayoutPattern> {
-    use MetaSourceHint::*;
+    use MetaSourceHint::Frontmatter as FM;
+    use MetaSourceHint::None as MNone;
     vec![
-        // Issues — sequenced ISS-NNNN
         LayoutPattern {
-            pattern: "issues/{id:ISS-{seq:04}}/issue.md".to_string(),
-            kind: "issue".to_string(),
-            metadata_format: Frontmatter,
-            seq_scope: SeqScope::Project,
-        },
-        // Issue-attached design / requirements / verify-report etc.
-        LayoutPattern {
-            pattern: "issues/{parent_id}/design.md".to_string(),
-            kind: "design".to_string(),
-            metadata_format: Frontmatter,
+            pattern: "issues/{id:ISS-{seq:04}}/issue.md".into(),
+            kind: "issue".into(),
+            metadata_format: FM,
             seq_scope: SeqScope::Project,
         },
         LayoutPattern {
-            pattern: "issues/{parent_id}/requirements.md".to_string(),
-            kind: "requirements".to_string(),
-            metadata_format: Frontmatter,
+            pattern: "issues/{parent_id}/design.md".into(),
+            kind: "design".into(),
+            metadata_format: FM,
             seq_scope: SeqScope::Project,
         },
-        // Issue reviews — sequenced r-N within parent issue dir
         LayoutPattern {
-            pattern: "issues/{parent_id}/reviews/{name}.md".to_string(),
-            kind: "review".to_string(),
-            metadata_format: Frontmatter,
+            pattern: "issues/{parent_id}/requirements.md".into(),
+            kind: "requirements".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        LayoutPattern {
+            pattern: "issues/{parent_id}/reviews/{name}.md".into(),
+            kind: "review".into(),
+            metadata_format: FM,
             seq_scope: SeqScope::Parent {
-                rel: "issues/{parent_id}/reviews".to_string(),
-            },
-        },
-        // Catch-all for issue-attached docs (verify-report, handoff, etc.)
-        LayoutPattern {
-            pattern: "issues/{parent_id}/{any}.md".to_string(),
-            kind: "issue-doc".to_string(),
-            metadata_format: Frontmatter,
-            seq_scope: SeqScope::Project,
-        },
-        // Features
-        LayoutPattern {
-            pattern: "features/{slug}/requirements.md".to_string(),
-            kind: "requirements".to_string(),
-            metadata_format: Frontmatter,
-            seq_scope: SeqScope::Project,
-        },
-        LayoutPattern {
-            pattern: "features/{slug}/design.md".to_string(),
-            kind: "design".to_string(),
-            metadata_format: Frontmatter,
-            seq_scope: SeqScope::Project,
-        },
-        LayoutPattern {
-            pattern: "features/{slug}/reviews/{name}.md".to_string(),
-            kind: "review".to_string(),
-            metadata_format: Frontmatter,
-            seq_scope: SeqScope::Parent {
-                rel: "features/{slug}/reviews".to_string(),
+                rel: "issues/{parent_id}/reviews".into(),
             },
         },
         LayoutPattern {
-            pattern: "features/{slug}/{any}.md".to_string(),
-            kind: "feature-doc".to_string(),
-            metadata_format: Frontmatter,
-            seq_scope: SeqScope::Project,
-        },
-        // Top-level docs (.gid/docs/*) and reviews (.gid/reviews/*)
-        LayoutPattern {
-            pattern: "docs/{name}.md".to_string(),
-            kind: "doc".to_string(),
-            metadata_format: Frontmatter,
+            pattern: "issues/{parent_id}/{any}.md".into(),
+            kind: "issue-doc".into(),
+            metadata_format: FM,
             seq_scope: SeqScope::Project,
         },
         LayoutPattern {
-            pattern: "reviews/{name}.md".to_string(),
-            kind: "review".to_string(),
-            metadata_format: Frontmatter,
+            pattern: "features/{slug}/requirements.md".into(),
+            kind: "feature-requirements".into(),
+            metadata_format: FM,
             seq_scope: SeqScope::Project,
         },
-        // Ad-hoc subdir notes (e.g., .gid/sqlite-migration/, .gid/incremental-extract/)
         LayoutPattern {
-            pattern: "{slug}/{any}.md".to_string(),
-            kind: "note".to_string(),
-            metadata_format: MetaSourceHint::None,
+            pattern: "features/{slug}/design.md".into(),
+            kind: "feature-design".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        LayoutPattern {
+            pattern: "features/{slug}/reviews/{name}.md".into(),
+            kind: "feature-review".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Parent {
+                rel: "features/{slug}/reviews".into(),
+            },
+        },
+        LayoutPattern {
+            pattern: "features/{slug}/{any}.md".into(),
+            kind: "feature-doc".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        LayoutPattern {
+            pattern: "docs/{name}.md".into(),
+            kind: "doc".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        LayoutPattern {
+            pattern: "reviews/{name}.md".into(),
+            kind: "global-review".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        LayoutPattern {
+            pattern: "{slug}/{any}.md".into(),
+            kind: "note".into(),
+            metadata_format: MNone,
             seq_scope: SeqScope::Project,
         },
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Layout API
+// ---------------------------------------------------------------------------
+
 impl Layout {
-    /// Configured relation field names — frontmatter fields whose values are
-    /// interpreted as `ArtifactId` references during relation discovery.
     pub fn relation_fields(&self) -> &[String] {
         &self.relation_fields
+    }
+
+    pub fn match_path(&self, rel: &str) -> MatchResult {
+        for pat in &self.patterns {
+            if let Some(slots) = pattern_match(&pat.pattern, rel) {
+                return MatchResult {
+                    kind: pat.kind.clone(),
+                    slots,
+                    fallback: false,
+                };
+            }
+        }
+        MatchResult {
+            kind: self.fallback.kind.clone(),
+            slots: SlotMap::new(),
+            fallback: true,
+        }
+    }
+
+    pub fn resolve(&self, kind: &str, slots: &SlotMap) -> Result<PathBuf, LayoutError> {
+        let pat = self
+            .patterns
+            .iter()
+            .find(|p| p.kind == kind)
+            .ok_or_else(|| LayoutError::UnknownKind(kind.to_string()))?;
+        let rendered = pattern_render(&pat.pattern, slots, kind)?;
+        Ok(PathBuf::from(rendered))
+    }
+
+    pub fn pattern_for_kind(&self, kind: &str) -> Option<&LayoutPattern> {
+        self.patterns.iter().find(|p| p.kind == kind)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DSL — tokenizer
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Literal(String),
+    Slug,
+    Name,
+    ParentId,
+    Any,
+    Seq { width: usize },
+    Id { template: Vec<IdToken> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdToken {
+    Literal(String),
+    Seq { width: usize },
+}
+
+fn tokenize_segment(seg: &str) -> Result<Vec<Token>, String> {
+    let mut out: Vec<Token> = Vec::new();
+    let bytes = seg.as_bytes();
+    let mut i = 0usize;
+    let mut lit_start = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if lit_start < i {
+                out.push(Token::Literal(seg[lit_start..i].to_string()));
+            }
+            let start = i;
+            let mut depth = 1usize;
+            let mut j = i + 1;
+            while j < bytes.len() && depth > 0 {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return Err(format!(
+                    "unterminated `{{` at byte {} in segment `{}`",
+                    start, seg
+                ));
+            }
+            let inner = &seg[start + 1..j];
+            out.push(parse_placeholder(inner)?);
+            i = j + 1;
+            lit_start = i;
+        } else if bytes[i] == b'}' {
+            return Err(format!(
+                "unexpected `}}` at byte {} in segment `{}`",
+                i, seg
+            ));
+        } else {
+            i += 1;
+        }
+    }
+    if lit_start < bytes.len() {
+        out.push(Token::Literal(seg[lit_start..].to_string()));
+    }
+    Ok(out)
+}
+
+fn parse_placeholder(inner: &str) -> Result<Token, String> {
+    if let Some(rest) = inner.strip_prefix("seq:") {
+        let width: usize = rest
+            .parse()
+            .map_err(|_| format!("invalid seq width in `{{seq:{}}}`", rest))?;
+        if width == 0 {
+            return Err("seq width must be ≥ 1".into());
+        }
+        return Ok(Token::Seq { width });
+    }
+    if let Some(rest) = inner.strip_prefix("id:") {
+        return Ok(Token::Id {
+            template: parse_id_template(rest)?,
+        });
+    }
+    match inner {
+        "slug" => Ok(Token::Slug),
+        "name" => Ok(Token::Name),
+        "parent_id" => Ok(Token::ParentId),
+        "any" => Ok(Token::Any),
+        other => Err(format!("unknown placeholder `{{{}}}`", other)),
+    }
+}
+
+fn parse_id_template(inner: &str) -> Result<Vec<IdToken>, String> {
+    let mut out: Vec<IdToken> = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    let mut lit_start = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if lit_start < i {
+                out.push(IdToken::Literal(inner[lit_start..i].to_string()));
+            }
+            let start = i;
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'}' {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                return Err(format!(
+                    "unterminated `{{` at byte {} in id template",
+                    start
+                ));
+            }
+            let token_inner = &inner[start + 1..j];
+            if let Some(rest) = token_inner.strip_prefix("seq:") {
+                let width: usize = rest
+                    .parse()
+                    .map_err(|_| format!("invalid seq width inside id template: `{}`", rest))?;
+                if width == 0 {
+                    return Err("seq width must be ≥ 1".into());
+                }
+                out.push(IdToken::Seq { width });
+            } else {
+                return Err(format!(
+                    "id template may only contain `{{seq:NN}}`, found `{{{}}}`",
+                    token_inner
+                ));
+            }
+            i = j + 1;
+            lit_start = i;
+        } else if bytes[i] == b'}' {
+            return Err(format!("unexpected `}}` at byte {} in id template", i));
+        } else {
+            i += 1;
+        }
+    }
+    if lit_start < bytes.len() {
+        out.push(IdToken::Literal(inner[lit_start..].to_string()));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Pattern matching
+// ---------------------------------------------------------------------------
+
+fn pattern_match(pattern: &str, path: &str) -> Option<SlotMap> {
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    let path_segs: Vec<&str> = path.split('/').collect();
+    if pat_segs.len() != path_segs.len() {
+        return None;
+    }
+    let mut slots = SlotMap::new();
+    for (pseg, vseg) in pat_segs.iter().zip(path_segs.iter()) {
+        let tokens = tokenize_segment(pseg).ok()?;
+        if !match_segment(&tokens, vseg, &mut slots) {
+            return None;
+        }
+    }
+    Some(slots)
+}
+
+fn match_segment(tokens: &[Token], seg: &str, slots: &mut SlotMap) -> bool {
+    let mut cursor = 0usize;
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        match token {
+            Token::Literal(lit) => {
+                if !seg[cursor..].starts_with(lit.as_str()) {
+                    return false;
+                }
+                cursor += lit.len();
+            }
+            _ => {
+                let next_lit = tokens[idx + 1..].iter().find_map(|t| {
+                    if let Token::Literal(l) = t {
+                        Some(l.as_str())
+                    } else {
+                        None
+                    }
+                });
+                let value_end = match next_lit {
+                    Some(lit) => match seg[cursor..].find(lit) {
+                        Some(rel) => cursor + rel,
+                        None => return false,
+                    },
+                    None => seg.len(),
+                };
+                let value = &seg[cursor..value_end];
+                if !match_placeholder(token, value, slots) {
+                    return false;
+                }
+                cursor = value_end;
+            }
+        }
+        idx += 1;
+    }
+    cursor == seg.len()
+}
+
+fn match_placeholder(token: &Token, value: &str, slots: &mut SlotMap) -> bool {
+    match token {
+        Token::Slug => {
+            if value.is_empty()
+                || !value
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                return false;
+            }
+            slots.insert("slug".into(), value.into());
+            true
+        }
+        Token::Name => {
+            if value.is_empty() {
+                return false;
+            }
+            slots.insert("name".into(), value.into());
+            true
+        }
+        Token::ParentId => {
+            if value.is_empty() {
+                return false;
+            }
+            slots.insert("parent_id".into(), value.into());
+            true
+        }
+        Token::Any => {
+            if value.is_empty() {
+                return false;
+            }
+            slots.insert("any".into(), value.into());
+            true
+        }
+        Token::Seq { width } => {
+            if value.len() < *width || !value.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            slots.insert("seq".into(), value.into());
+            true
+        }
+        Token::Id { template } => match_id_template(template, value, slots),
+        Token::Literal(_) => unreachable!("literals handled above"),
+    }
+}
+
+fn match_id_template(template: &[IdToken], value: &str, slots: &mut SlotMap) -> bool {
+    let mut cursor = 0usize;
+    let mut captured_seq: Option<String> = None;
+    let mut i = 0usize;
+    while i < template.len() {
+        let tk = &template[i];
+        match tk {
+            IdToken::Literal(lit) => {
+                if !value[cursor..].starts_with(lit.as_str()) {
+                    return false;
+                }
+                cursor += lit.len();
+            }
+            IdToken::Seq { width } => {
+                let next_lit = template[i + 1..].iter().find_map(|t| {
+                    if let IdToken::Literal(l) = t {
+                        Some(l.as_str())
+                    } else {
+                        None
+                    }
+                });
+                let value_end = match next_lit {
+                    Some(lit) => match value[cursor..].find(lit) {
+                        Some(r) => cursor + r,
+                        None => return false,
+                    },
+                    None => value.len(),
+                };
+                let seq_val = &value[cursor..value_end];
+                if seq_val.len() < *width || !seq_val.chars().all(|c| c.is_ascii_digit()) {
+                    return false;
+                }
+                captured_seq = Some(seq_val.into());
+                cursor = value_end;
+            }
+        }
+        i += 1;
+    }
+    if cursor != value.len() {
+        return false;
+    }
+    slots.insert("id".into(), value.into());
+    if let Some(seq) = captured_seq {
+        slots.insert("seq".into(), seq);
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Pattern rendering
+// ---------------------------------------------------------------------------
+
+fn pattern_render(pattern: &str, slots: &SlotMap, kind: &str) -> Result<String, LayoutError> {
+    let mut out = String::with_capacity(pattern.len());
+    let segs: Vec<&str> = pattern.split('/').collect();
+    for (idx, seg) in segs.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        let tokens = tokenize_segment(seg).map_err(|message| LayoutError::MalformedPattern {
+            pattern: pattern.into(),
+            message,
+        })?;
+        for token in tokens {
+            render_token(&token, slots, kind, pattern, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+fn render_token(
+    token: &Token,
+    slots: &SlotMap,
+    kind: &str,
+    pattern: &str,
+    out: &mut String,
+) -> Result<(), LayoutError> {
+    match token {
+        Token::Literal(lit) => {
+            out.push_str(lit);
+            Ok(())
+        }
+        Token::Slug => fetch_slot(slots, kind, "slug").map(|v| out.push_str(v)),
+        Token::Name => fetch_slot(slots, kind, "name").map(|v| out.push_str(v)),
+        Token::ParentId => fetch_slot(slots, kind, "parent_id").map(|v| out.push_str(v)),
+        Token::Any => fetch_slot(slots, kind, "any").map(|v| out.push_str(v)),
+        Token::Seq { width } => {
+            let s = fetch_slot(slots, kind, "seq")?;
+            check_seq_width(s, *width, pattern)?;
+            pad_into(out, s, *width);
+            Ok(())
+        }
+        Token::Id { template } => render_id_token(template, slots, kind, pattern, out),
+    }
+}
+
+fn render_id_token(
+    template: &[IdToken],
+    slots: &SlotMap,
+    kind: &str,
+    pattern: &str,
+    out: &mut String,
+) -> Result<(), LayoutError> {
+    if let Some(id) = slots.get("id") {
+        out.push_str(id);
+        return Ok(());
+    }
+    for tk in template {
+        match tk {
+            IdToken::Literal(lit) => out.push_str(lit),
+            IdToken::Seq { width } => {
+                let s = fetch_slot(slots, kind, "seq")?;
+                check_seq_width(s, *width, pattern)?;
+                pad_into(out, s, *width);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pad_into(out: &mut String, s: &str, width: usize) {
+    if s.len() < width {
+        for _ in 0..(width - s.len()) {
+            out.push('0');
+        }
+    }
+    out.push_str(s);
+}
+
+fn fetch_slot<'a>(slots: &'a SlotMap, kind: &str, slot: &str) -> Result<&'a str, LayoutError> {
+    slots
+        .get(slot)
+        .map(String::as_str)
+        .ok_or_else(|| LayoutError::MissingSlot {
+            kind: kind.to_string(),
+            slot: slot.to_string(),
+        })
+}
+
+fn check_seq_width(value: &str, width: usize, pattern: &str) -> Result<(), LayoutError> {
+    let parsed: u64 = value.parse().map_err(|_| LayoutError::MalformedPattern {
+        pattern: pattern.into(),
+        message: format!("seq slot value `{}` is not numeric", value),
+    })?;
+    let max = 10u64.saturating_pow(width as u32) - 1;
+    if parsed > max {
+        return Err(LayoutError::SeqExhausted {
+            pattern: pattern.into(),
+            max,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slots_of(pairs: &[(&str, &str)]) -> SlotMap {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    // --- tokenizer ---
+
+    #[test]
+    fn tokenize_literal_only() {
+        assert_eq!(
+            tokenize_segment("issue.md").unwrap(),
+            vec![Token::Literal("issue.md".into())]
+        );
+    }
+
+    #[test]
+    fn tokenize_simple_slug() {
+        assert_eq!(tokenize_segment("{slug}").unwrap(), vec![Token::Slug]);
+    }
+
+    #[test]
+    fn tokenize_id_with_nested_seq() {
+        assert_eq!(
+            tokenize_segment("{id:ISS-{seq:04}}").unwrap(),
+            vec![Token::Id {
+                template: vec![
+                    IdToken::Literal("ISS-".into()),
+                    IdToken::Seq { width: 4 }
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn tokenize_unterminated_brace_errors() {
+        let err = tokenize_segment("{slug").unwrap_err();
+        assert!(err.contains("unterminated"));
+    }
+
+    #[test]
+    fn tokenize_unknown_placeholder_errors() {
+        let err = tokenize_segment("{wat}").unwrap_err();
+        assert!(err.contains("unknown placeholder"));
+    }
+
+    #[test]
+    fn tokenize_id_disallows_other_slots() {
+        let err = tokenize_segment("{id:{slug}-{seq:04}}").unwrap_err();
+        assert!(err.contains("id template may only contain"));
+    }
+
+    // --- match_path ---
+
+    #[test]
+    fn match_issue_path() {
+        let layout = Layout::default();
+        let m = layout.match_path("issues/ISS-0042/issue.md");
+        assert_eq!(m.kind, "issue");
+        assert!(!m.fallback);
+        assert_eq!(m.slots.get("id"), Some(&"ISS-0042".to_string()));
+        assert_eq!(m.slots.get("seq"), Some(&"0042".to_string()));
+    }
+
+    #[test]
+    fn match_issue_review_path() {
+        let layout = Layout::default();
+        let m = layout.match_path("issues/ISS-0042/reviews/design-r2.md");
+        assert_eq!(m.kind, "review");
+        assert!(!m.fallback);
+        assert_eq!(m.slots.get("parent_id"), Some(&"ISS-0042".to_string()));
+        assert_eq!(m.slots.get("name"), Some(&"design-r2".to_string()));
+    }
+
+    #[test]
+    fn match_feature_requirements() {
+        let layout = Layout::default();
+        let m = layout.match_path("features/dim-extract/requirements.md");
+        assert_eq!(m.kind, "feature-requirements");
+        assert_eq!(m.slots.get("slug"), Some(&"dim-extract".to_string()));
+    }
+
+    #[test]
+    fn match_falls_back_for_top_level_md() {
+        let layout = Layout::default();
+        let m = layout.match_path("README.md");
+        assert!(m.fallback);
+        assert_eq!(m.kind, "note");
+    }
+
+    // --- resolve ---
+
+    #[test]
+    fn resolve_issue_with_id_slot() {
+        let layout = Layout::default();
+        let path = layout
+            .resolve("issue", &slots_of(&[("id", "ISS-0042")]))
+            .unwrap();
+        assert_eq!(path, PathBuf::from("issues/ISS-0042/issue.md"));
+    }
+
+    #[test]
+    fn resolve_issue_with_seq_only() {
+        let layout = Layout::default();
+        let path = layout
+            .resolve("issue", &slots_of(&[("seq", "0042")]))
+            .unwrap();
+        assert_eq!(path, PathBuf::from("issues/ISS-0042/issue.md"));
+    }
+
+    #[test]
+    fn resolve_issue_with_short_seq_pads() {
+        let layout = Layout::default();
+        let path = layout.resolve("issue", &slots_of(&[("seq", "5")])).unwrap();
+        assert_eq!(path, PathBuf::from("issues/ISS-0005/issue.md"));
+    }
+
+    #[test]
+    fn resolve_review_under_issue() {
+        let layout = Layout::default();
+        let path = layout
+            .resolve(
+                "review",
+                &slots_of(&[("parent_id", "ISS-0042"), ("name", "design-r2")]),
+            )
+            .unwrap();
+        assert_eq!(path, PathBuf::from("issues/ISS-0042/reviews/design-r2.md"));
+    }
+
+    #[test]
+    fn resolve_unknown_kind_errors() {
+        let layout = Layout::default();
+        let err = layout.resolve("nope", &SlotMap::new()).unwrap_err();
+        assert!(matches!(err, LayoutError::UnknownKind(ref s) if s == "nope"));
+    }
+
+    #[test]
+    fn resolve_missing_slot_errors() {
+        let layout = Layout::default();
+        let err = layout.resolve("issue", &SlotMap::new()).unwrap_err();
+        match err {
+            LayoutError::MissingSlot { kind, slot } => {
+                assert_eq!(kind, "issue");
+                assert_eq!(slot, "seq");
+            }
+            other => panic!("expected MissingSlot, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_seq_overflow_errors() {
+        let layout = Layout::default();
+        let err = layout
+            .resolve("issue", &slots_of(&[("seq", "100000")]))
+            .unwrap_err();
+        match err {
+            LayoutError::SeqExhausted { max, .. } => assert_eq!(max, 9999),
+            other => panic!("expected SeqExhausted, got {:?}", other),
+        }
+    }
+
+    // --- bidirectional round-trip ---
+
+    #[test]
+    fn match_then_resolve_round_trip_issue() {
+        let layout = Layout::default();
+        let m = layout.match_path("issues/ISS-0042/issue.md");
+        let path = layout.resolve(&m.kind, &m.slots).unwrap();
+        assert_eq!(path.to_str().unwrap(), "issues/ISS-0042/issue.md");
+    }
+
+    #[test]
+    fn match_then_resolve_round_trip_review() {
+        let layout = Layout::default();
+        let m = layout.match_path("issues/ISS-0042/reviews/design-r2.md");
+        let path = layout.resolve(&m.kind, &m.slots).unwrap();
+        assert_eq!(
+            path.to_str().unwrap(),
+            "issues/ISS-0042/reviews/design-r2.md"
+        );
+    }
+
+    // --- id_template_str ---
+
+    #[test]
+    fn id_template_str_extracts_inner() {
+        let pat = LayoutPattern {
+            pattern: "issues/{id:ISS-{seq:04}}/issue.md".into(),
+            kind: "issue".into(),
+            metadata_format: MetaSourceHint::Frontmatter,
+            seq_scope: SeqScope::Project,
+        };
+        assert_eq!(pat.id_template_str(), Some("ISS-{seq:04}".into()));
+    }
+
+    #[test]
+    fn id_template_str_none_when_absent() {
+        let pat = LayoutPattern {
+            pattern: "features/{slug}/design.md".into(),
+            kind: "feature-design".into(),
+            metadata_format: MetaSourceHint::Frontmatter,
+            seq_scope: SeqScope::Project,
+        };
+        assert_eq!(pat.id_template_str(), None);
     }
 }
