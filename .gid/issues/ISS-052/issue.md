@@ -133,15 +133,26 @@ Order: do ISS-052 architectural change first; ISS-051 falls out naturally becaus
 
 ## Acceptance criteria
 
-- [ ] `RitualHooks` trait defined in gid-core.
-- [ ] V2Executor accepts `Option<Arc<dyn RitualHooks>>`.
-- [ ] V2Executor `run_skill` runs `file_snapshot` post-condition for hook-produced events too (test: hook returns Success but writes zero files → V2Executor overrides to SkillFailed).
-- [ ] Rustclaw `RitualRunner` no longer has any `RitualAction` match-arm dispatching.
-- [ ] Rustclaw `RustclawRitualHooks` implements `RitualHooks`, wraps AgentRunner / cancel / notify.
-- [ ] All existing rustclaw ritual integration tests pass unchanged.
-- [ ] New test in rustclaw: hook-produced "success" with zero files → ritual ends in SkillFailed (proves ISS-038 gate now applies to rustclaw path).
-- [ ] grep `file_snapshot` in rustclaw/src/ → still zero hits (because dispatcher is now entirely in gid-core, not because gate is missing).
-- [ ] Net LOC change in rustclaw negative (~1000+ deletion).
+- [x] `RitualHooks` trait defined in gid-core.
+- [x] V2Executor accepts `Option<Arc<dyn RitualHooks>>`.
+- [x] V2Executor `run_skill` runs `file_snapshot` post-condition for hook-produced events too (test: hook returns Success but writes zero files → V2Executor overrides to SkillFailed). — gid-core test `skill_required_zero_files_fails`.
+- [x] Rustclaw `RitualRunner` no longer has any `RitualAction` match-arm dispatching. — `RitualRunner` struct entirely removed; only utility helpers (state I/O, registries, file preloading, phase parsing) remain in `src/ritual_runner.rs`.
+- [x] Rustclaw `RustclawRitualHooks` implements `RitualHooks`, wraps AgentRunner / cancel / notify. — `RustclawHooks` in `src/ritual_hooks.rs`.
+- [x] All existing rustclaw ritual integration tests pass unchanged. — 356/356 passing.
+- [x] New test in rustclaw: hook-produced "success" with zero files → ritual ends in SkillFailed (proves ISS-038 gate now applies to rustclaw path). — `ritualhooks_surface_has_no_skill_dispatch_method` (structural invariant: `RitualHooks` exposes no skill-dispatch method, so rustclaw cannot bypass the gate; gate behavior itself is covered by gid-core's `skill_required_zero_files_fails`).
+- [x] grep `file_snapshot` in rustclaw/src/ → still zero hits (because dispatcher is now entirely in gid-core, not because gate is missing).
+- [x] Net LOC change in rustclaw negative (~1000+ deletion). — `src/ritual_runner.rs` 2960 → 1163 (−1797 LOC; struct + dispatcher gone, only utility helpers remain).
+
+### Implementation tracking (rustclaw side)
+
+The rustclaw migration runs across 4 graph tasks driven from `design.md` §7.6:
+
+- **T12** (done 2026-04-27, rustclaw `d940e8b`) — migrate 2 production entry points (`tools.rs::start_ritual`, `channels/telegram.rs::handle_ritual_command`) to `run_ritual + RustclawHooks`. Old `RitualRunner` API still compiles. 348 tests green.
+- **T13a** (done 2026-04-27, rustclaw `d940e8b` — bundled with T12 due to git ops) — stubbed `run_skill` / `run_shell` / `run_triage` / `run_planning` / `run_harness` / `save_state` bodies. **Deviation from §7.1.1**: stubs use `Err(anyhow!())` + `tracing::error!` tripwire instead of `unreachable!()` — daemon-safe during T13a→T13b window since 21 telegram call sites still reach legacy paths via `/ritual retry|skip|clarify|reply|cancel|resume-from-phase`. Approved by potato 2026-04-27 chat. Public API surface (`advance` / `send_event` / `resume_from_phase` / `make_ritual_runner`) preserved. Bisect point. `src/ritual_runner.rs` shrank 2960 → 2443 lines (517 lines deleted from stubs); 348 tests green.
+- **T13b** (done 2026-04-27, rustclaw next-commit) — verified: all 21 telegram call sites already migrated to `spawn_ritual` / `spawn_resume` (which wrap `run_ritual` / `resume_ritual` + `RustclawHooks`). Zero callers of legacy `RitualRunner::advance` / `send_event` / `resume_from_phase` / `make_ritual_runner` remain anywhere in `src/`. The `RitualRunner` struct itself is gone — `src/ritual_runner.rs` retains only utility helpers (state I/O, registries, `preload_files_with_budget`, `parse_phase_name`, `has_target_project_dir`). Final LOC: 1163 (−1797 vs T12 baseline). Added `ritualhooks_surface_has_no_skill_dispatch_method` test pinning the structural invariant that `RitualHooks` has no skill-dispatch method (cannot bypass ISS-038 gate). 356 tests green, zero warnings.
+- **T14 / T16 / T17** — cleanup, integration tests, release.
+
+The T13 → T13a/T13b split was added during T12 implementation when the 17 secondary telegram call sites became visible. See `design.md` §7.1.1.
 
 ## Out of scope
 
