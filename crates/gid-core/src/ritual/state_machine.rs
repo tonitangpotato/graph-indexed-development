@@ -342,6 +342,102 @@ pub enum ImplementStrategy {
     MultiAgent { tasks: Vec<String> },
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ISS-029 — RitualHealth introspection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// ISS-029 GOAL-3 — health classification for a `RitualState` at a given
+/// instant, derived from `phase`, `phase_entered_at`, and `last_heartbeat`.
+///
+/// Computed by [`RitualState::health`]. Consumed by the agent-facing
+/// `gid_ritual_status` tool (Task 2b) so the agent can distinguish
+/// "still working on a long phase" from "adapter died mid-phase" without
+/// having to interpret raw timestamps.
+///
+/// **Durations are reported in seconds (`i64`) rather than `chrono::Duration`
+/// because the chrono type does not implement `Serialize` by default and
+/// this enum is shipped over the tool RPC channel as JSON.**
+///
+/// Variants are mutually exclusive and exhaustive — every possible
+/// (phase, phase_age, heartbeat_age) tuple maps to exactly one variant.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RitualHealth {
+    /// Phase is non-terminal, recent heartbeat, phase age within expected
+    /// budget. The common case for an actively-progressing ritual.
+    Healthy {
+        /// Wall-clock seconds since `phase_entered_at`.
+        phase_age_secs: i64,
+    },
+    /// Phase is non-terminal, heartbeat is recent (so the adapter is
+    /// alive), but `phase_age` exceeds the per-phase `expected_max`
+    /// budget. Useful for "this is taking longer than usual but isn't
+    /// broken" reporting.
+    LongRunning {
+        phase_age_secs: i64,
+        /// Per-phase soft budget (see [`RitualPhase::expected_max_secs`]).
+        expected_max_secs: i64,
+    },
+    /// Heartbeat is stale (older than [`WEDGED_HEARTBEAT_THRESHOLD_SECS`]).
+    /// This is the wedged-adapter signal — the adapter likely crashed
+    /// or got stuck without writing a state update. Distinct from
+    /// `LongRunning`: a long-running phase still bumps `last_heartbeat`.
+    Wedged {
+        phase_age_secs: i64,
+        last_heartbeat_age_secs: i64,
+    },
+    /// Phase is one of `Done` / `Escalated` / `Cancelled`. Liveness
+    /// classification doesn't apply — the ritual is finished. Returned
+    /// regardless of how stale `last_heartbeat` is, because a terminal
+    /// ritual will (correctly) never tick its heartbeat again.
+    Terminal { phase: RitualPhase },
+}
+
+/// ISS-029 — heartbeat staleness threshold, in seconds.
+///
+/// Set to `60s` (= 2 × the planned 30s heartbeat tick from Task 2b) so a
+/// single missed tick never triggers `Wedged`. Two consecutive missed
+/// ticks → wedged. Tuned per the ritual notes in ISS-029 (heartbeat
+/// cadence ~30s, alarm threshold 60s).
+pub const WEDGED_HEARTBEAT_THRESHOLD_SECS: i64 = 60;
+
+impl RitualPhase {
+    /// ISS-029 GOAL-3 — soft budget for how long this phase is expected
+    /// to take before classifying as `LongRunning`.
+    ///
+    /// **These are heuristic priors, not hard limits.** Crossing the
+    /// budget does not abort the ritual; it only changes the health
+    /// classification surfaced to readers. Numbers seeded from
+    /// observed durations on this Mac (Opus single-LLM rituals):
+    ///
+    /// - `Implementing` / `Reviewing` / `Verifying` — long LLM calls,
+    ///   600s (10min) is normal.
+    /// - `Designing` / `WritingRequirements` / `Planning` / `Graphing`
+    ///   — shorter LLM calls or computation, 300s (5min).
+    /// - `Triaging` / `Initializing` — quick haiku-class calls, 60s.
+    /// - Pause states (`WaitingClarification`, `WaitingApproval`) —
+    ///   bounded only by user response; treat as effectively unbounded
+    ///   (`i64::MAX`) so they never read as `LongRunning`.
+    /// - `Idle` — start-of-ritual; 60s grace window.
+    /// - Terminal phases — handled by the `Terminal` health variant
+    ///   before this is consulted; value is unreachable but defined for
+    ///   exhaustiveness.
+    pub fn expected_max_secs(&self) -> i64 {
+        use RitualPhase::*;
+        match self {
+            Implementing | Reviewing | Verifying => 600,
+            Designing | WritingRequirements | Planning | Graphing => 300,
+            Triaging | Initializing => 60,
+            Idle => 60,
+            WaitingClarification | WaitingApproval => i64::MAX,
+            // Terminal phases short-circuit to `RitualHealth::Terminal`
+            // before this is read, but pick a sane non-MAX value for
+            // exhaustiveness in case a future caller bypasses `health`.
+            Done | Escalated | Cancelled => i64::MAX,
+        }
+    }
+}
+
 impl RitualState {
     pub fn new() -> Self {
         let now = Utc::now();
@@ -503,6 +599,55 @@ impl RitualState {
             .as_ref()
             .and_then(|p| p.verify_command.as_deref())
             .unwrap_or("echo 'No verify command configured'")
+    }
+
+    /// ISS-029 GOAL-3 — classify the ritual's liveness at instant `now`.
+    ///
+    /// Decision order (first match wins):
+    /// 1. Terminal phases (`Done` / `Escalated` / `Cancelled`) →
+    ///    [`RitualHealth::Terminal`]. Heartbeat staleness is *ignored*
+    ///    for terminal rituals because they correctly stop ticking on
+    ///    completion — flagging a finished ritual as `Wedged` would be
+    ///    a false positive.
+    /// 2. Stale `last_heartbeat` (> [`WEDGED_HEARTBEAT_THRESHOLD_SECS`])
+    ///    → [`RitualHealth::Wedged`]. This is the wedged-adapter
+    ///    signal — the heartbeat tick (Task 2b) stopped firing.
+    /// 3. `phase_age` exceeds [`RitualPhase::expected_max_secs`] but
+    ///    heartbeat is fresh → [`RitualHealth::LongRunning`]. Adapter
+    ///    is alive; phase is just taking a while.
+    /// 4. Otherwise → [`RitualHealth::Healthy`].
+    ///
+    /// Negative durations (clock skew or stale `now`) are clamped to 0
+    /// before comparisons so a backwards-jumping clock can't spuriously
+    /// flag a fresh ritual as `Wedged`.
+    pub fn health(&self, now: DateTime<Utc>) -> RitualHealth {
+        // Terminal short-circuit: don't apply heartbeat rules to a
+        // finished ritual (it intentionally stopped ticking).
+        if self.phase.is_terminal() {
+            return RitualHealth::Terminal {
+                phase: self.phase.clone(),
+            };
+        }
+
+        let phase_age_secs = (now - self.phase_entered_at).num_seconds().max(0);
+        let last_heartbeat_age_secs = (now - self.last_heartbeat).num_seconds().max(0);
+
+        if last_heartbeat_age_secs > WEDGED_HEARTBEAT_THRESHOLD_SECS {
+            return RitualHealth::Wedged {
+                phase_age_secs,
+                last_heartbeat_age_secs,
+            };
+        }
+
+        let expected_max_secs = self.phase.expected_max_secs();
+        if phase_age_secs > expected_max_secs {
+            return RitualHealth::LongRunning {
+                phase_age_secs,
+                expected_max_secs,
+            };
+        }
+
+        RitualHealth::Healthy { phase_age_secs }
     }
 }
 
@@ -2955,6 +3100,189 @@ mod tests {
             json.get("last_heartbeat").is_some(),
             "last_heartbeat must serialize"
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ISS-029 GOAL-3 — RitualHealth::health() classification
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iss029_health_healthy_fresh_phase() {
+        // A ritual mid-phase with a heartbeat that ticked within the
+        // wedged threshold and a phase_age under the per-phase budget
+        // → Healthy. This is the common case.
+        let now = Utc::now();
+        let mut s = idle_state();
+        s.phase = RitualPhase::Implementing;
+        s.phase_entered_at = now - chrono::Duration::seconds(30);
+        s.last_heartbeat = now - chrono::Duration::seconds(5);
+
+        match s.health(now) {
+            RitualHealth::Healthy { phase_age_secs } => {
+                assert!(
+                    (29..=31).contains(&phase_age_secs),
+                    "phase_age_secs ≈ 30, got {phase_age_secs}"
+                );
+            }
+            other => panic!("expected Healthy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iss029_health_wedged_when_heartbeat_stale() {
+        // ISS-029 incident reproduction: phase=Implementing, but
+        // last_heartbeat is 90s old (>60s threshold) → Wedged. This
+        // is the wedged-adapter signal that the ISS-029 fix exists to
+        // surface — a snapshot read alone could not distinguish this
+        // from "still working" before the heartbeat field existed.
+        let now = Utc::now();
+        let mut s = idle_state();
+        s.phase = RitualPhase::Implementing;
+        s.phase_entered_at = now - chrono::Duration::seconds(120);
+        s.last_heartbeat = now - chrono::Duration::seconds(90);
+
+        match s.health(now) {
+            RitualHealth::Wedged {
+                phase_age_secs,
+                last_heartbeat_age_secs,
+            } => {
+                assert!(
+                    (119..=121).contains(&phase_age_secs),
+                    "phase_age_secs ≈ 120, got {phase_age_secs}"
+                );
+                assert!(
+                    (89..=91).contains(&last_heartbeat_age_secs),
+                    "last_heartbeat_age_secs ≈ 90, got {last_heartbeat_age_secs}"
+                );
+                assert!(
+                    last_heartbeat_age_secs > WEDGED_HEARTBEAT_THRESHOLD_SECS,
+                    "Wedged variant must imply heartbeat age > threshold"
+                );
+            }
+            other => panic!("expected Wedged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iss029_health_long_running_fresh_heartbeat() {
+        // Implementing phase with phase_age past the per-phase budget
+        // (600s default) but a fresh heartbeat → LongRunning, not
+        // Wedged. The whole point of LongRunning is to distinguish
+        // "alive but slow" from "dead".
+        let now = Utc::now();
+        let mut s = idle_state();
+        s.phase = RitualPhase::Implementing;
+        // 700s phase age > 600s expected_max_secs for Implementing.
+        s.phase_entered_at = now - chrono::Duration::seconds(700);
+        // Fresh heartbeat (well within 60s threshold).
+        s.last_heartbeat = now - chrono::Duration::seconds(10);
+
+        match s.health(now) {
+            RitualHealth::LongRunning {
+                phase_age_secs,
+                expected_max_secs,
+            } => {
+                assert!(
+                    (699..=701).contains(&phase_age_secs),
+                    "phase_age_secs ≈ 700, got {phase_age_secs}"
+                );
+                assert_eq!(
+                    expected_max_secs, 600,
+                    "Implementing budget is 600s — pinning the contract"
+                );
+            }
+            other => panic!("expected LongRunning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iss029_health_terminal_phases_always_terminal() {
+        // Terminal phases (Done / Cancelled / Escalated) always read
+        // Terminal — even if the heartbeat is ancient — because a
+        // finished ritual *correctly* stops ticking. Marking a Done
+        // ritual as Wedged would be a false positive.
+        let now = Utc::now();
+        for terminal_phase in [
+            RitualPhase::Done,
+            RitualPhase::Cancelled,
+            RitualPhase::Escalated,
+        ] {
+            let mut s = idle_state();
+            s.phase = terminal_phase.clone();
+            s.phase_entered_at = now - chrono::Duration::seconds(10);
+            // Deliberately stale heartbeat to confirm terminal short-circuit.
+            s.last_heartbeat = now - chrono::Duration::days(1);
+
+            match s.health(now) {
+                RitualHealth::Terminal { phase } => {
+                    assert_eq!(
+                        phase, terminal_phase,
+                        "Terminal variant should report the actual phase"
+                    );
+                }
+                other => panic!(
+                    "expected Terminal for phase={terminal_phase:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_iss029_health_clock_skew_clamped_to_zero() {
+        // If `now` is *before* phase_entered_at (clock skew, stale
+        // cached `now`), durations would be negative and could wrap
+        // arithmetic. We clamp to 0 so a backwards clock can't
+        // spuriously flag a fresh ritual as Wedged.
+        let now = Utc::now();
+        let mut s = idle_state();
+        s.phase = RitualPhase::Implementing;
+        // Both timestamps in the future relative to `now`.
+        s.phase_entered_at = now + chrono::Duration::seconds(100);
+        s.last_heartbeat = now + chrono::Duration::seconds(100);
+
+        match s.health(now) {
+            RitualHealth::Healthy { phase_age_secs } => {
+                assert_eq!(
+                    phase_age_secs, 0,
+                    "Negative phase_age must clamp to 0"
+                );
+            }
+            other => panic!("expected Healthy (clamped), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iss029_health_wedged_takes_precedence_over_long_running() {
+        // If both conditions are true (phase_age > expected_max AND
+        // heartbeat stale), the more severe `Wedged` classification
+        // wins — the agent needs the wedged signal to act, not the
+        // softer "still working but slow" signal.
+        let now = Utc::now();
+        let mut s = idle_state();
+        s.phase = RitualPhase::Implementing;
+        s.phase_entered_at = now - chrono::Duration::seconds(700); // > 600s budget
+        s.last_heartbeat = now - chrono::Duration::seconds(120); // > 60s threshold
+
+        assert!(
+            matches!(s.health(now), RitualHealth::Wedged { .. }),
+            "Wedged must take precedence over LongRunning when both apply"
+        );
+    }
+
+    #[test]
+    fn test_iss029_health_serde_roundtrip() {
+        // RitualHealth ships over the tool RPC channel as JSON
+        // (Task 2b consumer). Pin the on-wire shape so future
+        // refactors can't silently break tool output.
+        let h = RitualHealth::Wedged {
+            phase_age_secs: 120,
+            last_heartbeat_age_secs: 90,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        // `#[serde(tag = "kind", rename_all = "snake_case")]` controls shape.
+        assert!(json.contains("\"kind\":\"wedged\""), "got: {json}");
+        let h2: RitualHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, h2);
     }
 
     #[test]
