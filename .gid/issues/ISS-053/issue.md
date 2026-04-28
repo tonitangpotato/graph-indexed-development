@@ -180,7 +180,10 @@ pub enum MetaValue {
 
 impl Metadata {
     /// Parse from file contents. Tries YAML → markdown headers → None.
-    /// Never errors on unknown formats; returns MetaSource::None.
+    /// For non-frontmatter files, never errors; returns `MetaSource::None`.
+    ///
+    /// On success, returns `Ok((metadata, body))` where `body` is the file
+    /// contents after the metadata block.
     ///
     /// **Malformed YAML:** if the file begins with `---` frontmatter delimiters
     /// but the content between them fails to parse as YAML, returns
@@ -191,7 +194,14 @@ impl Metadata {
     /// no frontmatter at their discretion. Specifically, `gid artifact lint`
     /// reports `MalformedFrontmatter` as a **warning, not an error**, so a single
     /// bad file does not block bulk operations like `gid artifact list`.
-    pub fn parse(file_contents: &str) -> (Self, /* body */ String);
+    pub fn parse(file_contents: &str) -> Result<(Self, /* body */ String), MetadataError>;
+
+    /// Construct empty metadata for a brand-new artifact. The `hint` selects
+    /// which format `render()` will emit (frontmatter vs. markdown headers vs.
+    /// none). `fields` is empty; `raw` is empty (no round-trip source yet).
+    /// Caller populates fields via `set_field` before `ArtifactStore::create`
+    /// renders + writes the file.
+    pub fn new(source_hint: MetaSourceHint) -> Self;
 
     /// Replace one field's value, rewriting only the affected line(s).
     /// Other lines (including whitespace, comments, key order) preserved byte-exact.
@@ -200,6 +210,19 @@ impl Metadata {
     /// Emit metadata block in original MetaSource format. If MetaSource::None,
     /// caller must specify a target source.
     pub fn render(&self) -> String;
+}
+
+/// Errors produced by `Metadata::parse`. Non-frontmatter parse paths are
+/// infallible (return `MetaSource::None`); only malformed `---`-delimited
+/// YAML frontmatter raises an error.
+pub enum MetadataError {
+    /// File begins with `---` but the YAML between delimiters failed to parse.
+    /// `line` is 1-indexed within the file; `message` is the underlying parser
+    /// diagnostic (verbatim from `serde_yaml` / equivalent).
+    MalformedFrontmatter { line: usize, message: String },
+    /// I/O failure while reading the file (only raised by callers that wrap
+    /// `parse` with file IO, e.g., `ArtifactStore::open` / `get`).
+    IoError(std::io::Error),
 }
 ```
 
@@ -243,8 +266,11 @@ pub struct LayoutPattern {
     pub pattern: String,
     pub kind: String,
     pub metadata_format: MetaSourceHint,    // expected, used for `create`
-    pub id_template: Option<String>,        // for sequenced kinds: "ISS-{seq:04}"
     pub seq_scope: SeqScope,                // Project | Parent
+    // Note: there is no separate `id_template` field. The ID template for a
+    // sequenced kind is encoded inside the pattern via `{id:TEMPLATE}` (see
+    // §4.4.1). `LayoutPattern::id_template_str()` extracts it from `pattern`
+    // when `next_id` needs to render a bare ID without a full path.
 }
 
 pub enum SeqScope {
@@ -292,8 +318,22 @@ impl Layout {
     /// Inverse of pattern matching: given `kind="issue"` and
     /// `slots = {"id" → "ISS-0042", "seq" → "0042"}`, returns
     /// `".gid/issues/ISS-0042/issue.md"`.
-    /// Errors if required slots are missing or a `{seq:NN}` would overflow.
-    pub fn resolve(&self, kind: &Kind, slots: &SlotMap) -> Result<RelativePath, LayoutError>;
+    /// Errors if `kind` matches no pattern, required slots are missing, or a
+    /// `{seq:NN}` would overflow.
+    pub fn resolve(&self, kind: &str, slots: &SlotMap) -> Result<PathBuf, LayoutError>;
+}
+
+/// Errors produced by `Layout::resolve` and the sequence-allocation paths
+/// (`ArtifactStore::next_id` / `next_path`).
+pub enum LayoutError {
+    /// `kind` did not match any `LayoutPattern` in the layout.
+    UnknownKind(String),
+    /// A required slot was not present in the `SlotMap`. `kind` is the kind
+    /// being rendered; `slot` is the missing placeholder name.
+    MissingSlot { kind: String, slot: String },
+    /// `{seq:NN}` would allocate a value past `10^NN - 1`. Widen the layout
+    /// (e.g., bump `seq:04` → `seq:05`) before creating new artifacts.
+    SeqExhausted { pattern: String, max: u64 },
 }
 
 /// Order-preserving union of two string lists. Used by `Metadata::set_field`
@@ -354,6 +394,16 @@ Pattern: `issues/{id:ISS-{seq:04}}/issue.md`
 | Match     | `issues/ISS-0042/issue.md`      | `slots = {id: "ISS-0042", seq: "0042"}`    |
 | Render    | `slots = {seq: "0042"}` (or auto-allocated) | `issues/ISS-0042/issue.md`     |
 
+**Render precedence for `{id:TEMPLATE}`:** when rendering, `{id:TEMPLATE}` is
+resolved first by looking up the `id` slot in the `SlotMap`. If `id` is
+present, its rendered form is used verbatim. If `id` is absent, the template
+is evaluated by recursively resolving its inner placeholders (currently only
+`{seq:NN}` and literal text), with `seq` looked up in the `SlotMap` and
+zero-padded to width NN. If both `id` and `seq` are present in slots and `id`
+already starts with the rendered seq, the seq is consumed by the id template;
+otherwise (neither `id` nor a usable `seq` is supplied) it's an error
+(`LayoutError::MissingSlot`).
+
 **Escaping:** Literal `{` and `}` cannot appear in patterns (no escape mechanism in v1). `.` is treated as a literal character (not regex-special). Path separators are always `/`.
 
 **Sequence overflow:** If `ArtifactStore::create` (or `next_id` / `next_path`) would allocate a `{seq:NN}` value that exceeds `10^NN - 1` (e.g., `seq:04` past `9999`), it returns `Err(LayoutError::SeqExhausted { pattern, max })`. Callers must widen the layout (e.g., bump `seq:03` → `seq:04`) before creating new artifacts. **No silent rollover** — a 5-digit ID under a `seq:04` pattern would break sort order assumptions and round-trip matching.
@@ -402,7 +452,12 @@ impl ArtifactStore {
     pub fn open(project: &str) -> Result<Self>;
 
     // Read.
+    /// Loads each matching file, calling `Metadata::parse` and propagating
+    /// `MetadataError` via `?`. A malformed-frontmatter file surfaces as an
+    /// error to the caller; `gid artifact list` downgrades to a warning + skip
+    /// (per §4.2).
     pub fn list(&self, kind_filter: Option<&str>) -> Result<Vec<Artifact>>;
+    /// Reads the file at `id.path`, then `let (meta, body) = Metadata::parse(&contents)?;`.
     pub fn get(&self, id: &ArtifactId) -> Result<Option<Artifact>>;
 
     // Allocate.
@@ -410,6 +465,10 @@ impl ArtifactStore {
     pub fn next_path(&self, kind: &str, parent: Option<&ArtifactId>, slot_overrides: &SlotMap) -> Result<PathBuf>;
 
     // Write (all are file writes; D3 means relate also writes a file).
+    /// New artifacts: caller builds metadata via `Metadata::new(hint)` + a
+    /// sequence of `set_field` calls, then passes it here. `create` renders
+    /// metadata + body, writes via `tempfile + rename` (atomic), refuses
+    /// overwrites.
     pub fn create(&self, path: &Path, metadata: Metadata, body: &str) -> Result<Artifact>;
     pub fn update(&self, artifact: &Artifact) -> Result<()>;
 
@@ -427,9 +486,26 @@ Every operation is **kind-agnostic at the type level**. Behavior differences liv
 
 #### Concurrency model
 
-- `&self` for reads (list/get/relations_*); `&mut self` for index updates.
-- Daemon usage: wrap `ArtifactStore` in `Arc<Mutex<...>>` or `Arc<RwLock<...>>` at the call site. gid-core does not impose a sharing model.
-- Index invalidation: each query checks dir mtime; if newer than cache, rebuild. Cheap.
+- `&self` for all public methods. `index: Mutex<RelationIndex>` provides
+  interior mutability for the lazy cache, so query methods (`relations_from`,
+  `relations_to`) can rebuild on mtime change without `&mut self`.
+- Daemon usage: wrap `ArtifactStore` in `Arc<...>` at the call site. gid-core
+  does not impose a sharing model.
+- Index invalidation: each query checks dir mtime; if newer than cache,
+  rebuild. Cheap (<1000 artifacts per project).
+- **Workload shape:** read-mostly (list/show/refs dominate; create/update are
+  rare, human-driven). The `RelationIndex` is the only in-memory cache; it is
+  rebuilt from files, never persisted, so there is no cross-process cache
+  invalidation problem.
+- **Atomic writes:** `create` / `update` write via `tempfile` in the target
+  directory followed by `rename(2)` onto the final path — readers either see
+  the old file or the new file, never a torn write.
+- **Concurrent edits to the same file:** last-writer-wins. Acceptable because
+  artifact files are human-edited markdown with low contention; conflicts are
+  resolved by git, not by gid-core. There is no advisory locking.
+- **No separate index to keep in sync:** D3 (relations derived from files)
+  means writing an artifact file is the only mutation — there is no
+  `relations.db` that could disagree with disk after a crash mid-write.
 
 
 ## 5. Wrappers
@@ -481,18 +557,18 @@ Same six tools, registered as native function-call tools, identical surface to M
 ### Functional
 
 - [ ] `Metadata::parse` round-trips: read -> no-op `set_field` for an existing key with the same value -> render -> byte-identical to original.
-  - **Test:** Fixture `tests/fixtures/iss053/roundtrip-corpus/` containing files copied verbatim from `engram/.gid/`, `gid-rs/.gid/`, and `rustclaw/.gid/` (issue.md, design.md, requirements.md, review files, ad-hoc files). For each fixture file `F`: `let (m, body) = Metadata::parse(read(F)); m.set_field(first_key, m.fields[first_key].clone()); assert_eq!(read(F), m.render() + body)`. Expected: byte-identical for 100% of fixture files. CI fails on any non-match with a unified diff.
+  - **Test:** Fixture `tests/fixtures/iss053/roundtrip-corpus/` containing files copied verbatim from `engram/.gid/`, `gid-rs/.gid/`, and `rustclaw/.gid/` (issue.md, design.md, requirements.md, review files, ad-hoc files). For each fixture file `F`: `let (m, body) = Metadata::parse(read(F))?; m.set_field(first_key, m.fields[first_key].clone()); assert_eq!(read(F), m.render() + body)`. Expected: byte-identical for 100% of fixture files. CI fails on any non-match with a unified diff.
 - [ ] `Metadata::set_field` for a new key inserts in original `MetaSource` style.
 - [ ] `ArtifactStore::next_id` returns project-scoped ISS-{seq} for issues, parent-scoped r-{seq} for reviews; errors clearly for slug kinds without caller-supplied slot.
 - [ ] `ArtifactStore::create` is mkdir-atomic and refuses overwrites.
 - [ ] Two stores for different projects can both have `ISS-050` without conflict (regression test for the original collision).
 - [ ] `resolve("engram:ISS-022")` works regardless of cwd, via ProjectRegistry.
   - **Test:** Fixture `tests/fixtures/iss053/projects.yml` registering `engram` → `tests/fixtures/iss053/engram-root/` (which contains `.gid/issues/ISS-022/issue.md`). Set env var `GID_PROJECTS_YML=tests/fixtures/iss053/projects.yml` to mock `~/.config/gid/projects.yml`. Run from cwd `/tmp` (outside any project): `resolve(&ArtifactId::parse("engram:ISS-022", &layout)?)`. Expected: `Ok(Artifact { kind: "issue", id: ArtifactId { project: "engram", path: ".gid/issues/ISS-022/issue.md" }, ... })`.
-- [ ] `find_references_to` discovers all four `RelationSource` types per the rules in §4.5.
-  - **Test:** Fixture `tests/fixtures/iss053/relations/` with one file per `RelationSource` type, all pointing at the same target `ISS-002`:
+- [ ] `find_references_to` discovers relations from all four discovery rules in §4.5 (frontmatter, markdown link, inline backtick, directory nesting), mapped onto the three `RelationSource` variants (`Frontmatter`, `MarkdownLink`, `DirectoryNesting`; backtick refs share the `MarkdownLink` discriminant).
+  - **Test:** Fixture `tests/fixtures/iss053/relations/` with one file per discovery rule, all pointing at the same target `ISS-002`:
     - `frontmatter.md` — frontmatter `related: [ISS-002]` → expects `RelationSource::Frontmatter { field: "related" }`.
     - `markdown-link.md` — body contains `[see](.gid/issues/ISS-002/issue.md)` → expects `RelationSource::MarkdownLink`.
-    - `backtick.md` — body contains `` `engram:ISS-002` `` → expects `RelationSource::MarkdownLink` (via inline-backtick rule §4.5.3).
+    - `backtick.md` — body contains `` `engram:ISS-002` `` → expects `RelationSource::MarkdownLink` (via inline-backtick rule §4.5 rule 3).
     - `reviews/of-ISS-002.md` (placed under a parent dir for `ISS-002`) → expects `RelationSource::DirectoryNesting`.
     Run `find_references_to(ISS-002)`. Expected: 4 relations returned, one per source type. Test asserts the set of `source` discriminants equals `{Frontmatter, MarkdownLink, DirectoryNesting}` (markdown-link and backtick share the `MarkdownLink` discriminant; assert at least one of each was discovered by inspecting which fixture file was the `from`).
 - [ ] `gid artifact relate A blocks B` modifies A's frontmatter; subsequent `find_references_to(B)` returns the new edge; no `relations.yml`/`.db` is created.
@@ -516,7 +592,6 @@ Same six tools, registered as native function-call tools, identical surface to M
     - pattern: "postmortems/{id:PM-{seq:03}}/postmortem.md"
       kind: postmortem
       metadata_format: frontmatter
-      id_template: "PM-{seq:03}"
       seq_scope: project
   ```
 
