@@ -721,3 +721,32 @@ Until that issue lands, the practical guidance is: **for artifacts (issue/featur
 - After this fix, the original ISS-050 collision is structurally impossible: `engram` and `gid-rs` each scope their `next_id("issue")` to their own `issues/` dir; cross-project refs always carry the project name.
 - ISS-051 / ISS-052 (ritual fixes) do not depend on this; they proceed in parallel.
 - Generalization comes from removing closed sets in code (no `ArtifactKind` enum, no fixed parent tree) and putting variation in data (`layout.yml`, frontmatter, file paths). Same pattern as rustclaw channels (capabilities-driven) and skills (frontmatter-driven).
+
+---
+
+## Implementation log
+
+### 2026-04-28 — Phase 4 (rustclaw native tools) complete
+
+Added 6 `gid_artifact_*` tools to rustclaw's `src/tools.rs`, wrapping
+`gid_core::ArtifactStore`:
+
+- `gid_artifact_list` — list artifacts (optional kind filter)
+- `gid_artifact_show` — show one artifact (path or short id ref)
+- `gid_artifact_new` — create artifact (Layout-allocated path)
+- `gid_artifact_update` — update frontmatter fields (scalar/list/array values)
+- `gid_artifact_relate` — add typed relation (depends_on / blocks / …)
+- `gid_artifact_refs` — find back-references (frontmatter / md-link / backtick / nesting)
+
+Project resolution precedence: `project` (registry) → `project_path` (filesystem)
+→ `<proj>:` ref prefix → workspace fallback. Mirrors the CLI but adapted for
+agent calls (no cwd ambient state).
+
+Tests: 5 end-to-end tests under tempdir, covering create/show/list roundtrip,
+mixed-type field updates, relate→refs back-reference flow, error paths
+(unknown ref, empty fields). All 379 rustclaw tests pass, 0 warnings.
+
+Commits: rustclaw `src/tools.rs` (~600 LOC added incl. tests + helpers).
+
+Phases remaining: G (default layout corpus verification), H (documentation).
+ISS-052 (rustclaw artifact↔graph sync) is now unblocked.
