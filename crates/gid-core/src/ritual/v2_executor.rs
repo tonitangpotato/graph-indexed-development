@@ -2008,16 +2008,167 @@ pub async fn run_ritual(
 
     // ── Step 3: kick off the state machine with `Start` ──
     let task = state.task.clone();
-    let (new_state, actions) = transition(&state, RitualEvent::Start { task });
+    drive_event_loop(state, RitualEvent::Start { task }, &executor, hooks.as_ref()).await
+}
+
+/// User-driven events that can be injected into a paused ritual via
+/// [`resume_ritual`]. This is the **public** event API for resumption —
+/// a deliberate subset of the internal state-machine event space, kept
+/// small to avoid leaking the full FSM vocabulary into embedder code.
+///
+/// Each variant maps 1:1 to a `state_machine::RitualEvent::User*` variant
+/// internally, but embedders depend only on this enum, not on the FSM
+/// type. This gives us room to evolve the state machine without breaking
+/// the resume API.
+///
+/// # Mapping to commands
+///
+/// Embedders typically receive these from user-facing commands:
+///
+/// - `Cancel`        — `/cancel`
+/// - `Retry`         — `/retry`
+/// - `SkipPhase`     — `/skip`
+/// - `Clarification` — `/clarify <text>` or `/reply <text>`
+/// - `Approval`      — `/approve <findings-spec>` (e.g. "all" or "1,3,5")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserEvent {
+    /// Operator-initiated cancellation. Routes to `Cancelled` terminal
+    /// from any non-terminal phase.
+    Cancel,
+    /// Retry the most recently failed phase. From paused phases this
+    /// re-enters the prior working phase; from `Escalated` this resets
+    /// retry counters and re-attempts.
+    Retry,
+    /// Skip the current phase and advance to the next one. State machine
+    /// rejects skip from phases where it's unsafe (e.g. cannot skip into
+    /// `WaitingClarification` itself).
+    SkipPhase,
+    /// Reply to a clarification request. The `response` becomes the
+    /// requirements/design input for the next phase.
+    Clarification { response: String },
+    /// Approval of a review's findings. `approved` is the user's selector
+    /// (e.g. `"all"`, `"1,3,5"`) — interpretation is the embedder's
+    /// responsibility; the state machine just records the string.
+    Approval { approved: String },
+}
+
+impl UserEvent {
+    /// Internal: convert to the state-machine event type. Kept private
+    /// so the FSM event type does not leak across the crate boundary.
+    fn into_machine_event(self) -> super::state_machine::RitualEvent {
+        use super::state_machine::RitualEvent as Ev;
+        match self {
+            UserEvent::Cancel => Ev::UserCancel,
+            UserEvent::Retry => Ev::UserRetry,
+            UserEvent::SkipPhase => Ev::UserSkipPhase,
+            UserEvent::Clarification { response } => Ev::UserClarification { response },
+            UserEvent::Approval { approved } => Ev::UserApproval { approved },
+        }
+    }
+}
+
+/// Resume a previously-persisted ritual by injecting a user-driven event
+/// into the state machine.
+///
+/// This is the entry point for user-driven events on a paused ritual:
+/// `/retry`, `/skip`, `/clarify`, `/reply`, `/cancel`, `/approve`. The
+/// state is expected to already be at a paused phase
+/// (`WaitingClarification`, `WaitingApproval`) — but this function will
+/// faithfully feed the event to `transition` regardless and let the
+/// state machine reject invalid (state, event) pairs through its normal
+/// terminal/no-op rules.
+///
+/// # Differences from [`run_ritual`]
+///
+/// - **No workspace resolution.** A ritual that's paused has already
+///   passed workspace resolution on its first run; the resolved
+///   `target_root` is already on `state`. Re-resolving would be
+///   redundant and potentially incorrect (the registry could have
+///   changed, but the ritual must continue against the originally-
+///   resolved root).
+/// - **No `stamp_metadata` call.** Per FINDING-12 / design §4 invariant,
+///   metadata is stamped exactly once at ritual *start*. Resumption is
+///   not a start.
+/// - **Caller provides the initial event.** No hardcoded `Start`. The
+///   caller decides which [`UserEvent`] to inject.
+///
+/// # Lifecycle
+///
+/// 1. Convert the [`UserEvent`] to its internal state-machine event.
+/// 2. Inject via `transition(&state, ev)`.
+/// 3. Fire `on_phase_transition` if the phase changed.
+/// 4. Drive the same event loop as `run_ritual` (same iteration cap,
+///    same terminal/paused break behavior, same hook contract).
+///
+/// # When to use
+///
+/// Embedders (e.g. rustclaw) that previously persisted ritual state to
+/// disk via `SaveState` actions should load that state, then call
+/// `resume_ritual` with a [`UserEvent`]. This replaces ad-hoc dispatcher
+/// re-implementations on the embedder side (ISS-052 AC3: single
+/// dispatcher).
+pub async fn resume_ritual(
+    state: RitualState,
+    user_event: UserEvent,
+    config: V2ExecutorConfig,
+    hooks: Arc<dyn RitualHooks>,
+) -> RitualOutcome {
+    let executor = V2Executor::with_hooks(config, hooks.clone());
+    drive_event_loop(
+        state,
+        user_event.into_machine_event(),
+        &executor,
+        hooks.as_ref(),
+    )
+    .await
+}
+
+/// Internal event-loop driver shared by `run_ritual` (start) and
+/// `resume_ritual` (user-event injection on paused state).
+///
+/// Takes ownership of the state, fires `initial_event` once, then loops:
+/// for each produced event, transition → fire `on_phase_transition` if
+/// phase changed → execute actions → capture next event → repeat. Breaks
+/// on terminal or paused phases (after draining their fire-and-forget
+/// actions). Enforces the 50-iteration safety cap.
+///
+/// # Why a private helper
+///
+/// `run_ritual` and `resume_ritual` differ only in their pre-loop setup
+/// (workspace resolution + stamp_metadata for start; nothing for resume)
+/// and their initial event (`Start` vs caller-provided). Everything from
+/// the first `transition` onward is identical. Extracting this loop is
+/// the AC3 single-dispatcher invariant — there must be exactly ONE event
+/// loop in the codebase, otherwise embedders inevitably re-implement
+/// dispatcher logic and quality gates fragment.
+async fn drive_event_loop(
+    mut state: RitualState,
+    initial_event: RitualEvent,
+    executor: &V2Executor,
+    hooks: &dyn RitualHooks,
+) -> RitualOutcome {
+    use super::state_machine::transition;
+
+    let (new_state, actions) = transition(&state, initial_event);
     let prev_phase = state.phase.clone();
     state = new_state;
     if prev_phase != state.phase {
         hooks.on_phase_transition(&prev_phase, &state.phase);
     }
 
+    // If the very first transition lands us in a terminal or paused phase,
+    // drain its actions and return — the caller handed us an event that
+    // produced no further work (e.g., `UserCancel` on an already-paused
+    // ritual transitions straight to `Cancelled`).
+    if state.phase.is_terminal() || state.phase.is_paused() {
+        executor.execute_actions(&actions, &state).await;
+        info!(phase = ?state.phase, iterations = 0, "Ritual completed");
+        return RitualOutcome::from_state(state);
+    }
+
     let mut event = executor.execute_actions(&actions, &state).await;
 
-    // ── Step 4: main event loop ──
+    // ── Main event loop ──
     // Each iteration: feed the produced event back through `transition`,
     // execute the resulting actions, capture the next event. Phase changes
     // fire `on_phase_transition` exactly once per actual change.

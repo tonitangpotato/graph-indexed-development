@@ -816,6 +816,36 @@ Sections of `src/ritual_runner.rs` to **remove entirely**:
 
 **Approximate net deletion: ~1700 LOC.** Final number measured during implementation.
 
+#### 7.1.1 Two-phase deletion (T13a → T13b)
+
+Reality check from T12 implementation (2026-04-27): after T12 migrated the two **production** entry points (`tools.rs::start_ritual` and `channels/telegram.rs::handle_ritual_command`) to call `gid_core::ritual::run_ritual`, the dispatcher bodies in `ritual_runner.rs` are **still reachable** through 17 other call sites in `channels/telegram.rs` that depend on the public `RitualRunner` API surface — `advance()`, `send_event()`, `resume_from_phase()`, `make_ritual_runner()` factory — driving `/ritual retry`, `/skip`, `/clarify`, `/reply`, `/cancel`, `/resume-from-phase`, and the orphan-sweep recovery path. A single-shot deletion of the dispatcher bodies would break compilation at all 17 sites and at `make_ritual_runner`.
+
+To preserve bisectability and keep `cargo test --all` green at every commit, T13 is split into two atomic steps:
+
+**T13a — stub dispatcher bodies (compile-preserving)**
+- Replace bodies of `RitualRunner::run_skill`, `run_shell`, `run_triage`, `run_planning`, `run_harness`, and `save_state` with `unreachable!("migrated to V2Executor in T12 — should not be reached, see ISS-052")`.
+- Keep the function signatures, keep `execute_event_producing` / `execute_event_producing_single` / `advance()` / `send_event()` / `resume_from_phase()` and `make_ritual_runner()` factory **as-is** so the 17 telegram call sites still compile.
+- Verify production path goes through `run_ritual` (T12 work) and never enters a stub. Add a release-mode log line on stub entry as a tripwire (defensive — should never fire).
+- All 348 existing tests must stay green.
+
+**T13b — delete public API + migrate 17 call sites**
+- Delete `advance()`, `send_event()`, `resume_from_phase()`, `execute_event_producing*`, `make_ritual_runner()`.
+- Migrate each of the 17 telegram call sites to one of:
+  - `run_ritual + RustclawHooks` for sites that actually drive a ritual forward (e.g. `/ritual retry` resumes via `run_ritual` with the persisted state).
+  - Thin event-recording shims that read state files and append `UserEvent`s (e.g. `/clarify`, `/reply` may not need a runner at all — they write to the ritual's input channel which `run_ritual` consumes via `hooks.poll_user_input` or similar).
+  - Direct state-file mutation for read-only sites (`/ritual status`).
+- Delete the now-empty stub bodies introduced in T13a.
+
+The split is the difference between "one bisect point if anything breaks" (T13b broken in isolation = revert one commit) and "tangled refactor commit that must be reverted whole" (T12+T13 monolith).
+
+**Acceptance for T13a in isolation:**
+- `wc -l src/ritual_runner.rs` drops only marginally (just function bodies → `unreachable!`).
+- `cargo test --all` green.
+- `grep -n 'unreachable!' src/ritual_runner.rs` returns ≥6 hits with the ISS-052 message.
+- Manual sanity: trigger `/ritual` end-to-end via Telegram, verify no stub log fires.
+
+**Acceptance for T13b** is the original §7.1 / AC1 / AC3 acceptance: file ≤800 LOC, no `match action` against `RitualAction`, all 17 telegram sites migrated, `make_ritual_runner` deleted.
+
 ### 7.2 What stays / changes
 
 **Stays as-is:**
@@ -915,12 +945,13 @@ The deletion plan in §7.1 only addresses the *internals* of `src/ritual_runner.
 | `rustclaw/src/tools.rs:80, 2795, 2804, 5774, 5785` | `crate::ritual_runner::NotifyFn` type alias | Notify function plumbed through tools | The `NotifyFn` shape becomes redundant once notifications go through `hooks.notify`. Either delete the alias or keep it as a compatibility shim that delegates to `hooks`. Decide in commit 4. |
 | `rustclaw/src/tools.rs:2942` | `ritual_runner::preload_files_with_budget` | Helper, not a runner construction | Standalone helper; either keep in `ritual_runner.rs` (the file isn't deleted, just shrunk) or move to a dedicated module. No migration concern. |
 
-**Updated commit ordering** (replaces the §7.4 plan): commit 3 ("rewrite `RitualRunner::run`") becomes commit 3a + 3b:
+**Updated commit ordering** (replaces the §7.4 plan): commit 3 ("rewrite `RitualRunner::run`") becomes commit 3a + 3b + 3c, **mirroring the T12 / T13a / T13b graph tasks**:
 
-- **3a:** Update *all* of the above call sites to call `gid_core::ritual::run_ritual` with `RustclawHooks`. `RitualRunner::new` and `RitualRunner::with_registries` either disappear or become trivial wrappers in this commit. Build must stay green.
-- **3b:** Delete the old dispatcher bodies inside `ritual_runner.rs` (the L575 / L813 match blocks). At this point nothing external still calls them.
+- **3a (T12, completed 2026-04-27):** Migrate the two production entry points — `tools.rs::start_ritual` and `channels/telegram.rs::handle_ritual_command` — to call `gid_core::ritual::run_ritual` with `RustclawHooks`. Old `RitualRunner` API surface (`advance` / `send_event` / `resume_from_phase` / `make_ritual_runner`) preserved so the remaining 17 telegram call sites still compile. Build + 348 tests green.
+- **3b (T13a):** Stub the dispatcher bodies (`run_skill` / `run_shell` / `run_triage` / `run_planning` / `run_harness` / `save_state`) with `unreachable!("migrated to V2Executor in T12 — should not be reached, see ISS-052")`. Public API surface untouched. Build + tests green. This is the bisect point — if anything regresses, revert this single commit.
+- **3c (T13b):** Delete `advance()`, `send_event()`, `resume_from_phase()`, `execute_event_producing*`, `make_ritual_runner()`. Migrate all 17 telegram call sites (`/ritual retry`, `/skip`, `/clarify`, `/reply`, `/cancel`, `/resume-from-phase`, orphan sweep, etc.) to either `run_ritual + RustclawHooks` flows or thin event-recording shims. Delete the now-empty stub bodies from 3b. AC3 enforced: zero `match action` against `RitualAction`, file ≤800 LOC.
 
-This split lets a reviewer verify "external callers migrated correctly" (3a) separately from "old code deleted" (3b).
+This three-step split (was: 3a + 3b) lets a reviewer bisect "external production callers migrated correctly" (3a) vs "dispatcher bodies stubbed" (3b) vs "public API removed + 17 secondary callers migrated" (3c) independently. T13a was added during T12 implementation when the 17 secondary call sites became visible.
 
 **Test sites** (`grep -rn "RitualRunner\|ritual_runner" rustclaw/tests/`) are enumerated and migrated in commit 5 alongside the unit-test rewiring.
 
@@ -1192,9 +1223,9 @@ Considered. Rejected. Two dispatchers is the bug; shipping a third behind a flag
 
 This design is "done" when:
 
-- **AC1.** `rustclaw/src/ritual_runner.rs` line count reduced by ≥1500 LOC.
-- **AC2.** `cargo test --all` passes in both repos against the new gid-core.
-- **AC3.** `grep -rn "match action" rustclaw/src/` returns **zero** matches against `RitualAction` variants. (Single-dispatcher invariant.)
+- **AC1.** `rustclaw/src/ritual_runner.rs` line count reduced by ≥1500 LOC (final state, measured at end of T13b).
+- **AC2.** `cargo test --all` passes in both repos against the new gid-core. **Must hold at every commit boundary** — T12, T13a, and T13b each leave the workspace green.
+- **AC3.** `grep -rn "match action" rustclaw/src/` returns **zero** matches against `RitualAction` variants. (Single-dispatcher invariant — measured at end of T13b.)
 - **AC4.** New gid-core test `skill_required_zero_files_fails` passes (gate runs).
 - **AC5.** New rustclaw integration test `zero_file_implement_fails_in_prod` passes (gate runs in production path — r-950ebf regression test).
 - **AC6.** New gid-core test `subloop_turn_limit_all_attempts_fails` passes (rustclaw ISS-051 gate).

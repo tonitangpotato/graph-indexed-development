@@ -50,7 +50,7 @@ pub use llm::{LlmClient, ToolDefinition, SkillResult};
 pub use api_llm_client::ApiLlmClient;
 pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
 pub use composer::{compose_ritual, ProjectState as ComposerProjectState, ProjectLanguage};
-pub use v2_executor::{V2Executor, V2ExecutorConfig, NotifyFn, run_ritual, build_triage_prompt, RitualOutcome, RitualOutcomeStatus};
+pub use v2_executor::{V2Executor, V2ExecutorConfig, NotifyFn, run_ritual, resume_ritual, UserEvent, build_triage_prompt, RitualOutcome, RitualOutcomeStatus};
 pub use gating::{GatingConfig, GatingResult, CommandPattern, PatternType, check_gating, load_gating_config, save_gating_config};
 pub use work_unit::{WorkUnit, WorkUnitResolver, RegistryResolver, resolve_and_validate, validate_resolved_root, reject_target_root};
 pub use hooks::{

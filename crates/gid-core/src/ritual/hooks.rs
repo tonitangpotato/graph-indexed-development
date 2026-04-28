@@ -202,6 +202,11 @@ pub struct NoopHooks {
     pub persist_dir: PathBuf,
     pub notifications: Mutex<Vec<String>>,
     pub cancel_requested: AtomicBool,
+    /// Test-only counter: increments on every `stamp_metadata` call.
+    /// Exercised by ISS-052 T13b to assert the once-only invariant
+    /// (FINDING-12 / §4) — `run_ritual` increments it to 1, `resume_ritual`
+    /// must NOT increment it.
+    pub stamp_metadata_calls: AtomicUsize,
 }
 
 impl NoopHooks {
@@ -213,7 +218,14 @@ impl NoopHooks {
             persist_dir,
             notifications: Mutex::new(Vec::new()),
             cancel_requested: AtomicBool::new(false),
+            stamp_metadata_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times `stamp_metadata` has been invoked on this hook
+    /// instance. Used by resume tests to verify the once-only invariant.
+    pub fn stamp_metadata_count(&self) -> usize {
+        self.stamp_metadata_calls.load(Ordering::SeqCst)
     }
 
     /// Request cancellation. The next call to `should_cancel` will return
@@ -272,6 +284,13 @@ impl RitualHooks for NoopHooks {
         } else {
             None
         }
+    }
+
+    fn stamp_metadata(&self, _state: &mut RitualState) {
+        // Test-only counter: lets resume_ritual tests assert the once-only
+        // invariant (FINDING-12 / §4). The base trait's default is a no-op;
+        // we override only to count.
+        self.stamp_metadata_calls.fetch_add(1, Ordering::SeqCst);
     }
 }
 
