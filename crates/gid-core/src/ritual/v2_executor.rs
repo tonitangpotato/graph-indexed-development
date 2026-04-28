@@ -617,7 +617,16 @@ impl V2Executor {
             None
         };
         let model = review_config.as_ref().map(|c| c.model.clone()).unwrap_or_else(|| self.config.skill_model.clone());
-        let max_iterations = review_config.as_ref().map(|c| c.max_iterations).unwrap_or(100);
+        // ISS-056a: implement phase max_iterations scales with triage size
+        // (small=15, medium=30, large=50, None→30). Review phases keep
+        // their own budget via review_config. Other phases default to 100.
+        let max_iterations = review_config.as_ref().map(|c| c.max_iterations).unwrap_or_else(|| {
+            if name == "implement" {
+                Self::implement_iterations_for_triage_size(state.triage_size.as_deref())
+            } else {
+                100
+            }
+        });
 
         // Inject review depth hint into prompt for review phases
         let full_prompt = if let Some(ref config) = review_config {
@@ -1300,6 +1309,16 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     // ═══════════════════════════════════════════════════════════════════════
     // Helpers
     // ═══════════════════════════════════════════════════════════════════════
+
+    /// ISS-056a: implement-phase iteration budget keyed on triage size.
+    /// small/medium/large map to 15/30/50; unknown or missing → 30.
+    fn implement_iterations_for_triage_size(size: Option<&str>) -> usize {
+        match size.unwrap_or("medium") {
+            "small" => 15,
+            "large" => 50,
+            _ => 30, // medium + unknown
+        }
+    }
 
     /// Select model and iteration count for review phase based on triage size (§9).
     fn review_config_for_triage_size(&self, state: &RitualState) -> ReviewConfig {
@@ -2370,6 +2389,21 @@ mod tests {
     }
 
     // ── Review skill name matching ──
+
+    // ── ISS-056a: implement phase iteration budget ──
+
+    #[test]
+    fn test_implement_iterations_for_triage_size_small() {
+        assert_eq!(V2Executor::implement_iterations_for_triage_size(Some("small")), 15);
+    }
+
+    #[test]
+    fn test_implement_iterations_for_triage_size_medium_large_default() {
+        assert_eq!(V2Executor::implement_iterations_for_triage_size(Some("medium")), 30);
+        assert_eq!(V2Executor::implement_iterations_for_triage_size(Some("large")), 50);
+        assert_eq!(V2Executor::implement_iterations_for_triage_size(None), 30);
+        assert_eq!(V2Executor::implement_iterations_for_triage_size(Some("bogus")), 30);
+    }
 
     #[test]
     fn test_review_design_triggers_review_config() {
