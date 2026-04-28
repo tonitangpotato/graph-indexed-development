@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use anyhow::Result;
+use chrono::Utc;
 use tracing::{info, warn, error};
 
 use super::composer::ProjectState as ComposerProjectState;
@@ -2166,6 +2167,16 @@ async fn drive_event_loop(
         return RitualOutcome::from_state(state);
     }
 
+    // ISS-029b: heartbeat tick before dispatching actions. Each event-loop
+    // step is a natural tick point — phase transitions and action
+    // completions both pass through here. Updating `last_heartbeat` here
+    // keeps the value fresh while a long action (skill execution) is
+    // running, but only at the granularity of the surrounding state
+    // machine cycle. For wedged-detection: if a single action hangs
+    // longer than `WEDGED_HEARTBEAT_THRESHOLD_SECS`, `health()` will
+    // correctly classify the ritual as `Wedged` because no further
+    // ticks will land here until the action returns.
+    state.last_heartbeat = Utc::now();
     let mut event = executor.execute_actions(&actions, &state).await;
 
     // ── Main event loop ──
@@ -2225,6 +2236,9 @@ async fn drive_event_loop(
             break;
         }
 
+        // ISS-029b: heartbeat tick at every event-loop iteration. See
+        // initial-transition tick above for design rationale.
+        state.last_heartbeat = Utc::now();
         event = executor.execute_actions(&actions, &state).await;
     }
 
@@ -4102,6 +4116,47 @@ mod tests {
         // Final transition must end at Cancelled (cancellation was the
         // intended terminator).
         assert_eq!(transitions.last().map(|(_, t)| t.as_str()), Some("Cancelled"));
+    }
+
+    /// ISS-029b — heartbeat tick fires on every event-loop iteration so
+    /// `last_heartbeat` stays fresh while a ritual is making progress.
+    /// Concretely: we set `last_heartbeat` to a stale timestamp before
+    /// running, and assert that after `run_ritual` returns the value has
+    /// been advanced past that stale point. This pins the contract that
+    /// some natural tick point inside `drive_event_loop` updates the
+    /// field — without that tick, `RitualHealth::Wedged` detection would
+    /// never trigger correctly because the only updates would come from
+    /// phase transitions in `with_phase`.
+    #[tokio::test]
+    async fn drive_event_loop_ticks_last_heartbeat() {
+        let tmp = std::env::temp_dir();
+        let hooks = TrackingHooks::new(tmp.clone());
+        hooks.cancel_on_first_action();
+        let mut initial = make_initial_state_with_work_unit();
+        // Stale stamp from the past — must be overwritten by the tick.
+        let stale = chrono::Utc::now() - chrono::Duration::hours(1);
+        initial.last_heartbeat = stale;
+
+        let cfg = V2ExecutorConfig {
+            project_root: tmp,
+            ..V2ExecutorConfig::default()
+        };
+
+        let outcome = run_ritual(initial, cfg, hooks.clone() as Arc<dyn RitualHooks>).await;
+
+        assert!(
+            outcome.state.last_heartbeat > stale,
+            "last_heartbeat must advance past the stale starting value \
+             (got {} vs stale {})",
+            outcome.state.last_heartbeat, stale,
+        );
+        let now = chrono::Utc::now();
+        let age_secs = (now - outcome.state.last_heartbeat).num_seconds();
+        assert!(
+            age_secs.abs() < 60,
+            "last_heartbeat must be ~recent after run_ritual returns \
+             (age = {age_secs}s)"
+        );
     }
 
     /// Cancellation via hooks.should_cancel routes through
