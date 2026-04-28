@@ -25,3 +25,12 @@ packages/*/dist/
 .gid/execution-log.jsonl
 **/execution-log.jsonl
 .gid/graph.yml.backup
+
+# SQLite WAL/SHM temp files
+.gid/graph.db-shm
+.gid/graph.db-wal
+**/graph.db-shm
+**/graph.db-wal
+
+# Ritual JSON backups
+.gid/rituals/*.bak
