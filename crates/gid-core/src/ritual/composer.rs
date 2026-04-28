@@ -10,6 +10,7 @@ use tracing::info;
 use super::definition::{
     ApprovalRequirement, PhaseDefinition, PhaseKind, RitualConfig, RitualDefinition,
 };
+use super::work_unit::WorkUnit;
 
 /// Project state detected by scanning the filesystem.
 #[derive(Debug)]
@@ -46,7 +47,13 @@ pub enum ProjectLanguage {
 
 impl ProjectState {
     /// Scan the project directory and detect state.
-    pub fn detect(project_root: &Path) -> Self {
+    ///
+    /// `work_unit` (ISS-057): when provided and the unit is `WorkUnit::Issue`,
+    /// the corresponding `.gid/issues/<id>/issue.md` is treated as a satisfied
+    /// requirements artifact. This prevents issue-mode rituals from being
+    /// routed to `WritingRequirements` (which would re-author the issue body
+    /// instead of implementing it).
+    pub fn detect(project_root: &Path, work_unit: Option<&WorkUnit>) -> Self {
         let gid_dir = project_root.join(".gid");
         let graph_yml = gid_dir.join("graph.yml");
         let graph_db = gid_dir.join("graph.db");
@@ -65,7 +72,7 @@ impl ProjectState {
         let has_graph = has_graph_db || has_graph_yml;
 
         // Check for requirements files: .gid/requirements-*.md or REQUIREMENTS.md
-        let has_requirements = project_root.join("REQUIREMENTS.md").exists()
+        let has_requirements_file = project_root.join("REQUIREMENTS.md").exists()
             || gid_dir.is_dir() && std::fs::read_dir(&gid_dir)
                 .map(|entries| entries
                     .filter_map(|e| e.ok())
@@ -74,6 +81,19 @@ impl ProjectState {
                         name.starts_with("requirements-") && name.ends_with(".md")
                     }))
                 .unwrap_or(false);
+
+        // ISS-057: in issue-mode, the issue.md body IS the requirements artifact.
+        // Detecting it here prevents the state machine from routing to
+        // `WritingRequirements` (which would re-author the issue body
+        // instead of implementing it) and the resulting self-review deadlock.
+        let has_issue_artifact = match work_unit {
+            Some(WorkUnit::Issue { id, .. }) => {
+                gid_dir.join("issues").join(id).join("issue.md").exists()
+            }
+            _ => false,
+        };
+
+        let has_requirements = has_requirements_file || has_issue_artifact;
 
         let has_source_code = project_root.join("src").is_dir()
             || project_root.join("lib").is_dir()
@@ -102,8 +122,17 @@ impl ProjectState {
 }
 
 /// Compose a ritual definition dynamically based on project state and task description.
-pub fn compose_ritual(project_root: &Path, task: &str) -> RitualDefinition {
-    let state = ProjectState::detect(project_root);
+///
+/// `work_unit` (ISS-057): when provided, gives the composer awareness of the
+/// caller's intent (issue / feature / task). This affects requirements
+/// detection (issue.md counts as requirements in issue-mode) and prevents
+/// the WritingRequirements / self-review deadlock for incremental work.
+pub fn compose_ritual(
+    project_root: &Path,
+    task: &str,
+    work_unit: Option<&WorkUnit>,
+) -> RitualDefinition {
+    let state = ProjectState::detect(project_root, work_unit);
 
     info!(
         has_design = state.has_design,
@@ -331,7 +360,7 @@ mod tests {
     #[test]
     fn test_compose_greenfield() {
         let tmp = TempDir::new().unwrap();
-        let ritual = compose_ritual(tmp.path(), "build a CLI tool");
+        let ritual = compose_ritual(tmp.path(), "build a CLI tool", None);
 
         // No DESIGN.md → draft-design
         assert_eq!(ritual.phases[0].id, "draft-design");
@@ -354,7 +383,7 @@ mod tests {
         fs::write(tmp.path().join(".gid/graph.yml"), "nodes:\n  - id: test\n    title: test\n    status: done\n    type: component").unwrap();
         fs::write(tmp.path().join("DESIGN.md"), "# Design\nSome design").unwrap();
 
-        let ritual = compose_ritual(tmp.path(), "add /tools command");
+        let ritual = compose_ritual(tmp.path(), "add /tools command", None);
 
         // DESIGN.md exists → update-design
         assert_eq!(ritual.phases[0].id, "update-design");
@@ -379,7 +408,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".gid")).unwrap();
         fs::write(tmp.path().join(".gid/graph.yml"), "nodes:\n  - id: x\n    title: x\n    status: done\n    type: file").unwrap();
 
-        let ritual = compose_ritual(tmp.path(), "fix a bug");
+        let ritual = compose_ritual(tmp.path(), "fix a bug", None);
 
         // No DESIGN → draft-design
         assert_eq!(ritual.phases[0].id, "draft-design");
@@ -392,11 +421,67 @@ mod tests {
     #[test]
     fn test_project_state_detect() {
         let tmp = TempDir::new().unwrap();
-        let state = ProjectState::detect(tmp.path());
+        let state = ProjectState::detect(tmp.path(), None);
         assert!(!state.has_gid_dir);
         assert!(!state.has_graph);
         assert!(!state.has_design);
         assert!(!state.has_source_code);
+    }
+
+    /// ISS-057 regression: when ritual targets an existing issue (issue-mode),
+    /// `.gid/issues/<ID>/issue.md` MUST be recognized as the requirements
+    /// artifact. Otherwise the state machine routes to `WritingRequirements`
+    /// and re-authors the issue body, leading to the self-review deadlock /
+    /// Escalation reported in ISS-057.
+    #[test]
+    fn issue_mode_treats_issue_md_as_requirements_iss057() {
+        let tmp = TempDir::new().unwrap();
+        let issue_dir = tmp.path().join(".gid/issues/ISS-057");
+        std::fs::create_dir_all(&issue_dir).unwrap();
+        std::fs::write(issue_dir.join("issue.md"), "# Some issue body").unwrap();
+
+        let work_unit = WorkUnit::Issue {
+            project: "gid-rs".to_string(),
+            id: "ISS-057".to_string(),
+        };
+
+        // Without work_unit: classic detection misses issue.md.
+        let state_blind = ProjectState::detect(tmp.path(), None);
+        assert!(
+            !state_blind.has_requirements,
+            "control: bare detect should still NOT see issue.md as requirements"
+        );
+
+        // With work_unit: detection sees issue.md → has_requirements=true,
+        // so the state machine will skip WritingRequirements.
+        let state = ProjectState::detect(tmp.path(), Some(&work_unit));
+        assert!(
+            state.has_requirements,
+            "issue-mode: .gid/issues/<id>/issue.md must satisfy has_requirements (ISS-057)"
+        );
+    }
+
+    /// ISS-057: feature-mode and task-mode WITHOUT a real requirements file
+    /// must NOT spuriously satisfy has_requirements just because some other
+    /// artifact directory exists. Only `WorkUnit::Issue` opts in.
+    #[test]
+    fn non_issue_mode_does_not_match_issue_md_iss057() {
+        let tmp = TempDir::new().unwrap();
+        // An unrelated issue.md exists, but we're running a Feature unit.
+        let issue_dir = tmp.path().join(".gid/issues/ISS-999");
+        std::fs::create_dir_all(&issue_dir).unwrap();
+        std::fs::write(issue_dir.join("issue.md"), "# unrelated").unwrap();
+
+        let feature_unit = WorkUnit::Feature {
+            project: "gid-rs".to_string(),
+            name: "some-feature".to_string(),
+        };
+
+        let state = ProjectState::detect(tmp.path(), Some(&feature_unit));
+        assert!(
+            !state.has_requirements,
+            "feature-mode must NOT inherit has_requirements from a stray issue.md (ISS-057)"
+        );
     }
 
     #[test]

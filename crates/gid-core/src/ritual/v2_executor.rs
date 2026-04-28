@@ -338,7 +338,7 @@ impl V2Executor {
         state: &RitualState,
     ) -> Option<RitualEvent> {
         match action {
-            RitualAction::DetectProject => Some(self.detect_project().await),
+            RitualAction::DetectProject => Some(self.detect_project(state).await),
             RitualAction::RunTriage { task } => Some(self.run_triage(task, state).await),
             RitualAction::RunSkill { name, context } => {
                 Some(self.run_skill(name, context, state).await)
@@ -443,10 +443,17 @@ impl V2Executor {
     // Event-producing actions
     // ═══════════════════════════════════════════════════════════════════════
 
-    async fn detect_project(&self) -> RitualEvent {
+    async fn detect_project(&self, state: &RitualState) -> RitualEvent {
         info!(project_root = %self.config.project_root.display(), "Detecting project state");
 
-        let cs = ComposerProjectState::detect(&self.config.project_root);
+        // ISS-057: pass the ritual's WorkUnit into project detection so
+        // issue-mode rituals recognize `.gid/issues/<id>/issue.md` as the
+        // requirements artifact and skip the spurious WritingRequirements
+        // phase that otherwise causes a self-review deadlock / Escalation.
+        let cs = ComposerProjectState::detect(
+            &self.config.project_root,
+            state.work_unit.as_ref(),
+        );
 
         // Read verify command from .gid/config.yml if it exists
         let verify_command = self.read_verify_command();
@@ -1406,7 +1413,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         let config_path = self.config.project_root.join(".gid").join("config.yml");
         if !config_path.exists() {
             // Default based on project type
-            let composer_state = ComposerProjectState::detect(&self.config.project_root);
+            let composer_state = ComposerProjectState::detect(&self.config.project_root, None);
             return match composer_state.language {
                 Some(super::composer::ProjectLanguage::Rust) => {
                     Some("cargo build 2>&1 && cargo test 2>&1".to_string())
