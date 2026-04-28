@@ -319,4 +319,16 @@ The following ACs lack deterministic, automatable test specifications:
 
 ## Applied
 
-(None — awaiting human approval before apply phase.)
+All 11 findings applied to `.gid/issues/ISS-053/issue.md` on 2026-04-28.
+
+- **FINDING-1** (Critical, undefined types): Added `SlotMap`, `MetaSourceHint`, `RelationIndex` type aliases/enums in §4.4; added `Layout::relation_fields()` method to the Layout API block.
+- **FINDING-2** (Important, separator): Switched short-form to `:` separator (`engram:ISS-022`, `engram:feature/dim-extract`) in §3 D1, §4.1 parse doc, §6 ACs, §6 D2 test command. Aligns with existing `project_registry.rs` convention.
+- **FINDING-3** (Important, malformed YAML): Updated §4.2 `Metadata::parse` doc — malformed frontmatter returns `Err(MetadataError::MalformedFrontmatter { line, message })`; `gid artifact lint` downgrades to warning.
+- **FINDING-4** (Minor, seq overflow): Added "Sequence overflow" paragraph to §4.4.1 — `Err(LayoutError::SeqExhausted { pattern, max })`, no silent rollover.
+- **FINDING-5** (Important, relation_fields field): Added `relation_fields: Vec<String>` field to `Layout` struct in §4.4 with semantics docstring; overridable via `.gid/layout.yml`.
+- **FINDING-6** (Critical, DSL grammar): Added new sub-section §4.4.1 "Pattern DSL grammar" with EBNF, token semantics table, nesting rule (`{id:...}` may contain `{seq:NN}` + literals only), bidirectional example, escaping rules, match precedence.
+- **FINDING-7** (Minor, missing helpers): Added signatures for `Layout::resolve(&self, kind, slots) -> Result<RelativePath, LayoutError>` and `merge_list(existing, new) -> Vec<String>` (order-preserving union) at end of §4.4.
+- **FINDING-8** (Critical, name collision): Renamed `ArtifactRef` → `ArtifactId` throughout §4–§9 (struct, impl, fields, method params, ACs). §4.1 includes a callout note explaining the rename and pointing at the existing `ritual::definition::ArtifactRef`.
+- **FINDING-9** (Important, D2 test binding): Expanded §6 scalability test with fixture path (`tests/fixtures/iss053/postmortem-extension/`), exact `layout.yml` snippet, three verification assertions (list, refs grep, next_id from zero), and CI binding statement.
+- **FINDING-10** (Important, testable ACs): Added `**Test:**` sub-bullets to the four flagged ACs (round-trip, resolve, find_references_to, wrappers) — each specifies fixture path, exact command, expected output/JSON shape.
+- **FINDING-11** (Important, migration): Added §7 default Layout patterns (top-level `.gid/reviews/{name}.md` → `kind: review`; `.gid/{slug}/{any}.md` → `kind: note` fallback acknowledged), Phase 0 migration verification step (run `gid artifact list --json` against three corpora; miscategorization blocks rollout), and rollback path note (revert `layout.yml`; no data corruption since no files moved).

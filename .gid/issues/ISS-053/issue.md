@@ -19,7 +19,7 @@ related: ["ISS-051", "ISS-052", "ISS-029"]
 1. Constraints
 2. Reality on disk
 3. Decisions (D1–D5)
-4. Model (ArtifactRef / Metadata / Artifact / Layout / Relation / ArtifactStore)
+4. Model (ArtifactId / Metadata / Artifact / Layout / Relation / ArtifactStore)
 5. Wrappers (CLI / MCP / rustclaw)
 6. Acceptance criteria — including the binding D2 scalability test
 7. Migration & phasing
@@ -81,11 +81,11 @@ These are the points where v0–v2 went wrong. Each is decided here so v3 doesn'
 
 ### D1 — Authoritative ID is the file path, not a kind+local_id tuple
 
-`ArtifactRef = (project, relative_path)`. The path is the source of truth on disk anyway. `kind` is **derived** from the path via Layout (§4), used as a label/filter, never as part of the ID.
+`ArtifactId = (project, relative_path)`. The path is the source of truth on disk anyway. `kind` is **derived** from the path via Layout (§4), used as a label/filter, never as part of the ID.
 
 Rationale: arbitrary nesting (review-of-split-design-part-1) needs unbounded depth. Path has it natively. Tuple flattening was the v2 mistake.
 
-Short forms (`engram/ISS-022`, `engram/feature/dim-extract`) are sugar resolved by Layout. Authoritative form is always the path.
+Short forms (`engram:ISS-022`, `engram:feature/dim-extract`) are sugar resolved by Layout. The separator between project and artifact id is `:` — aligning with the existing `project_registry.rs` convention (e.g., `engram:ISS-022`) and the canonical label format. The artifact id portion preserves its native format (e.g., `ISS-022`, `feature/dim-extract`, `feature/dim-extract/review/design-r1`); only the leading project segment uses `:`. Authoritative form is always the path.
 
 ### D2 — Kind is a string, not an enum; Layout is data, not code
 
@@ -127,24 +127,27 @@ This was a non-issue I was overthinking in v2 §Risks.
 
 Five types. Each does one thing. None has hardcoded knowledge of "issue" vs "feature" vs anything else.
 
-### 4.1 ArtifactRef — identity (D1)
+### 4.1 ArtifactId — identity (D1)
+
+> **Note (rename):** Earlier drafts called this `ArtifactRef`. Renamed to `ArtifactId` to avoid collision with the existing `gid_core::ritual::definition::ArtifactRef` (different semantics — inter-phase artifact flow). See §10 for the collision discussion.
 
 ```rust
-pub struct ArtifactRef {
+pub struct ArtifactId {
     pub project: String,           // "engram"
     pub path: PathBuf,             // ".gid/issues/ISS-022/issue.md", relative to project root
 }
 
-impl ArtifactRef {
+impl ArtifactId {
     /// Canonical label: "<project>:<relative_path>"
     pub fn label(&self) -> String;
 
     /// Parse a reference. Accepts:
     ///   - canonical:  "engram:.gid/issues/ISS-022/issue.md"
-    ///   - short:      "engram/ISS-022"        (Layout resolves to path)
-    ///   - short:      "engram/feature/dim-extract"
-    ///   - short:      "engram/feature/dim-extract/review/design-r1"
-    /// Short forms require a Layout to resolve.
+    ///   - short:      "engram:ISS-022"        (Layout resolves to path)
+    ///   - short:      "engram:feature/dim-extract"
+    ///   - short:      "engram:feature/dim-extract/review/design-r1"
+    /// The `:` separator between project and id aligns with the existing
+    /// `project_registry.rs` convention. Short forms require a Layout to resolve.
     pub fn parse(s: &str, layout: &Layout) -> Result<Self>;
 
     /// Bare local form (no project), resolved against a contextual project.
@@ -178,6 +181,16 @@ pub enum MetaValue {
 impl Metadata {
     /// Parse from file contents. Tries YAML → markdown headers → None.
     /// Never errors on unknown formats; returns MetaSource::None.
+    ///
+    /// **Malformed YAML:** if the file begins with `---` frontmatter delimiters
+    /// but the content between them fails to parse as YAML, returns
+    /// `Err(MetadataError::MalformedFrontmatter { line, message })` rather than
+    /// silently falling through to the markdown-headers parser. Falling through
+    /// would mask typos (e.g., `stauts: open` becoming `MetaSource::None`).
+    /// Callers may downgrade this error to a warning + treat the file as having
+    /// no frontmatter at their discretion. Specifically, `gid artifact lint`
+    /// reports `MalformedFrontmatter` as a **warning, not an error**, so a single
+    /// bad file does not block bulk operations like `gid artifact list`.
     pub fn parse(file_contents: &str) -> (Self, /* body */ String);
 
     /// Replace one field's value, rewriting only the affected line(s).
@@ -196,8 +209,8 @@ Surgical field edits go through `set_field`. Whole-block reformatting requires e
 
 ```rust
 pub struct Artifact {
-    pub r#ref: ArtifactRef,
-    pub kind: String,                // derived via Layout from r#ref.path
+    pub id: ArtifactId,
+    pub kind: String,                // derived via Layout from id.path
     pub metadata: Metadata,
     pub body: String,                // markdown after metadata block
 }
@@ -211,6 +224,12 @@ pub struct Artifact {
 pub struct Layout {
     patterns: Vec<LayoutPattern>,
     fallback: FallbackRule,
+    /// Frontmatter fields whose values (string or list of strings) are
+    /// interpreted as `ArtifactId` references for relation discovery.
+    /// Default: ["related", "blocks", "blocked_by", "supersedes",
+    ///           "derives_from", "applies_to", "references"].
+    /// Overridable via `.gid/layout.yml`.
+    relation_fields: Vec<String>,
 }
 
 pub struct LayoutPattern {
@@ -237,6 +256,52 @@ pub struct FallbackRule {
     pub kind: String,                       // "note"
     pub metadata_format: MetaSourceHint,
 }
+
+// Newly defined supporting types (used by ArtifactStore and Layout):
+
+/// Slot name → captured value. Populated by Layout pattern matching
+/// (e.g., {"id" → "ISS-0042", "seq" → "0042", "slug" → "dim-extract"})
+/// and consumed by `Layout::resolve` for path rendering.
+pub type SlotMap = BTreeMap<String, String>;
+
+/// Hint to the renderer about which metadata format to write.
+/// Distinct from `MetaSource`: `MetaSource` records what was *parsed*;
+/// `MetaSourceHint` declares what should be *produced* on `create`.
+pub enum MetaSourceHint {
+    Frontmatter,        // emit YAML `---` block
+    KeyValue,           // emit `**Field**: value` markdown headers
+    None,               // no metadata block
+}
+
+/// Incoming-relation index, built lazily from artifact contents.
+/// Keyed by the *target* of each relation, so `relations_to(target)` is O(1).
+/// Forward direction (`relations_from`) is computed on demand from the
+/// artifact file itself; no separate forward index is cached.
+pub type RelationIndex = BTreeMap<ArtifactId, Vec<Relation>>;
+```
+
+Layout API methods:
+
+```rust
+impl Layout {
+    /// Frontmatter field names treated as relation references.
+    /// Returns the configured `relation_fields` slice.
+    pub fn relation_fields(&self) -> &[String];
+
+    /// Render a concrete relative path from a kind + slot values.
+    /// Inverse of pattern matching: given `kind="issue"` and
+    /// `slots = {"id" → "ISS-0042", "seq" → "0042"}`, returns
+    /// `".gid/issues/ISS-0042/issue.md"`.
+    /// Errors if required slots are missing or a `{seq:NN}` would overflow.
+    pub fn resolve(&self, kind: &Kind, slots: &SlotMap) -> Result<RelativePath, LayoutError>;
+}
+
+/// Order-preserving union of two string lists. Used by `Metadata::set_field`
+/// when the field is a list-typed relation field, and by
+/// `gid artifact relate` to merge a new target into an existing list:
+///   merge_list(["A", "B"], ["B", "C"]) == ["A", "B", "C"]
+/// Duplicates from either side are dropped; first occurrence wins.
+pub fn merge_list(existing: &[String], new: &[String]) -> Vec<String>;
 ```
 
 #### Default layout (built into gid-core via `include_str!`)
@@ -251,12 +316,56 @@ Edit `.gid/layout.yml`, add a pattern. No code change. **This is the test for D2
 
 `{seq:NN}` — zero-padded integer, scope per `seq_scope`. `{slug}` — kebab-case identifier. `{name}` — free-form basename. `{parent_id}` — captured parent path segment. `{any}` — catch-all. **No user-defined placeholders in v1.** Future kinds needing `{year}-{seq}` etc. extend this list — that *is* a gid-core change, but adding placeholders is rare and additive (doesn't break existing layouts). Documented in Risks (§9).
 
+#### 4.4.1 Pattern DSL grammar
+
+Patterns are bidirectional: the **same** pattern string is used both for matching paths (deriving `kind` + slot captures from a path on disk) and for rendering paths (`Layout::resolve` produces a path from `kind` + `SlotMap`). A formal grammar is required so matcher and renderer agree on edge cases.
+
+```ebnf
+pattern     ::= segment ('/' segment)*
+segment     ::= (literal | placeholder)+
+placeholder ::= '{' name (':' constraint)? '}'
+constraint  ::= literal_text | seq_spec | id_template
+seq_spec    ::= 'seq:' DIGITS                        (* e.g., seq:04 *)
+id_template ::= (literal_text | '{' 'seq:' DIGITS '}')+   (* e.g., ISS-{seq:04} *)
+name        ::= [a-z_][a-z0-9_]*
+literal      ::= [^{}/]+
+literal_text ::= [^{}/]+
+```
+
+**Token semantics (within one path segment, i.e., between `/`):**
+
+| Token             | Matches                              | Generates                             |
+|-------------------|--------------------------------------|---------------------------------------|
+| `{slug}`          | `[a-z0-9_-]+`                        | caller-supplied via `SlotMap`         |
+| `{name}`          | `[^/]+` (free-form basename)         | caller-supplied                       |
+| `{parent_id}`     | `[^/]+` (captures parent dir name)   | caller-supplied                       |
+| `{any}`           | `[^/]+` (single segment, catch-all)  | caller-supplied                       |
+| `{seq:NN}`        | `\d{NN,}` (≥ NN digits, zero-padded) | next sequence integer, zero-padded NN |
+| `{id:TEMPLATE}`   | a structured ID matching TEMPLATE    | renders TEMPLATE with its slots       |
+
+**Nesting rule:** `{id:...}` may contain `{seq:NN}` and literal text only. No other slot types nest. Example: `{id:ISS-{seq:04}}` is legal; `{id:{slug}-{seq:04}}` is not.
+
+**Example (bidirectional):**
+
+Pattern: `issues/{id:ISS-{seq:04}}/issue.md`
+
+| Direction | Input                           | Output                                     |
+|-----------|---------------------------------|--------------------------------------------|
+| Match     | `issues/ISS-0042/issue.md`      | `slots = {id: "ISS-0042", seq: "0042"}`    |
+| Render    | `slots = {seq: "0042"}` (or auto-allocated) | `issues/ISS-0042/issue.md`     |
+
+**Escaping:** Literal `{` and `}` cannot appear in patterns (no escape mechanism in v1). `.` is treated as a literal character (not regex-special). Path separators are always `/`.
+
+**Sequence overflow:** If `ArtifactStore::create` (or `next_id` / `next_path`) would allocate a `{seq:NN}` value that exceeds `10^NN - 1` (e.g., `seq:04` past `9999`), it returns `Err(LayoutError::SeqExhausted { pattern, max })`. Callers must widen the layout (e.g., bump `seq:03` → `seq:04`) before creating new artifacts. **No silent rollover** — a 5-digit ID under a `seq:04` pattern would break sort order assumptions and round-trip matching.
+
+**Match precedence:** Patterns are tried in declaration order; first match wins. The fallback rule is consulted only if no pattern matches.
+
 ### 4.5 Relation — derived from artifact contents (D3)
 
 ```rust
 pub struct Relation {
-    pub from: ArtifactRef,
-    pub to: ArtifactRef,
+    pub from: ArtifactId,
+    pub to: ArtifactId,
     pub kind: String,                       // "related", "blocks", "supersedes", "reviews", ...
     pub source: RelationSource,             // where we learned it
 }
@@ -270,9 +379,9 @@ pub enum RelationSource {
 
 #### Relation discovery rules (precise)
 
-1. **Frontmatter fields** matching `Layout::relation_fields()` (default: `related`, `blocks`, `blocked_by`, `supersedes`, `derives_from`, `applies_to`, `references`). Each value is parsed as an ArtifactRef.
+1. **Frontmatter fields** matching `Layout::relation_fields()` (default: `related`, `blocks`, `blocked_by`, `supersedes`, `derives_from`, `applies_to`, `references`). Each value is parsed as an ArtifactId.
 2. **Markdown links** of the form `[anything](relative_or_absolute_path_to_a_.md_under_.gid/)`. URL fragments and external URLs ignored.
-3. **Inline backtick refs** matching `` `<project>/...` `` or `` `<short_form>` `` parseable by `ArtifactRef::parse`.
+3. **Inline backtick refs** matching `` `<project>/...` `` or `` `<short_form>` `` parseable by `ArtifactId::parse`.
 4. **Directory nesting**: any artifact under `<X>/reviews/Y.md` emits `Relation { from: Y, to: X, kind: "reviews", source: DirectoryNesting }`.
 
 #### "Manual relate" = edit source artifact (D3)
@@ -294,24 +403,24 @@ impl ArtifactStore {
 
     // Read.
     pub fn list(&self, kind_filter: Option<&str>) -> Result<Vec<Artifact>>;
-    pub fn get(&self, r#ref: &ArtifactRef) -> Result<Option<Artifact>>;
+    pub fn get(&self, id: &ArtifactId) -> Result<Option<Artifact>>;
 
     // Allocate.
-    pub fn next_id(&self, kind: &str, parent: Option<&ArtifactRef>) -> Result<String>;
-    pub fn next_path(&self, kind: &str, parent: Option<&ArtifactRef>, slot_overrides: &SlotMap) -> Result<PathBuf>;
+    pub fn next_id(&self, kind: &str, parent: Option<&ArtifactId>) -> Result<String>;
+    pub fn next_path(&self, kind: &str, parent: Option<&ArtifactId>, slot_overrides: &SlotMap) -> Result<PathBuf>;
 
     // Write (all are file writes; D3 means relate also writes a file).
     pub fn create(&self, path: &Path, metadata: Metadata, body: &str) -> Result<Artifact>;
     pub fn update(&self, artifact: &Artifact) -> Result<()>;
 
     // Relations (read-only; "manual relate" goes through update of source artifact).
-    pub fn relations_from(&self, r#ref: &ArtifactRef) -> Result<Vec<Relation>>;
-    pub fn relations_to(&self, r#ref: &ArtifactRef) -> Result<Vec<Relation>>;
+    pub fn relations_from(&self, id: &ArtifactId) -> Result<Vec<Relation>>;
+    pub fn relations_to(&self, id: &ArtifactId) -> Result<Vec<Relation>>;
 }
 
 // Cross-project resolver via ProjectRegistry (D5).
-pub fn resolve(r#ref: &ArtifactRef) -> Result<Artifact>;
-pub fn find_references_to(target: &ArtifactRef) -> Result<Vec<Relation>>;
+pub fn resolve(id: &ArtifactId) -> Result<Artifact>;
+pub fn find_references_to(target: &ArtifactId) -> Result<Vec<Relation>>;
 ```
 
 Every operation is **kind-agnostic at the type level**. Behavior differences live in `Layout`.
@@ -365,19 +474,27 @@ Same six tools, registered as native function-call tools, identical surface to M
 
 ### Type / API
 
-- [ ] `gid_core::{Artifact, ArtifactRef, Metadata, MetaSource, MetaValue, Layout, LayoutPattern, Relation, RelationSource, ArtifactStore, resolve, find_references_to}` all exist and are public.
+- [ ] `gid_core::{Artifact, ArtifactId, Metadata, MetaSource, MetaValue, Layout, LayoutPattern, Relation, RelationSource, ArtifactStore, resolve, find_references_to}` all exist and are public.
 - [ ] Default `Layout` ships built-in (via `include_str!`); `.gid/layout.yml` override is optional.
-- [ ] `ArtifactRef::parse` accepts canonical, short (kind/id), short (kind/slug), and nested-short forms.
+- [ ] `ArtifactId::parse` accepts canonical, short (kind/id), short (kind/slug), and nested-short forms.
 
 ### Functional
 
 - [ ] `Metadata::parse` round-trips: read -> no-op `set_field` for an existing key with the same value -> render -> byte-identical to original.
+  - **Test:** Fixture `tests/fixtures/iss053/roundtrip-corpus/` containing files copied verbatim from `engram/.gid/`, `gid-rs/.gid/`, and `rustclaw/.gid/` (issue.md, design.md, requirements.md, review files, ad-hoc files). For each fixture file `F`: `let (m, body) = Metadata::parse(read(F)); m.set_field(first_key, m.fields[first_key].clone()); assert_eq!(read(F), m.render() + body)`. Expected: byte-identical for 100% of fixture files. CI fails on any non-match with a unified diff.
 - [ ] `Metadata::set_field` for a new key inserts in original `MetaSource` style.
 - [ ] `ArtifactStore::next_id` returns project-scoped ISS-{seq} for issues, parent-scoped r-{seq} for reviews; errors clearly for slug kinds without caller-supplied slot.
 - [ ] `ArtifactStore::create` is mkdir-atomic and refuses overwrites.
 - [ ] Two stores for different projects can both have `ISS-050` without conflict (regression test for the original collision).
-- [ ] `resolve("engram/ISS-022")` works regardless of cwd, via ProjectRegistry.
+- [ ] `resolve("engram:ISS-022")` works regardless of cwd, via ProjectRegistry.
+  - **Test:** Fixture `tests/fixtures/iss053/projects.yml` registering `engram` → `tests/fixtures/iss053/engram-root/` (which contains `.gid/issues/ISS-022/issue.md`). Set env var `GID_PROJECTS_YML=tests/fixtures/iss053/projects.yml` to mock `~/.config/gid/projects.yml`. Run from cwd `/tmp` (outside any project): `resolve(&ArtifactId::parse("engram:ISS-022", &layout)?)`. Expected: `Ok(Artifact { kind: "issue", id: ArtifactId { project: "engram", path: ".gid/issues/ISS-022/issue.md" }, ... })`.
 - [ ] `find_references_to` discovers all four `RelationSource` types per the rules in §4.5.
+  - **Test:** Fixture `tests/fixtures/iss053/relations/` with one file per `RelationSource` type, all pointing at the same target `ISS-002`:
+    - `frontmatter.md` — frontmatter `related: [ISS-002]` → expects `RelationSource::Frontmatter { field: "related" }`.
+    - `markdown-link.md` — body contains `[see](.gid/issues/ISS-002/issue.md)` → expects `RelationSource::MarkdownLink`.
+    - `backtick.md` — body contains `` `engram:ISS-002` `` → expects `RelationSource::MarkdownLink` (via inline-backtick rule §4.5.3).
+    - `reviews/of-ISS-002.md` (placed under a parent dir for `ISS-002`) → expects `RelationSource::DirectoryNesting`.
+    Run `find_references_to(ISS-002)`. Expected: 4 relations returned, one per source type. Test asserts the set of `source` discriminants equals `{Frontmatter, MarkdownLink, DirectoryNesting}` (markdown-link and backtick share the `MarkdownLink` discriminant; assert at least one of each was discovered by inspecting which fixture file was the `from`).
 - [ ] `gid artifact relate A blocks B` modifies A's frontmatter; subsequent `find_references_to(B)` returns the new edge; no `relations.yml`/`.db` is created.
 
 ### Scalability test (D2 — the binding test)
@@ -387,15 +504,41 @@ Same six tools, registered as native function-call tools, identical surface to M
   gid artifact new --kind postmortem --title "..."
   gid artifact list --kind postmortem
   gid artifact show <ref>
-  gid artifact relate <pm-ref> applies-to engram/ISS-022
+  gid artifact relate <pm-ref> applies-to engram:ISS-022
   ```
   All succeed. **gid-core is unmodified.** This test failing means the design failed.
+
+  **Test fixture:** `tests/fixtures/iss053/postmortem-extension/` containing a custom `.gid/layout.yml` that adds the `postmortem` kind:
+
+  ```yaml
+  # .gid/layout.yml addition:
+  patterns:
+    - pattern: "postmortems/{id:PM-{seq:03}}/postmortem.md"
+      kind: postmortem
+      metadata_format: frontmatter
+      id_template: "PM-{seq:03}"
+      seq_scope: project
+  ```
+
+  **Verification (after the four commands above):**
+  - `gid artifact list --kind postmortem` returns at least one row.
+  - `gid artifact refs engram:ISS-022 | grep postmortem` returns at least one row (proves the `applies-to` relation was persisted in the postmortem's frontmatter and is discoverable via reverse lookup).
+  - `next_id` for the postmortem kind starts at `PM-001` (sequence allocation works for a kind with zero pre-existing artifacts).
+
+  **CI binding:** This test runs in CI against an unmodified `gid-core` checkout — only `layout.yml` changes between the baseline and the test run. No Rust code changes, no recompile of `gid-core`. If the test passes only with code changes, the design has failed.
 
 ### Wrappers
 
 - [ ] CLI commands (§5.1) implemented; sugar aliases optional.
+  - **Test:** Given fixture `tests/fixtures/iss053/cli-smoke/` (a project root with `.gid/issues/ISS-001/issue.md`), run `gid artifact list --kind issue --project cli-smoke --json`. Expected stdout (JSON):
+    ```json
+    [{"project":"cli-smoke","path":".gid/issues/ISS-001/issue.md","kind":"issue","title":"..."}]
+    ```
+    Exit code 0. Run `gid artifact show cli-smoke:ISS-001 --json` and assert `.kind == "issue"` and `.id.path == ".gid/issues/ISS-001/issue.md"`.
 - [ ] MCP tools (§5.2) implemented.
+  - **Test:** MCP server fixture invokes `gid_artifact_list { "kind": "issue", "project": "cli-smoke" }`. Expected response shape: `{"content":[{"type":"text","text":"<JSON array matching CLI output above>"}]}`. One assertion per tool (6 tools total).
 - [ ] rustclaw tools (§5.3) implemented.
+  - **Test:** rustclaw native tool registry exposes `gid_artifact_list`, `gid_artifact_show`, `gid_artifact_new`, `gid_artifact_update`, `gid_artifact_relate`, `gid_artifact_refs`. For each, invoke with the same fixture and assert the JSON return value matches the MCP response (content-equal, modulo transport wrapping).
 
 ### Documentation
 
@@ -409,7 +552,38 @@ Same six tools, registered as native function-call tools, identical surface to M
 - **No file moves, no renames.** Existing `.gid/` layout becomes the default Layout. On-disk files unchanged.
 - **No graph schema changes.** Issues/features that already exist as graph nodes (post-ISS-028 backfill) remain; this issue does not touch the graph layer.
 - **Optional `gid artifact lint`**: surfaces bare `ISS-NNN` / unqualified slugs in markdown bodies; suggests project-prefixing. Lint only — never auto-rewrites human prose.
-- **Phasing** (single PR is too big):
+
+### Default Layout patterns (additions for ground-truth coverage)
+
+In addition to the patterns implied by §2 (issues/, features/, their reviews/), the default Layout ships with:
+
+- `.gid/reviews/{name}.md` → `kind: review` — covers **top-level** reviews (e.g., `gid-rs/.gid/reviews/frictionless-graph-design-r3-review.md`, ~18 such files in `gid-rs` alone). These would otherwise fall to the fallback rule.
+- `.gid/{slug}/{any}.md` → `kind: note` — explicit fallback for ad-hoc design subdirs like `.gid/sqlite-migration/`, `.gid/incremental-extract/`. Acknowledged: docs in these dirs become `kind: note`, not `kind: design`. Acceptable in v1 because (a) these are uncommon, (b) projects can override via `.gid/layout.yml`, (c) the alternative (auto-detect by filename `DESIGN.md` etc.) is heuristic and brittle.
+
+### Migration verification (Phase 0 — blocks rollout)
+
+Before any of the phases below, run:
+
+```
+gid artifact list --json
+```
+
+against the `engram`, `gid-rs`, and `rustclaw` `.gid/` corpora. Verify:
+
+- Zero artifacts that should be `kind: review` fall to `kind: note`.
+- Zero artifacts that should be `kind: design` fall to `kind: note`.
+- Zero artifacts that should be `kind: issue` / `kind: feature` / `kind: requirements` fall to `kind: note`.
+
+Any miscategorization **blocks rollout** until the default Layout patterns are extended to cover the missing cases.
+
+### Rollback path
+
+Rollback: revert the `.gid/layout.yml` change (or, for the built-in defaults, revert the gid-core release that introduced them). Since this issue's constraint is **no files moved or renamed**, reverting `layout.yml` is sufficient — the on-disk artifact files are untouched. `ArtifactStore` is read-only at this stage (writes are limited to `create` / `update` / `relate`, which only ever touch artifact files, never a relations DB). No data corruption is possible from rolling back the layout config.
+
+### Phasing
+
+Single PR is too big. Phases:
+
   1. gid-core types + Layout + Metadata + ArtifactStore (pure, with unit tests).
   2. CLI `gid artifact …` commands.
   3. MCP tools.
@@ -433,7 +607,7 @@ Phase (1) is the only blocker for the others; (2)–(7) can be parallelized afte
 
 - **Default Layout must cover all current files**, or existing artifacts become invisible (caught by `fallback: kind = note`) and lose kind-specific behavior. Mitigation: derive defaults empirically from engram + gid-rs + rustclaw `.gid/` corpora; ship as fixtures-tested defaults.
 - **Tolerant Metadata parser hides typos.** Misspelled frontmatter keys silently become unread fields. Mitigation: `gid artifact lint` flags fields not in the kind's known set; warn, never reject (rejection violates constraint #1).
-- **Markdown-link relation discovery is heuristic.** False positives are worse than false negatives (a fake edge confuses graph reasoning more than a missed one). Mitigation: only match `[](...)` and backticked refs that successfully `ArtifactRef::parse`; document the regex precisely.
+- **Markdown-link relation discovery is heuristic.** False positives are worse than false negatives (a fake edge confuses graph reasoning more than a missed one). Mitigation: only match `[](...)` and backticked refs that successfully `ArtifactId::parse`; document the regex precisely.
 - **String-typed `kind` admits typos.** `kid: "isue"` quietly creates a new kind. Mitigation: layout's known kinds form a soft set; lint warns on out-of-set kinds. Never errors (would violate D2).
 - **Placeholder vocabulary is closed in v1.** A future kind needing `{year}-{seq}` requires extending the placeholder parser in gid-core. This *is* a gid-core change — a deliberate concession. Acceptable because (a) additions are rare, (b) they're additive (don't break existing layouts), (c) a user-pluggable placeholder DSL is out of proportion to the problem. Trade-off documented; revisit if pressure mounts.
 - **Multi-branch ID race.** Two git branches both allocate `ISS-053`. On merge, both directories exist. Out of scope here; addressed by branch-aware allocation in a future issue. Workaround: rebase + rename, same as any branch conflict.
