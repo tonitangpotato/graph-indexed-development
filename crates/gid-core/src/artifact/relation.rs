@@ -423,6 +423,7 @@ mod tests {
     fn mk_artifact(path: &str, body: &str) -> Artifact {
         Artifact {
             id: ArtifactId::new(path).unwrap(),
+            kind: "issue".into(),
             metadata: Metadata::new(MetaSourceHint::None),
             body: body.to_string(),
         }
@@ -431,6 +432,7 @@ mod tests {
     fn mk_artifact_with_meta(path: &str, meta: Metadata, body: &str) -> Artifact {
         Artifact {
             id: ArtifactId::new(path).unwrap(),
+            kind: "issue".into(),
             metadata: meta,
             body: body.to_string(),
         }
