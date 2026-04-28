@@ -750,3 +750,32 @@ Commits: rustclaw `src/tools.rs` (~600 LOC added incl. tests + helpers).
 
 Phases remaining: G (default layout corpus verification), H (documentation).
 ISS-052 (rustclaw artifact↔graph sync) is now unblocked.
+
+### 2026-04-28 — Phase G (corpus verification) ROLLOUT BLOCKED
+
+Ran `gid artifact list --project <name> --json` against engram, gid-rs,
+rustclaw `.gid/` corpora (356 artifacts total). Result:
+
+- engram: 17 notes, 14 miscategorized (rollout-blocking)
+- gid-rs: 4 notes, 0 miscategorized (passes)
+- rustclaw: 10 notes, 8 miscategorized (rollout-blocking)
+
+Four gaps in default Layout identified:
+
+1. **Nested feature subfolders** — `features/{slug}/{subslug}/...` (engram knowledge-compiler meta-feature, 12 files)
+2. **Top-level `features/{name}.md`** — legacy designs without slug dir (rustclaw, 5 files)
+3. **`docs/{subdir}/{name}.md`** — `docs/reviews/`, `docs/discussion/` (engram + rustclaw, 5 files)
+4. **`issues/{id}/{subdir}/...`** — wip dirs under issues (engram, 1 file)
+
+Per §7 "Migration verification (Phase 0)": "Any miscategorization
+**blocks rollout** until the default Layout patterns are extended to cover
+the missing cases." Therefore:
+
+- §6 Acceptance NOT met until Layout is extended.
+- Phase G2 needed: add 4 patterns to `default_patterns()` in
+  `crates/gid-core/src/artifact/layout.rs`, plus regression test against
+  the 3-corpus snapshot.
+- Phase H (documentation) MAY proceed in parallel; doc surface is unchanged,
+  only the kind table grows by one row per pattern.
+
+Full report: `.gid/issues/ISS-053/phase-g/verification-2026-04-28.md`.
