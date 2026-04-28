@@ -21,6 +21,7 @@ pub mod id;
 pub mod layout;
 pub mod metadata;
 pub mod relation;
+pub mod store;
 
 pub use artifact::{Artifact, ArtifactError};
 pub use id::{ArtifactId, ArtifactIdError};
@@ -29,3 +30,4 @@ pub use layout::{
 };
 pub use metadata::{FieldValue, MetaSourceHint, Metadata, MetadataError};
 pub use relation::{discover, Relation, RelationError, RelationSource};
+pub use store::{ArtifactStore, RelationIndex, StoreError};
