@@ -219,10 +219,52 @@ pub struct RitualState {
     /// `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_degraded: Option<PersistDegradedInfo>,
+
+    // ───────────────────────────────────────────────────────────────────
+    // ISS-029 — liveness signal (phase age + heartbeat).
+    //
+    // `phase_entered_at` is set on every phase transition (in `with_phase`).
+    // Distinct from `updated_at`, which can refresh for non-transition
+    // reasons (persistence rewrites, metadata stamps).
+    //
+    // `last_heartbeat` is updated by long-running phases (Implementing /
+    // Reviewing / Verifying) at a fixed cadence. A stale heartbeat
+    // (>60s old per current threshold) is the wedged-adapter signal.
+    //
+    // Both fields use `#[serde(default = "default_liveness_ts")]` so legacy
+    // ritual JSON (written before ISS-029) round-trips: missing fields fall
+    // back to `Utc::now()` at load time. The reader-side `health()` helper
+    // (Task 2a step 3) interprets a freshly-loaded legacy ritual as
+    // `Healthy` for the first 60s — acceptable, since the alternative
+    // (defaulting to epoch) would mark every legacy ritual `Wedged` on
+    // first read after upgrade.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// ISS-029 GOAL-1 — timestamp the current `phase` was entered.
+    /// Updated on every `with_phase(...)` call (the single transition
+    /// entry point). Never written outside `with_phase` / `new`.
+    #[serde(default = "default_liveness_ts")]
+    pub phase_entered_at: DateTime<Utc>,
+
+    /// ISS-029 GOAL-2 — last heartbeat from a live phase action.
+    /// Long-running phases (Implementing / Reviewing / Verifying) update
+    /// this on a periodic tick (Task 2b). Phase transitions also bump it
+    /// to ensure freshness immediately after a phase change.
+    #[serde(default = "default_liveness_ts")]
+    pub last_heartbeat: DateTime<Utc>,
 }
 
 fn default_ritual_id() -> String {
     generate_ritual_id()
+}
+
+/// Default for ISS-029 liveness fields when a legacy state file (written
+/// before these fields existed) is deserialized. We pick `Utc::now()`
+/// rather than epoch so legacy rituals don't immediately read as
+/// `Wedged` — they get a one-time grace period equal to the heartbeat
+/// staleness threshold (~60s), after which normal liveness rules apply.
+fn default_liveness_ts() -> DateTime<Utc> {
+    Utc::now()
 }
 
 /// Generate a short human-readable ritual ID (e.g., "r-a3f81b").
@@ -325,15 +367,21 @@ impl RitualState {
             adapter_pid: None,
             status: RitualV2Status::Active,
             persist_degraded: None,
+            // ISS-029: liveness fields seeded to `now` — first transition
+            // via `with_phase` will overwrite, but `new()` already in Idle
+            // counts as the initial phase entry.
+            phase_entered_at: now,
+            last_heartbeat: now,
         }
     }
 
     pub fn with_phase(mut self, phase: RitualPhase) -> Self {
+        let now = Utc::now();
         self.transitions.push(TransitionRecord {
             from: self.phase.clone(),
             to: phase.clone(),
             event: format!("{:?} → {:?}", self.phase, phase),
-            timestamp: Utc::now(),
+            timestamp: now,
         });
         // Maintain `status` invariant: terminal phases set the matching
         // terminal status; non-terminal phases imply `Active` (handles the
@@ -344,7 +392,11 @@ impl RitualState {
             .terminal_status()
             .unwrap_or(RitualV2Status::Active);
         self.phase = phase;
-        self.updated_at = Utc::now();
+        self.updated_at = now;
+        // ISS-029 GOAL-1 — single transition entry point updates phase age
+        // and bumps heartbeat (a transition is itself a liveness signal).
+        self.phase_entered_at = now;
+        self.last_heartbeat = now;
         self
     }
 
@@ -2789,6 +2841,120 @@ mod tests {
         let s2: RitualState = serde_json::from_str(&json).unwrap();
         assert_eq!(s2.status, RitualV2Status::Done);
         assert_eq!(s2.phase, RitualPhase::Done);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ISS-029 — phase_entered_at + last_heartbeat serde compat
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iss029_legacy_state_file_roundtrip() {
+        // A real ritual JSON written BEFORE ISS-029 (no `phase_entered_at`,
+        // no `last_heartbeat`) must:
+        //   1. Deserialize without error
+        //   2. Backfill both fields with `Utc::now()` defaults (the
+        //      contract from `default_liveness_ts`)
+        //   3. Re-serialize and re-deserialize cleanly (full round-trip)
+        //   4. Preserve all non-liveness fields exactly
+        //
+        // This pins backwards compat for rituals already on disk on this
+        // Mac (e.g. .gid/runtime/rituals/r-04f359.json) when the daemon
+        // is upgraded to a binary carrying the new fields.
+        let legacy_json = serde_json::json!({
+            "id": "r-04f359",
+            "phase": "Implementing",
+            "task": "Ship ISS-043 fix",
+            "project": null,
+            "strategy": null,
+            "verify_retries": 0,
+            "phase_retries": {},
+            "failed_phase": null,
+            "error_context": null,
+            "review_target": null,
+            "triage_size": "medium",
+            "phase_tokens": {"implement": 18884},
+            "transitions": [],
+            "started_at": "2026-04-26T19:27:12Z",
+            "updated_at": "2026-04-26T19:34:35Z",
+        });
+
+        let before = Utc::now();
+        let s: RitualState = serde_json::from_value(legacy_json).unwrap();
+        let after = Utc::now();
+
+        // Non-liveness fields preserved exactly
+        assert_eq!(s.id, "r-04f359");
+        assert_eq!(s.phase, RitualPhase::Implementing);
+        assert_eq!(s.task, "Ship ISS-043 fix");
+        assert_eq!(s.triage_size.as_deref(), Some("medium"));
+        assert_eq!(s.phase_tokens.get("implement"), Some(&18884));
+        assert_eq!(s.status, RitualV2Status::Active); // ISS-052 backfill
+
+        // Liveness fields backfilled to ~now (between `before` and `after`).
+        assert!(
+            s.phase_entered_at >= before && s.phase_entered_at <= after,
+            "phase_entered_at default should be ~Utc::now(), got {}",
+            s.phase_entered_at
+        );
+        assert!(
+            s.last_heartbeat >= before && s.last_heartbeat <= after,
+            "last_heartbeat default should be ~Utc::now(), got {}",
+            s.last_heartbeat
+        );
+
+        // Full round-trip: serialize → deserialize → field equality.
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: RitualState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.id, s.id);
+        assert_eq!(s2.phase, s.phase);
+        assert_eq!(s2.phase_entered_at, s.phase_entered_at);
+        assert_eq!(s2.last_heartbeat, s.last_heartbeat);
+    }
+
+    #[test]
+    fn test_iss029_with_phase_bumps_liveness_fields() {
+        // The single transition entry point (`with_phase`) must update
+        // both `phase_entered_at` (because the phase is new) and
+        // `last_heartbeat` (because a transition is itself a liveness
+        // signal). Without this, a freshly-transitioned ritual would
+        // immediately read as "stuck since the previous phase entry".
+        let s = idle_state();
+        let initial_phase_entry = s.phase_entered_at;
+
+        // Sleep a hair so the timestamp comparison is meaningful.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let s2 = s.with_phase(RitualPhase::Triaging);
+
+        assert_eq!(s2.phase, RitualPhase::Triaging);
+        assert!(
+            s2.phase_entered_at > initial_phase_entry,
+            "phase_entered_at must advance on transition"
+        );
+        assert!(
+            s2.last_heartbeat >= s2.phase_entered_at,
+            "last_heartbeat must be at-least as fresh as phase_entered_at after transition"
+        );
+        // updated_at and phase_entered_at should match exactly post-transition
+        // (single `now` per call).
+        assert_eq!(s2.phase_entered_at, s2.updated_at);
+    }
+
+    #[test]
+    fn test_iss029_fresh_state_serializes_with_liveness_fields() {
+        // Newly-constructed rituals must include the fields in JSON
+        // output (no `skip_serializing_if`) so downstream readers can
+        // rely on their presence in any state file written by this
+        // version of the binary.
+        let s = idle_state();
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(
+            json.get("phase_entered_at").is_some(),
+            "phase_entered_at must serialize"
+        );
+        assert!(
+            json.get("last_heartbeat").is_some(),
+            "last_heartbeat must serialize"
+        );
     }
 
     #[test]
