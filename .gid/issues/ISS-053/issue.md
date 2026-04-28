@@ -1,14 +1,15 @@
 ---
 id: "ISS-053"
 title: "gid-core has no model for project artifacts (issues, features, designs, reviews, ...)"
-status: open
+status: closed
 priority: P1
 created: 2026-04-26
+closed: 2026-04-28
 related: ["ISS-051", "ISS-052", "ISS-029"]
 ---
 # ISS-053 — Project artifacts are not first-class in gid-core
 
-**Status:** open
+**Status:** closed (2026-04-28, Phase H complete)
 **Severity:** medium
 **Discovered:** 2026-04-26 — agent grabbed `ISS-050` for gid-rs without knowing engram already owned `ISS-050`. potato observed the deeper pattern: `.gid/` already contains *several* artifact types (issue / feature / design / requirements / review / investigation / pivot-note / verify-report / handoff / …) — gid-core knows about *none* of them, so CLI / MCP / rustclaw can't expose operations on them.
 
@@ -617,10 +618,10 @@ Same six tools, registered as native function-call tools, identical surface to M
 
 ### Documentation
 
-- [ ] `<project>/<short>` reference convention documented.
-- [ ] Default layout documented (the patterns shipped in gid-core).
-- [ ] Placeholder vocabulary (§4.4) documented as closed v1 set.
-- [ ] Relation discovery rules (§4.5) documented precisely.
+- [x] `<project>/<short>` reference convention documented.
+- [x] Default layout documented (the patterns shipped in gid-core).
+- [x] Placeholder vocabulary (§4.4) documented as closed v1 set.
+- [x] Relation discovery rules (§4.5) documented precisely.
 
 ## 7. Migration
 
@@ -820,3 +821,31 @@ also now satisfied for the Layout side. Diff: `crates/gid-core/src/artifact/layo
 Full report: `.gid/issues/ISS-053/phase-g/verification-2026-04-28-post-g2.md`.
 
 Phases remaining: H (documentation). ISS-053 is one phase from close.
+
+### 2026-04-28 — Phase H (documentation) DONE — ISS-053 COMPLETE
+
+Wrote user-facing reference page `docs/ARTIFACT.md` (~350 LOC) covering
+all four §6 Documentation acceptance items in one document:
+
+1. **Artifact identity & references** — `ArtifactId` struct, the four
+   accepted reference forms (canonical / short ID / short slug / nested
+   short / bare local), why path-as-identity (D1).
+2. **Default Layout** — every one of the 18 patterns shipped in
+   `gid_core::artifact::layout::default_patterns()`, grouped by section
+   (issues / features / docs / top-level reviews / fallback), with the
+   match-precedence rationale and the post-G2 corpus coverage table.
+3. **Placeholder vocabulary** — the closed v1 token set
+   (`{slug}` `{name}` `{parent_id}` `{any}` `{seq:NN}` `{id:TEMPLATE}`),
+   the nesting rule for `{id:...}`, sequence scope semantics, render
+   precedence, escaping rules, and overflow behavior.
+4. **Relation discovery** — the four sources (frontmatter fields,
+   markdown links, inline backtick refs, directory nesting), the
+   default `relation_fields()` list, what is *not* a relation source
+   (filename similarity, mtime, bare token matching), and the lazy
+   `RelationIndex` behavior.
+
+Linked from `README.md` under "Related" so the page is discoverable
+without grep.
+
+§6 Documentation acceptance gate: PASS (all four items checked).
+ISS-053 fully closed.

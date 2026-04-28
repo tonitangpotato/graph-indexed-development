@@ -347,6 +347,7 @@ graph-indexed-development/
 
 - 📄 [GID Paper](https://zenodo.org/records/18425984) — Formal methodology (Zenodo)
 - 📐 [GID Methodology](https://github.com/tonitangpotato/graph-indexed-development-principle) — Specification and examples
+- 🗂️ [Artifact Layer](docs/ARTIFACT.md) — File-first model: identity, default Layout, placeholder vocabulary, relation discovery (ISS-053)
 
 ---
 
