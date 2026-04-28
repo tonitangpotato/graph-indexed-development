@@ -694,6 +694,19 @@ impl V2Executor {
             .await
         {
             Ok(result) => {
+                // ISS-056b: implement-skill STATUS gate evaluated up-front
+                // so we can apply it to whichever success-shaped event the
+                // remaining pipeline emits. We do NOT short-circuit here;
+                // SkillFailed paths (zero-files, forbidden-write, graph
+                // postvalidate, self-review reject, turn-limit) must still
+                // surface as SkillFailed — STATUS is only consulted when
+                // the run otherwise looks "successful".
+                let implement_status: Option<ImplementStatus> = if name == "implement" {
+                    Some(parse_implement_status(&result.output))
+                } else {
+                    None
+                };
+
                 // ISS-039: graph-phase post-validation. Re-load the graph,
                 // diff node IDs, validate against the dispatched mode.
                 // A violation here (collision with existing IDs, new nodes
@@ -779,7 +792,8 @@ impl V2Executor {
                         phase: name.to_string(),
                         artifacts,
                     };
-                    return self.maybe_run_self_review(name, state, completed).await;
+                    let event = self.maybe_run_self_review(name, state, completed).await;
+                    return apply_implement_status_gate(name, event, implement_status);
                 }
 
                 info!(skill = name, "Skill completed successfully");
@@ -791,7 +805,8 @@ impl V2Executor {
                         .map(|p| p.to_string_lossy().to_string())
                         .collect(),
                 };
-                self.maybe_run_self_review(name, state, completed).await
+                let event = self.maybe_run_self_review(name, state, completed).await;
+                apply_implement_status_gate(name, event, implement_status)
             }
             Err(e) => {
                 warn!(skill = name, error = %e, "Skill failed");
@@ -1839,6 +1854,123 @@ fn parse_review_verdict(output: &str) -> Option<ReviewVerdict> {
     None
 }
 
+/// ISS-056b: implement-skill self-report parsed from LLM output.
+///
+/// Result of inspecting the trailing `STATUS:` line in the implement
+/// skill's `result.output`. See `prompts/implement.txt` "Self-report
+/// status" section for the contract the LLM sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImplementStatus {
+    /// Agent self-reported `STATUS: complete`.
+    Complete,
+    /// Agent self-reported `STATUS: incomplete: <reason>`, OR the line
+    /// was absent — both surface as `Incomplete` because a missing
+    /// status is the silent-success failure mode this gate exists to
+    /// catch (r-e196af regression). The reason text is normalised so
+    /// the state machine can render a uniform pause notification.
+    Incomplete { reason: String },
+}
+
+/// Scan the last 100 lines of LLM output for `^STATUS:` (case-insensitive
+/// prefix). The trailing-line restriction matches the prompt contract —
+/// agents are instructed to put STATUS on the very last line, so a
+/// loose substring match anywhere in the body would let unrelated
+/// prose ("the next STATUS: report will be…") slip through.
+///
+/// Returns `Complete` only on `STATUS: complete` (exact, case-insensitive).
+/// Returns `Incomplete` for `STATUS: incomplete[: reason]` and for
+/// any output without a `STATUS:` line at all.
+pub(crate) fn parse_implement_status(output: &str) -> ImplementStatus {
+    // Take the last 100 non-empty lines so we don't pay a full scan on
+    // verbose outputs but still tolerate minor trailing whitespace.
+    let mut tail: Vec<&str> = output
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(100)
+        .collect();
+    tail.reverse();
+
+    for line in tail.iter().rev() {
+        let trimmed = line.trim();
+        // Strip common markdown wrappers (`STATUS: …`, **STATUS: …**)
+        // before matching — the agent may bold-emphasise the line.
+        let stripped = trimmed
+            .trim_start_matches('`')
+            .trim_end_matches('`')
+            .trim_start_matches("**")
+            .trim_end_matches("**")
+            .trim();
+        let lc = stripped.to_lowercase();
+        if let Some(rest) = lc.strip_prefix("status:") {
+            let rest = rest.trim();
+            if rest == "complete" {
+                return ImplementStatus::Complete;
+            }
+            if let Some(reason) = rest.strip_prefix("incomplete") {
+                let reason = reason.trim_start_matches(':').trim();
+                let reason = if reason.is_empty() {
+                    "incomplete (no reason given)".to_string()
+                } else {
+                    reason.to_string()
+                };
+                return ImplementStatus::Incomplete { reason };
+            }
+            // Recognised STATUS: prefix but unknown payload — treat as
+            // incomplete with a diagnostic reason rather than silently
+            // accepting (defensive against typos like "STATUS: done").
+            return ImplementStatus::Incomplete {
+                reason: format!("unrecognized STATUS payload: {}", rest),
+            };
+        }
+    }
+
+    ImplementStatus::Incomplete {
+        reason: "missing STATUS self-report".to_string(),
+    }
+}
+
+/// ISS-056b: gate a post-implement event on the parsed STATUS self-report.
+///
+/// Called only on the success-shaped tail of `run_skill` for the implement
+/// phase. Three rules:
+/// 1. `name != "implement"` → no-op (`status` is `None`).
+/// 2. `event` is already a failure (`SkillFailed`) → no-op. The skill
+///    pipeline already decided this is a failure for a stronger reason
+///    (zero-files, review reject, turn limit, …) and STATUS would be
+///    redundant noise.
+/// 3. Otherwise (`SkillCompleted` / `SelfReviewCompleted`) → if the
+///    parsed status is `Incomplete`, replace the event with
+///    `ImplementIncomplete{reason}`, which the state machine routes to
+///    `Paused`. If `Complete`, pass through.
+fn apply_implement_status_gate(
+    name: &str,
+    event: RitualEvent,
+    status: Option<ImplementStatus>,
+) -> RitualEvent {
+    if name != "implement" {
+        return event;
+    }
+    let Some(status) = status else { return event };
+
+    // Rule 2: never override an existing failure verdict.
+    if matches!(event, RitualEvent::SkillFailed { .. }) {
+        return event;
+    }
+
+    match status {
+        ImplementStatus::Complete => event,
+        ImplementStatus::Incomplete { reason } => {
+            warn!(
+                skill = name,
+                reason = %reason,
+                "Implement skill self-reported incomplete (ISS-056b)"
+            );
+            RitualEvent::ImplementIncomplete { reason }
+        }
+    }
+}
+
 /// Extract JSON from LLM output (handles markdown code fences).
 fn extract_json(output: &str) -> &str {
     // Try to find ```json ... ``` block
@@ -2405,6 +2537,57 @@ mod tests {
         assert_eq!(V2Executor::implement_iterations_for_triage_size(Some("bogus")), 30);
     }
 
+    // ── ISS-056b: implement-skill STATUS self-report parser ──
+
+    #[test]
+    fn test_parse_implement_status_complete() {
+        let output = "Did the work.\nVerify passed.\n\nSTATUS: complete";
+        assert_eq!(parse_implement_status(output), ImplementStatus::Complete);
+    }
+
+    #[test]
+    fn test_parse_implement_status_incomplete_with_reason() {
+        let output = "Read 6 files.\nRan out of turns.\nSTATUS: incomplete: hit turn limit";
+        match parse_implement_status(output) {
+            ImplementStatus::Incomplete { reason } => assert_eq!(reason, "hit turn limit"),
+            other => panic!("expected Incomplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_implement_status_missing_is_incomplete() {
+        // The r-e196af regression: agent finishes silently with no STATUS line.
+        // Must surface as Incomplete so the state machine pauses instead of
+        // proceeding to verify on a half-finished refactor.
+        let output = "I finished the task.\nAll tests pass.\n";
+        match parse_implement_status(output) {
+            ImplementStatus::Incomplete { reason } => {
+                assert!(reason.contains("missing STATUS"), "reason was: {reason}")
+            }
+            other => panic!("expected Incomplete (missing-status), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_implement_status_case_insensitive_and_markdown() {
+        // Agents sometimes bold-emphasise the STATUS line. Strip wrappers.
+        let output = "Work summary…\n**status: COMPLETE**";
+        assert_eq!(parse_implement_status(output), ImplementStatus::Complete);
+    }
+
+    #[test]
+    fn test_parse_implement_status_unrecognised_payload() {
+        // Defensive: agent writes "STATUS: done" instead of the contract's
+        // "STATUS: complete". Treat as incomplete (don't silently accept).
+        let output = "Body…\nSTATUS: done";
+        match parse_implement_status(output) {
+            ImplementStatus::Incomplete { reason } => {
+                assert!(reason.contains("unrecognized"), "reason was: {reason}")
+            }
+            other => panic!("expected Incomplete (unrecognised), got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_review_design_triggers_review_config() {
         let executor = V2Executor::new(V2ExecutorConfig::default());
@@ -2799,7 +2982,22 @@ mod tests {
             let output = if is_self_review {
                 self.self_review_output.lock().unwrap().clone()
             } else {
-                "ok".into()
+                // ISS-056b: implement-phase prompts now require a trailing
+                // `STATUS:` self-report. Every test that drives `run_skill`
+                // for implement would otherwise see the missing-STATUS
+                // gate fire. We emit `STATUS: complete` for implement
+                // prompts so the existing assertions (which test orthogonal
+                // behaviour: zero-files, file-policy, self-review) keep
+                // their original meaning. Tests that want to exercise the
+                // STATUS-incomplete path do so via the parser unit tests
+                // (`test_parse_implement_status_*`) rather than through
+                // `run_skill`.
+                let is_implement = skill_prompt.contains("# Implement Phase");
+                if is_implement {
+                    "ok\n\nSTATUS: complete".into()
+                } else {
+                    "ok".into()
+                }
             };
             Ok(SkillResult {
                 output,

@@ -36,3 +36,16 @@ SUMMARY:
 ```
 
 If the verify command failed and you could not fix it, do NOT mark dependent tasks done. Report the failure clearly.
+
+## Self-report status (REQUIRED — ISS-056b)
+
+The very last line of your output MUST be one of:
+
+- `STATUS: complete` — every planned task in scope was implemented and the verify command passed.
+- `STATUS: incomplete: <reason>` — at least one task could not be finished. Reasons MUST be one of:
+  - `turn limit` — ran out of tool-call budget before finishing.
+  - `tool gating` — a required Write/Edit was rejected by the workspace's tool scope.
+  - `unclear spec` — the design or task description was ambiguous and you cannot fill the gap unilaterally.
+  - `blocked dependency` — a prerequisite task is not `done` and you cannot finish without it.
+
+If you omit this line, the ritual treats your run as `incomplete: missing STATUS self-report` and pauses for human review. Reporting `incomplete` is not a failure — it is the correct outcome when work is partial. Reporting `complete` when work is partial IS a failure (silent-success regression from r-e196af).

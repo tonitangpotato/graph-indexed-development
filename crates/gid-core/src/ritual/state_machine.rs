@@ -37,6 +37,18 @@ pub enum RitualPhase {
     Done,
     Escalated,
     Cancelled,
+    /// Implement skill self-reported `STATUS: incomplete` (ISS-056b).
+    ///
+    /// Distinct from `Escalated` (terminal failure, retries exhausted) and
+    /// `Cancelled` (user/adapter abort). `Paused` means the agent ran but
+    /// did not finish — a human needs to inspect, then either resume
+    /// (re-emit `Start`-like event) or cancel. Non-terminal: status stays
+    /// `Active` because the work is still owned by this ritual; an
+    /// orphaned `Paused` ritual is a real bug, not just a zombie file.
+    ///
+    /// The reason string lives in `RitualState::error_context` (same
+    /// pattern as `Escalated`), populated when the transition fires.
+    Paused,
 }
 
 impl RitualPhase {
@@ -58,6 +70,7 @@ impl RitualPhase {
             Self::Done => "Done",
             Self::Escalated => "Escalated",
             Self::Cancelled => "Cancelled",
+            Self::Paused => "Paused",
         }
     }
 
@@ -96,8 +109,12 @@ impl RitualPhase {
     }
 
     /// Whether this is a pause state (waiting for user input, no EP actions expected).
+    ///
+    /// Includes `Paused` (ISS-056b) — implement skill self-reported incomplete,
+    /// ritual is parked until human resumes/cancels. Same EP-action accounting
+    /// as `WaitingClarification`/`WaitingApproval`.
     pub fn is_paused(&self) -> bool {
-        matches!(self, Self::WaitingClarification | Self::WaitingApproval)
+        matches!(self, Self::WaitingClarification | Self::WaitingApproval | Self::Paused)
     }
 }
 
@@ -434,6 +451,9 @@ impl RitualPhase {
             // before this is read, but pick a sane non-MAX value for
             // exhaustiveness in case a future caller bypasses `health`.
             Done | Escalated | Cancelled => i64::MAX,
+            // Paused (ISS-056b) is non-terminal but waits indefinitely
+            // for human triage; same treatment as user-input pauses.
+            Paused => i64::MAX,
         }
     }
 }
@@ -700,6 +720,13 @@ pub enum RitualEvent {
     UserApproval { approved: String },
     PlanDecided(ImplementStrategy),
     SkillCompleted { phase: String, artifacts: Vec<String> },
+    /// Implement skill self-reported incomplete work (ISS-056b).
+    ///
+    /// Distinct from `SkillFailed` — the LLM ran without crashing and
+    /// (possibly) produced partial artifacts, but its `STATUS:` self-report
+    /// declared the work unfinished. State machine routes to `Paused` and
+    /// preserves `reason` in `error_context` for human triage.
+    ImplementIncomplete { reason: String },
     /// A skill execution failed.
     ///
     /// `phase` and `error` are the legacy human-facing fields (kept for
@@ -1383,6 +1410,28 @@ pub fn transition(state: &RitualState, event: RitualEvent) -> (RitualState, Vec<
                 ],
             )
         }
+
+        // ISS-056b: Implement self-reported incomplete → Paused (no verify run).
+        // Distinct from SkillFailed (which would Escalate via existing arms).
+        // The reason is preserved in error_context so human triage / status
+        // tools can surface it; no automatic retry — verify is skipped because
+        // running cargo on a half-finished refactor is the silent-success
+        // failure mode this issue exists to prevent.
+        (Implementing, ImplementIncomplete { reason }) => (
+            state
+                .clone()
+                .with_phase(Paused)
+                .with_error_context(reason.clone()),
+            vec![
+                Notify {
+                    message: format!(
+                        "⏸ Implement skill self-reported incomplete: {}. Ritual paused for human review.",
+                        reason
+                    ),
+                },
+                SaveState { kind: SaveStateKind::Boundary },
+            ],
+        ),
 
         // Verify success → Done
         (Verifying, ShellCompleted { exit_code: 0, .. }) => (
@@ -2205,6 +2254,36 @@ mod tests {
             .with_project(project_with_design());
         let (s, a) = transition(&state, RitualEvent::SkillCompleted { phase: "impl".into(), artifacts: vec![] });
         assert_eq!(s.phase, RitualPhase::Verifying);
+        assert_invariant(&s, &a);
+    }
+
+    /// ISS-056b: implement skill self-reports incomplete → ritual pauses
+    /// without entering Verifying. The reason is preserved in
+    /// `error_context` for human triage.
+    #[test]
+    fn test_implement_incomplete_pauses_without_verify() {
+        let state = idle_state()
+            .with_phase(RitualPhase::Implementing)
+            .with_project(project_with_design());
+        let (s, a) = transition(
+            &state,
+            RitualEvent::ImplementIncomplete {
+                reason: "hit turn limit".into(),
+            },
+        );
+        assert_eq!(s.phase, RitualPhase::Paused);
+        // Paused is non-terminal — work is owned by this ritual until a
+        // human triages it. Status remains Active.
+        assert!(!s.phase.is_terminal());
+        assert_eq!(s.status, RitualV2Status::Active);
+        assert_eq!(s.error_context.as_deref(), Some("hit turn limit"));
+        // No RunShell action emitted: cargo verify must NOT run on a
+        // partially-finished implement (the silent-success regression).
+        assert!(
+            !a.iter().any(|x| matches!(x, RitualAction::RunShell { .. })),
+            "ImplementIncomplete must not run the verify shell, got actions: {:?}",
+            a
+        );
         assert_invariant(&s, &a);
     }
 
