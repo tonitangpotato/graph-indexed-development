@@ -174,6 +174,17 @@ fn default_patterns() -> Vec<LayoutPattern> {
             metadata_format: FM,
             seq_scope: SeqScope::Project,
         },
+        // ISS-053 Phase G2 Gap 4: nested issue subdirs
+        // (e.g. `issues/ISS-024/wip/README.md`).
+        // Goes BEFORE feature patterns so the literal `issues/` prefix
+        // is matched before the generic `{slug}/{any}.md` fallback could
+        // intercept anything 4-deep.
+        LayoutPattern {
+            pattern: "issues/{parent_id}/{slug}/{any}.md".into(),
+            kind: "issue-doc-nested".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
         LayoutPattern {
             pattern: "features/{slug}/requirements.md".into(),
             kind: "feature-requirements".into(),
@@ -200,9 +211,71 @@ fn default_patterns() -> Vec<LayoutPattern> {
             metadata_format: FM,
             seq_scope: SeqScope::Project,
         },
+        // ISS-053 Phase G2 Gap 2: top-level legacy designs at
+        // `features/{name}.md` (rustclaw has 5 of these). Two segments,
+        // so it cannot collide with the three-segment `features/{slug}/...`
+        // patterns above. Listed AFTER them so the slug-dir form wins
+        // when a sibling slug-dir exists.
+        LayoutPattern {
+            pattern: "features/{name}.md".into(),
+            kind: "feature-doc-toplevel".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        // ISS-053 Phase G2 Gap 1: nested feature subfolders
+        // (engram knowledge-compiler meta-feature: 12 files at
+        // `features/{slug}/{subslug}/...`). 4- and 5-segment patterns;
+        // outer feature slug captured as `parent_id`, inner sub-feature
+        // slug captured as `slug`. SlotMap is BTreeMap<String,String>
+        // so the inner `slug` is what survives — the outer is in
+        // `parent_id`, which is exactly the round-trip semantic we want.
+        LayoutPattern {
+            pattern: "features/{parent_id}/{slug}/requirements.md".into(),
+            kind: "nested-feature-requirements".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        LayoutPattern {
+            pattern: "features/{parent_id}/{slug}/design.md".into(),
+            kind: "nested-feature-design".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        LayoutPattern {
+            pattern: "features/{parent_id}/{slug}/reviews/{name}.md".into(),
+            kind: "nested-feature-review".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Parent {
+                rel: "features/{parent_id}/{slug}/reviews".into(),
+            },
+        },
+        LayoutPattern {
+            pattern: "features/{parent_id}/{slug}/{any}.md".into(),
+            kind: "nested-feature-doc".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
         LayoutPattern {
             pattern: "docs/{name}.md".into(),
             kind: "doc".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        // ISS-053 Phase G2 Gap 3: `docs/reviews/{name}.md` —
+        // engram has architecture review docs here. Must come BEFORE
+        // the generic `docs/{slug}/{name}.md` since `reviews` is a
+        // valid `{slug}` value and the first match wins.
+        LayoutPattern {
+            pattern: "docs/reviews/{name}.md".into(),
+            kind: "doc-review".into(),
+            metadata_format: FM,
+            seq_scope: SeqScope::Project,
+        },
+        // ISS-053 Phase G2 Gap 3: nested docs subdir (engram
+        // `docs/reviews/`, rustclaw `docs/discussion/`).
+        LayoutPattern {
+            pattern: "docs/{slug}/{name}.md".into(),
+            kind: "doc-nested".into(),
             metadata_format: FM,
             seq_scope: SeqScope::Project,
         },
@@ -878,5 +951,166 @@ mod tests {
             seq_scope: SeqScope::Project,
         };
         assert_eq!(pat.id_template_str(), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // ISS-053 Phase G2 — corpus regression: 4 default-Layout gaps
+    //
+    // Each test names the originating corpus + path so anyone reading a
+    // failure can trace back to the exact real-world file the pattern was
+    // added for. See `.gid/issues/ISS-053/phase-g/verification-2026-04-28.md`
+    // for the full inventory.
+    // ---------------------------------------------------------------------
+
+    // Gap 1 — engram knowledge-compiler meta-feature
+    #[test]
+    fn iss053_gap1_nested_feature_requirements() {
+        let layout = Layout::default();
+        let m = layout.match_path("features/knowledge-compiler/compilation/requirements.md");
+        assert_eq!(m.kind, "nested-feature-requirements");
+        assert!(!m.fallback);
+        assert_eq!(
+            m.slots.get("parent_id"),
+            Some(&"knowledge-compiler".to_string())
+        );
+        assert_eq!(m.slots.get("slug"), Some(&"compilation".to_string()));
+    }
+
+    #[test]
+    fn iss053_gap1_nested_feature_design() {
+        let layout = Layout::default();
+        let m = layout.match_path("features/knowledge-compiler/maintenance/design.md");
+        assert_eq!(m.kind, "nested-feature-design");
+        assert!(!m.fallback);
+    }
+
+    #[test]
+    fn iss053_gap1_nested_feature_review() {
+        let layout = Layout::default();
+        let m = layout.match_path(
+            "features/knowledge-compiler/platform/reviews/design-r1.md",
+        );
+        assert_eq!(m.kind, "nested-feature-review");
+        assert!(!m.fallback);
+        assert_eq!(
+            m.slots.get("parent_id"),
+            Some(&"knowledge-compiler".to_string())
+        );
+        assert_eq!(m.slots.get("slug"), Some(&"platform".to_string()));
+        assert_eq!(m.slots.get("name"), Some(&"design-r1".to_string()));
+    }
+
+    #[test]
+    fn iss053_gap1_nested_feature_round_trip() {
+        let layout = Layout::default();
+        let path = "features/knowledge-compiler/compilation/design.md";
+        let m = layout.match_path(path);
+        let resolved = layout.resolve(&m.kind, &m.slots).unwrap();
+        assert_eq!(resolved.to_str().unwrap(), path);
+    }
+
+    // Gap 2 — rustclaw legacy `features/DESIGN-*.md`
+    #[test]
+    fn iss053_gap2_toplevel_feature_doc() {
+        let layout = Layout::default();
+        let m = layout.match_path("features/DESIGN-claude-proxy.md");
+        assert_eq!(m.kind, "feature-doc-toplevel");
+        assert!(!m.fallback);
+        assert_eq!(
+            m.slots.get("name"),
+            Some(&"DESIGN-claude-proxy".to_string())
+        );
+    }
+
+    #[test]
+    fn iss053_gap2_toplevel_feature_doc_round_trip() {
+        let layout = Layout::default();
+        let path = "features/BATCH3-DESIGN.md";
+        let m = layout.match_path(path);
+        let resolved = layout.resolve(&m.kind, &m.slots).unwrap();
+        assert_eq!(resolved.to_str().unwrap(), path);
+    }
+
+    // Slug-dir form must still win over toplevel form
+    #[test]
+    fn iss053_gap2_slug_dir_wins_over_toplevel() {
+        let layout = Layout::default();
+        let m = layout.match_path("features/dim-extract/requirements.md");
+        assert_eq!(m.kind, "feature-requirements");
+    }
+
+    // Gap 3 — `docs/reviews/`, `docs/discussion/`
+    #[test]
+    fn iss053_gap3_doc_review() {
+        let layout = Layout::default();
+        let m = layout.match_path("docs/reviews/architecture-r1.md");
+        assert_eq!(m.kind, "doc-review");
+        assert!(!m.fallback);
+        assert_eq!(m.slots.get("name"), Some(&"architecture-r1".to_string()));
+    }
+
+    #[test]
+    fn iss053_gap3_doc_nested() {
+        let layout = Layout::default();
+        let m = layout.match_path("docs/discussion/04-16.md");
+        assert_eq!(m.kind, "doc-nested");
+        assert!(!m.fallback);
+        assert_eq!(m.slots.get("slug"), Some(&"discussion".to_string()));
+        assert_eq!(m.slots.get("name"), Some(&"04-16".to_string()));
+    }
+
+    #[test]
+    fn iss053_gap3_doc_review_takes_precedence_over_doc_nested() {
+        // `reviews` is a syntactically valid {slug}, so without the
+        // explicit literal-`reviews` pattern positioned first, this would
+        // fall into doc-nested. Verify the ordering.
+        let layout = Layout::default();
+        let m = layout.match_path("docs/reviews/something.md");
+        assert_eq!(m.kind, "doc-review");
+    }
+
+    #[test]
+    fn iss053_gap3_flat_docs_still_works() {
+        // Single-segment `docs/{name}.md` must not regress.
+        let layout = Layout::default();
+        let m = layout.match_path("docs/architecture.md");
+        assert_eq!(m.kind, "doc");
+    }
+
+    // Gap 4 — engram `issues/ISS-024/wip/README.md`
+    #[test]
+    fn iss053_gap4_issue_doc_nested() {
+        let layout = Layout::default();
+        let m = layout.match_path("issues/ISS-024/wip/README.md");
+        assert_eq!(m.kind, "issue-doc-nested");
+        assert!(!m.fallback);
+        assert_eq!(m.slots.get("parent_id"), Some(&"ISS-024".to_string()));
+        assert_eq!(m.slots.get("slug"), Some(&"wip".to_string()));
+        assert_eq!(m.slots.get("any"), Some(&"README".to_string()));
+    }
+
+    #[test]
+    fn iss053_gap4_issue_subdir_does_not_regress_review() {
+        // `issues/{parent_id}/reviews/{name}.md` must still match `review`,
+        // not the new nested-doc pattern. `reviews` is a valid {slug}
+        // so the earlier-listed reviews pattern must win.
+        let layout = Layout::default();
+        let m = layout.match_path("issues/ISS-042/reviews/design-r2.md");
+        assert_eq!(m.kind, "review");
+    }
+
+    // Sanity: noop fallback still kicks in for genuinely unknown shapes
+    #[test]
+    fn iss053_g2_unknown_shape_still_falls_back_to_note() {
+        let layout = Layout::default();
+        // Two-segment unknown path matches the global `{slug}/{any}.md`
+        // noop pattern (fallback=false but kind=note).
+        let m = layout.match_path("randomdir/somefile.md");
+        assert_eq!(m.kind, "note");
+        // Top-level single-segment path falls all the way through to the
+        // explicit fallback (no pattern is one segment unanchored).
+        let m2 = layout.match_path("README.md");
+        assert_eq!(m2.kind, "note");
+        assert!(m2.fallback);
     }
 }

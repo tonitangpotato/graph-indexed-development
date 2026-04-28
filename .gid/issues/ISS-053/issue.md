@@ -779,3 +779,44 @@ the missing cases." Therefore:
   only the kind table grows by one row per pattern.
 
 Full report: `.gid/issues/ISS-053/phase-g/verification-2026-04-28.md`.
+
+### 2026-04-28 — Phase G2 (default Layout extension) DONE — ROLLOUT UNBLOCKED
+
+Extended `default_patterns()` in `crates/gid-core/src/artifact/layout.rs`
+with 7 new patterns covering all four gaps from the pre-G2 report:
+
+- `issues/{parent_id}/{slug}/{any}.md` → `issue-doc-nested` (Gap 4)
+- `features/{name}.md` → `feature-doc-toplevel` (Gap 2)
+- `features/{parent_id}/{slug}/requirements.md` → `nested-feature-requirements` (Gap 1)
+- `features/{parent_id}/{slug}/design.md` → `nested-feature-design` (Gap 1)
+- `features/{parent_id}/{slug}/reviews/{name}.md` → `nested-feature-review` (Gap 1)
+- `features/{parent_id}/{slug}/{any}.md` → `nested-feature-doc` (Gap 1 fallback within nesting)
+- `docs/reviews/{name}.md` → `doc-review` (Gap 3, ordered before doc-nested)
+- `docs/{slug}/{name}.md` → `doc-nested` (Gap 3)
+
+Slot reuse (no parser change): outer feature dir captured as `parent_id`,
+inner sub-feature dir as `slug`. SlotMap is `BTreeMap<String,String>`, so
+the inner survives — exactly the round-trip semantic we want, since the
+identity of a nested-feature artifact IS the (outer, inner) pair where the
+inner is the artifact's own slug.
+
+14 new regression tests added (`iss053_gap{1,2,3,4}_*`), each anchored to
+a real corpus path. `cargo test -p gid-core --lib artifact` →
+**123 passed; 0 failed**.
+
+Re-running the 3-corpus verification:
+
+| Corpus | Total | note (now) | note (before) | Miscategorized |
+|---|---:|---:|---:|---:|
+| engram | 146 | 1 | 17 | **0** |
+| gid-rs | 118 | 3 | 4  | **0** |
+| rustclaw | 87 | 2 | 10 | **0** |
+
+All 6 residual notes are §4.4 acknowledged fallbacks (top-level orphans /
+non-canonical design subdirs). **§7 acceptance gate met.** §6 acceptance
+also now satisfied for the Layout side. Diff: `crates/gid-core/src/artifact/layout.rs`
+~80 LOC added (patterns + comments + tests).
+
+Full report: `.gid/issues/ISS-053/phase-g/verification-2026-04-28-post-g2.md`.
+
+Phases remaining: H (documentation). ISS-053 is one phase from close.
