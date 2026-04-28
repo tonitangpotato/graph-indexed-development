@@ -24,6 +24,7 @@ pub mod storage;
 pub mod identity;
 pub mod watch;
 pub mod project_registry;
+pub mod artifact;
 
 // Ritual module (requires "ritual" feature)
 #[cfg(feature = "ritual")]
