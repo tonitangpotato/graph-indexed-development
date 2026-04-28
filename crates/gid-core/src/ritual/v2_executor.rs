@@ -370,9 +370,29 @@ impl V2Executor {
                 // failure (preserving the historical fire-and-forget
                 // contract for this arm) but the propagation to the
                 // state-machine via StatePersistFailed is still T08.
+                //
+                // ISS-050 incremental fix (2026-04-28): until T08 lands
+                // full event-feedback wiring, surface failures to the
+                // user via `hooks.notify` so a wedged ritual is at
+                // least observable. Without this, save_state errors
+                // (e.g. `StorageFull`) were logged at WARN and
+                // otherwise silent — exactly the symptom ISS-050
+                // describes (12+ minutes of indistinguishable silence
+                // in r-950ebf). One notify per failed save is small
+                // spam relative to Telegram volume; a bounded retry
+                // loop with summary notify is T08.
                 let _ = kind;
                 if let Err(e) = self.save_state(state) {
                     warn!(error = %e, "Failed to save ritual state");
+                    // Fire-and-forget notify (no event back into the
+                    // state machine — that's T08). User sees the
+                    // failure; we still return `None` per the legacy
+                    // dispatcher contract.
+                    self.hooks
+                        .notify(&format!(
+                            "⚠️ ritual state persist failed: {e}; ritual may be running with stale on-disk state"
+                        ))
+                        .await;
                 }
                 None
             }
@@ -3835,6 +3855,103 @@ mod tests {
         assert!(
             result.is_err(),
             "save_state must propagate IO failure when path is unwritable; got Ok"
+        );
+    }
+
+    /// ISS-050 (incremental fix, 2026-04-28).
+    ///
+    /// When the legacy `save_state` write fails inside the
+    /// `RitualAction::SaveState` dispatcher arm, the executor must call
+    /// `hooks.notify` so the failure is user-visible — the original ISS-050
+    /// symptom (12+ minutes of silent wedge in r-950ebf) reduced to a
+    /// single visible notification. Full event-feedback wiring through
+    /// `persist_state` (so the state machine transitions to `Failed` /
+    /// flips `persist_degraded`) is still ISS-052 T08.
+    ///
+    /// This test pins the notify behavior so it can't silently regress
+    /// while T08 is pending. When T08 lands, this test should be revisited
+    /// alongside the dispatcher refactor — by then `persist_state` will
+    /// be the call site, and the assertion shape changes from "Notify
+    /// fired on save_state failure" to "StatePersistFailed event flowed
+    /// back into transition()".
+    #[tokio::test]
+    async fn save_state_failure_notifies_user_iss050() {
+        use std::sync::Mutex;
+
+        // Recorder hook: just captures notify messages. Trivial impl.
+        struct NotifyRecorder {
+            workspace: PathBuf,
+            notifications: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl RitualHooks for NotifyRecorder {
+            async fn notify(&self, msg: &str) {
+                self.notifications.lock().unwrap().push(msg.to_string());
+            }
+            async fn persist_state(&self, _: &RitualState) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn resolve_workspace(
+                &self,
+                _: &WorkUnit,
+            ) -> Result<PathBuf, super::super::hooks::WorkspaceError> {
+                Ok(self.workspace.clone())
+            }
+            fn stamp_metadata(&self, _state: &mut RitualState) {}
+        }
+
+        // Same trick as `save_state_returns_err_on_unwritable_path`:
+        // project_root points at a regular file, so the executor's
+        // legacy `save_state` write to `<file>/.gid/ritual-state.json`
+        // fails with an io error.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let blocking_file = tmp.path().join("not-a-dir");
+        std::fs::write(&blocking_file, b"placeholder").expect("write placeholder");
+
+        let recorder = Arc::new(NotifyRecorder {
+            workspace: tmp.path().to_path_buf(),
+            notifications: Mutex::new(Vec::new()),
+        });
+
+        let config = V2ExecutorConfig {
+            project_root: blocking_file,
+            ..Default::default()
+        };
+        let exec =
+            V2Executor::with_hooks(config, recorder.clone() as Arc<dyn RitualHooks>);
+        let state = RitualState::new();
+
+        // Dispatch the SaveState action — save_state will fail internally.
+        let event = exec
+            .execute(
+                &RitualAction::SaveState {
+                    kind: super::super::state_machine::SaveStateKind::Boundary,
+                },
+                &state,
+            )
+            .await;
+
+        // Contract preserved (legacy fire-and-forget): no event surfaces.
+        // Full event-feedback wiring is T08.
+        assert!(
+            event.is_none(),
+            "SaveState arm must remain fire-and-forget until T08; got Some({:?})",
+            event
+        );
+
+        // The fix: at least one user-visible notification was emitted.
+        let notes = recorder.notifications.lock().unwrap();
+        assert_eq!(
+            notes.len(),
+            1,
+            "expected exactly one notify on save_state failure; got {:?}",
+            *notes
+        );
+        let msg = &notes[0];
+        assert!(
+            msg.contains("persist failed") || msg.contains("ritual state"),
+            "notify message should describe the persist failure; got {:?}",
+            msg
         );
     }
 
