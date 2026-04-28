@@ -16,14 +16,14 @@
 //! keeping with the design's "kind is derived, not stored on disk"
 //! invariant (D1). This is a phasing detail, not a design deviation.
 
-pub mod artifact;
 pub mod id;
 pub mod layout;
 pub mod metadata;
+pub mod model;
 pub mod relation;
 pub mod store;
 
-pub use artifact::{Artifact, ArtifactError};
+pub use model::{Artifact, ArtifactError};
 pub use id::{ArtifactId, ArtifactIdError};
 pub use layout::{
     FallbackRule, Layout, LayoutError, LayoutPattern, MatchResult, SeqScope, SlotMap,

@@ -31,7 +31,7 @@ use std::path::{Component, PathBuf};
 use regex::Regex;
 use thiserror::Error;
 
-use super::artifact::Artifact;
+use super::model::Artifact;
 use super::id::{ArtifactId, ArtifactIdError};
 use super::layout::Layout;
 use super::metadata::FieldValue;
@@ -277,9 +277,7 @@ fn normalize_relative(raw: &str) -> Option<String> {
         match comp {
             Component::CurDir => {}
             Component::ParentDir => {
-                if stack.pop().is_none() {
-                    return None;
-                }
+                stack.pop()?;
             }
             Component::Normal(seg) => {
                 let s = seg.to_str()?;

@@ -5438,9 +5438,8 @@ fn cmd_artifact_list(
     } else {
         if artifacts.is_empty() {
             eprintln!(
-                "(no artifacts{}{} in project '{}')",
+                "(no artifacts{} in project '{}')",
                 kind.as_deref().map(|k| format!(" of kind '{}'", k)).unwrap_or_default(),
-                "",
                 store.project()
             );
             return Ok(());
@@ -5696,7 +5695,7 @@ fn cmd_artifact_relate(
         .get(relation_kind)
         .map(|v| v.as_list())
         .unwrap_or_default();
-    let merged = merge_list(&existing, &[to_token.clone()]);
+    let merged = merge_list(&existing, std::slice::from_ref(&to_token));
     let new_value = if merged.len() == 1 {
         FieldValue::Scalar(merged.into_iter().next().unwrap())
     } else {

@@ -41,7 +41,7 @@ use std::time::SystemTime;
 
 use thiserror::Error;
 
-use super::artifact::{Artifact, ArtifactError};
+use super::model::{Artifact, ArtifactError};
 use super::id::{ArtifactId, ArtifactIdError};
 use super::layout::{Layout, LayoutError, SeqScope, SlotMap};
 use super::metadata::{Metadata, MetadataError};
@@ -467,7 +467,7 @@ impl ArtifactStore {
         let mut max_seq: u64 = 0;
         let kind_target = kind.to_string();
         walk_md_files(&scan_root, &mut |abs: &Path| {
-            let rel = match abs.strip_prefix(&self.project_root.join(".gid")) {
+            let rel = match abs.strip_prefix(self.project_root.join(".gid")) {
                 Ok(r) => r,
                 Err(_) => return Ok(()),
             };
@@ -523,10 +523,7 @@ impl ArtifactStore {
             .strip_prefix(&self.project_root)
             .map_err(|_| StoreError::Io {
                 path: abs.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::Other,
-                    "created path is outside the project root",
-                ),
+                source: io::Error::other("created path is outside the project root"),
             })?;
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let id = ArtifactId::new(&rel_str)?;
