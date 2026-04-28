@@ -88,3 +88,20 @@ Add a short section documenting the drift-and-sync protocol with the three primi
 
 - The protocol matches how good engineering teams treat tests: tests must pass at commit time, not "remember to add tests later". Drift sync should feel the same — a graph commit is part of the implementation commit.
 - Rationale source: engram v0.3 session 2026-04-26. Audit transcript and reconciliation steps will be linked from this issue once the manual cleanup is complete (separate engram-side issue).
+
+## Progress
+
+**2026-04-28 — Spec doc landed.** `DRIFT_PROTOCOL.md` (repo root — `docs/` is
+gitignored in gid-rs, same precedent as `RITUAL_RUN_IMPLEMENTATION.md`). Doc covers:
+problem statement, four drift categories, `gid drift --dir <path>` synopsis (flags,
+exit codes 0/1/2/3, text + JSON output formats), `gid drift add` / `cancel` / `split`
+semantics with edge effects, ritual `implement` post-condition contract + failure
+diagnostic format + escape hatch, AGENTS.md guidance, engram v0.3 reconciliation as
+the validation fixture (9 orphans / 5 missing / stale on §3.4), out-of-scope items
+for v0.1, references. AGENTS.md (rustclaw side) has a short pointer section.
+
+CLI implementation **deferred to post-0.4.0-publish** — coupling protocol churn with
+a release would force premature stabilization. ACs (`gid drift` exists, reconciliation
+primitives work, ritual post-condition rejects unregistered files, fixture tests, doc)
+are unmet by design until that gate clears. Spec doc is the contract the
+implementation must meet.
