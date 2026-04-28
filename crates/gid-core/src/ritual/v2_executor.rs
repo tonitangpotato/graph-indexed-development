@@ -365,8 +365,15 @@ impl V2Executor {
                 // exist as of T04 (see state_machine.rs §6.3.3 table)
                 // but are not driven yet — they're tested directly via
                 // `transition()` calls.
+                //
+                // ISS-051: `save_state` now returns `Result`. We log on
+                // failure (preserving the historical fire-and-forget
+                // contract for this arm) but the propagation to the
+                // state-machine via StatePersistFailed is still T08.
                 let _ = kind;
-                self.save_state(state);
+                if let Err(e) = self.save_state(state) {
+                    warn!(error = %e, "Failed to save ritual state");
+                }
                 None
             }
             RitualAction::UpdateGraph { description } => {
@@ -1245,24 +1252,32 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
         }
     }
 
-    fn save_state(&self, state: &RitualState) {
+    /// Legacy fire-and-forget state save (ISS-051: now returns Result).
+    ///
+    /// Returns `std::io::Result<()>` so callers can decide whether to
+    /// swallow, retry, or escalate. The current dispatcher (`RitualAction::SaveState`
+    /// arm) logs and swallows — full event-feedback wiring through
+    /// `persist_state` retry wrapper is T08 / ISS-052.
+    ///
+    /// Errors propagated:
+    ///   - serde failure → wrapped as `io::Error::other`
+    ///   - filesystem write failure → propagated as-is
+    ///
+    /// Side effects: best-effort `create_dir_all` on the parent; that
+    /// failure is intentionally ignored because the subsequent `write`
+    /// will surface the same condition with a more specific error.
+    fn save_state(&self, state: &RitualState) -> std::io::Result<()> {
         let state_path = self.config.project_root.join(".gid").join("ritual-state.json");
 
-        // Ensure .gid/ exists
+        // Ensure .gid/ exists. If create_dir_all fails, the write below
+        // will surface the same underlying condition with the right path.
         if let Some(parent) = state_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        match serde_json::to_string_pretty(state) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&state_path, &json) {
-                    warn!(error = %e, "Failed to save ritual state");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to serialize ritual state");
-            }
-        }
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|e| std::io::Error::other(format!("serialize ritual state: {e}")))?;
+        std::fs::write(&state_path, &json)
     }
 
     fn update_graph(&self, description: &str) {
@@ -3771,6 +3786,52 @@ mod tests {
                 (_, e) => panic!("fail_n={fail_n}: unexpected event {:?}", e),
             }
         }
+    }
+
+    // ── ISS-051: save_state returns Result ──────────────────────────────
+    //
+    // The legacy fire-and-forget `save_state` (called from the
+    // `RitualAction::SaveState` dispatcher) now returns `std::io::Result<()>`
+    // so callers can observe failure. The full retry/event-feedback path
+    // is owned by `persist_state` (T03, tested above) — these two tests
+    // pin only the new return-type contract.
+
+    #[tokio::test]
+    async fn save_state_returns_ok_on_writable_dir() {
+        // Happy path: a writable temp dir → save_state returns Ok and the
+        // state file is created on disk.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut config = V2ExecutorConfig::default();
+        config.project_root = tmp.path().to_path_buf();
+        let exec = V2Executor::new(config);
+        let state = RitualState::new();
+
+        exec.save_state(&state).expect("save_state must succeed in writable tmp");
+
+        let state_path = tmp.path().join(".gid").join("ritual-state.json");
+        assert!(state_path.exists(), "state file must be written to {state_path:?}");
+    }
+
+    #[tokio::test]
+    async fn save_state_returns_err_on_unwritable_path() {
+        // Failure path: project_root points at a regular *file* (not a dir).
+        // `create_dir_all` will fail (best-effort, ignored), then `write`
+        // will fail because `<file>/.gid/ritual-state.json` is not a valid
+        // path. save_state must return Err — not panic, not silently swallow.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let blocking_file = tmp.path().join("not-a-dir");
+        std::fs::write(&blocking_file, b"placeholder").expect("write placeholder");
+
+        let mut config = V2ExecutorConfig::default();
+        config.project_root = blocking_file;
+        let exec = V2Executor::new(config);
+        let state = RitualState::new();
+
+        let result = exec.save_state(&state);
+        assert!(
+            result.is_err(),
+            "save_state must propagate IO failure when path is unwritable; got Ok"
+        );
     }
 
     #[tokio::test]

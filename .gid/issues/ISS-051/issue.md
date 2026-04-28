@@ -83,3 +83,18 @@ Telegram notify must fire on `StatePersistFailed` with: ritual_id, phase, IO err
 ## Notes
 
 - Discovered 2026-04-26 alongside ISS-052 during engram ISS-028/ISS-029 implementation. Combined incident: disk filled (cargo target, 7.7GB freed via `cargo clean`), cargo test failed, ritual tried to record failure, save_state hit "No space left on device", ritual wedged. Three layers of failure compounded; this issue addresses only the third layer.
+
+## Progress (2026-04-28)
+
+### Done in gid-core (this commit)
+
+- `V2Executor::save_state` now returns `std::io::Result<()>` instead of swallowing errors. Serde failures wrapped as `io::Error::other`; FS write errors propagated as-is.
+- `RitualAction::SaveState` dispatcher logs propagated errors (preserves historical fire-and-forget contract for this path; full event-feedback wiring is T08).
+- 2 new unit tests pin the Result contract: writable tmp → Ok + file exists; project_root pointing at a regular file → Err propagated (not panic, not swallow).
+- T03 `persist_state` retry wrapper (3 attempts, 50ms/250ms backoff, emits `StatePersisted{attempt}` / `StatePersistFailed{attempt:3}`) was already in place from ISS-052 work — covers retry/event ACs.
+
+### Deferred to post-0.4.0-publish
+
+- **rustclaw-side AC** (`Test (rustclaw integration): inject readonly state dir → ritual fails fast with notification`) deferred to post-0.4.0 publish. Reason: rustclaw still depends on gid-core 0.3.x; the integration test would need to pin against this branch. Post-publish, rustclaw can bump and add the test.
+- **Telegram notify on StatePersistFailed**: state-machine arm already produces the right `Notify` action; rustclaw notify hook wiring is part of the same post-0.4.0 work.
+- **T08 wiring**: replacing the dispatcher's `save_state` call with `persist_state` (so retry+event are driven by the action dispatcher, not just by direct test calls) — bigger change, separate task. Tracked at the dispatcher's TODO comment.
