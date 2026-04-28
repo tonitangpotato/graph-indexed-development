@@ -634,6 +634,22 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectCommands,
     },
+
+    /// Manage `.gid/` artifacts (issues, features, designs, reviews, …).
+    ///
+    /// Six kind-agnostic verbs that operate on any artifact kind defined by
+    /// the project's `Layout` (built-in default + optional `.gid/layout.yml`
+    /// override). Adding a new artifact kind requires NO changes here —
+    /// that is the binding D2 invariant of ISS-053.
+    ///
+    /// Refs: short form `<project>:<short_or_path>` (e.g. `engram:ISS-022`,
+    /// `gid-rs:.gid/issues/ISS-053/issue.md`), or unqualified short/path
+    /// when `--project` is supplied (or inferable from the current working
+    /// directory).
+    Artifact {
+        #[command(subcommand)]
+        action: ArtifactCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -674,6 +690,98 @@ enum ProjectCommands {
     },
     /// Print the path to the registry file (creates it if missing is your job, not ours).
     Where,
+}
+
+#[derive(Subcommand)]
+enum ArtifactCommands {
+    /// List artifacts under a project's `.gid/`.
+    ///
+    /// JSON shape: `[{project, path, kind, title}, ...]`.
+    List {
+        /// Filter by kind (e.g. `issue`, `feature`, `design`, `review`, `note`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Project name or alias (resolved via `~/.config/gid/projects.yml`).
+        /// Defaults to the project containing the current working directory.
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+    },
+
+    /// Show a single artifact: id, kind, metadata, body.
+    ///
+    /// JSON shape: `{id: {project, path}, kind, metadata: {...}, body: "..."}`.
+    Show {
+        /// Artifact ref. Either `<project>:<short_or_path>` (e.g.
+        /// `engram:ISS-022`) or an unqualified id (when `--project` is set
+        /// or the cwd is inside a registered project).
+        artifact_ref: String,
+        /// Project (overrides any project component in `<artifact_ref>`).
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+    },
+
+    /// Create a new artifact of the given kind.
+    ///
+    /// `next_id` / `next_path` are computed via [`Layout`]. Caller-supplied
+    /// slots (e.g. `slug=resolution-pipeline`) are accepted as positional
+    /// `key=value` args for kinds that need them.
+    New {
+        /// Artifact kind (must be defined in the project's Layout).
+        #[arg(long)]
+        kind: String,
+        /// Project name or alias.
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+        /// Parent artifact ref (required for parent-scoped kinds like `review`).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Optional `title:` frontmatter field for the new artifact.
+        #[arg(long, short = 't')]
+        title: Option<String>,
+        /// Layout slot overrides as `key=value`. Repeatable. Used for slug
+        /// kinds (e.g. `slug=resolution-pipeline`) or any custom placeholder.
+        slots: Vec<String>,
+    },
+
+    /// Update an artifact's frontmatter fields. Atomic, byte-exact for
+    /// untouched fields (D4).
+    Update {
+        /// Artifact ref.
+        artifact_ref: String,
+        /// Project (overrides any project component in `<artifact_ref>`).
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+        /// Field assignment as `key=value`. Repeatable. A value containing
+        /// commas is parsed as a YAML list (e.g. `--field blocks=ISS-2,ISS-3`).
+        #[arg(long = "field", value_name = "KEY=VALUE")]
+        fields: Vec<String>,
+    },
+
+    /// Add a typed relation from one artifact to another by appending to
+    /// the source's frontmatter (e.g. `relate A blocks B` adds `B` to A's
+    /// `blocks:` list). No separate relations DB.
+    Relate {
+        /// Source artifact ref (the one whose frontmatter is edited).
+        from: String,
+        /// Relation kind (frontmatter field name: `blocks`, `related`,
+        /// `depends_on`, `applies-to`, …).
+        kind: String,
+        /// Target artifact ref.
+        to: String,
+        /// Project for `<from>` (overrides any project component in `<from>`).
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+    },
+
+    /// Find every artifact that references the given target. Mirrors
+    /// `ArtifactStore::relations_to`. JSON shape: `[{from, to, kind, source}, ...]`.
+    Refs {
+        /// Target artifact ref.
+        artifact_ref: String,
+        /// Project (overrides any project component in `<artifact_ref>`).
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1204,6 +1312,7 @@ fn main() -> Result<()> {
             }))
         }
         Commands::Project { action } => cmd_project(action, cli.json),
+        Commands::Artifact { action } => cmd_artifact(action, cli.json),
     }
 }
 
@@ -5102,4 +5211,586 @@ fn cmd_project(action: ProjectCommands, json: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// =============================================================================
+// Artifact Commands (ISS-053 Phase E)
+// =============================================================================
+//
+// Six kind-agnostic verbs over `gid_core::ArtifactStore`. Behavior differences
+// between artifact kinds live in `Layout`, NOT here — this module must remain
+// invariant under "add a new kind".
+//
+// Reference parsing
+// -----------------
+// Refs accepted by every verb take one of these shapes:
+//   - `<project>:<short_or_path>` — qualified, project resolved via registry.
+//   - `<short_or_path>` — unqualified; project comes from `--project` or cwd.
+//
+// Short forms:
+//   - `<project>:.gid/issues/ISS-001/issue.md` — explicit canonical path.
+//   - `<project>:ISS-001` — short id; resolved by scanning the project for a
+//      pattern slot (`id`, `slug`, `seq`, `name`) that equals the short.
+
+fn cmd_artifact(action: ArtifactCommands, json: bool) -> Result<()> {
+    match action {
+        ArtifactCommands::List { kind, project } => cmd_artifact_list(kind, project, json),
+        ArtifactCommands::Show { artifact_ref, project } => {
+            cmd_artifact_show(&artifact_ref, project, json)
+        }
+        ArtifactCommands::New { kind, project, parent, title, slots } => {
+            cmd_artifact_new(&kind, project, parent, title, slots, json)
+        }
+        ArtifactCommands::Update { artifact_ref, project, fields } => {
+            cmd_artifact_update(&artifact_ref, project, fields, json)
+        }
+        ArtifactCommands::Relate { from, kind, to, project } => {
+            cmd_artifact_relate(&from, &kind, &to, project, json)
+        }
+        ArtifactCommands::Refs { artifact_ref, project } => {
+            cmd_artifact_refs(&artifact_ref, project, json)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Project / ref resolution helpers
+// ---------------------------------------------------------------------------
+
+/// Open an `ArtifactStore` for the project resolved from (in order):
+///   1. explicit `--project` arg
+///   2. project component of `ref_hint` (e.g. `engram:ISS-022` → `engram`)
+///   3. project containing the current working directory (registry walk)
+fn open_store_for(
+    project_arg: Option<&str>,
+    ref_hint: Option<&str>,
+) -> Result<gid_core::ArtifactStore> {
+    use gid_core::ArtifactStore;
+
+    if let Some(name) = project_arg {
+        return ArtifactStore::open(name)
+            .with_context(|| format!("opening artifact store for project '{}'", name));
+    }
+
+    // Try project prefix from ref.
+    if let Some(r) = ref_hint {
+        if let Some((proj, _)) = r.split_once(':') {
+            if !proj.is_empty() {
+                return ArtifactStore::open(proj)
+                    .with_context(|| format!("opening artifact store for project '{}'", proj));
+            }
+        }
+    }
+
+    // Walk up from cwd looking for a project root that's registered.
+    let cwd = std::env::current_dir()?;
+    let project_root = find_artifact_project_root(&cwd).ok_or_else(|| {
+        anyhow!(
+            "no `--project` given and current directory `{}` is not inside a project root \
+             (no `.gid/` ancestor found)",
+            cwd.display()
+        )
+    })?;
+
+    // Look up the project name from the registry by matching the path.
+    let registry = gid_core::project_registry::Registry::load_default()
+        .context("loading project registry (~/.config/gid/projects.yml)")?;
+    let canonical_root = std::fs::canonicalize(&project_root).unwrap_or(project_root.clone());
+    for entry in registry.list(true) {
+        let entry_canonical =
+            std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+        if entry_canonical == canonical_root {
+            return ArtifactStore::open_at(entry.name.clone(), project_root.clone())
+                .with_context(|| {
+                    format!("opening artifact store at `{}`", project_root.display())
+                });
+        }
+    }
+
+    // Not registered: open with project name = root's last path component.
+    let name = project_root
+        .file_name()
+        .and_then(|s: &std::ffi::OsStr| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    ArtifactStore::open_at(name, project_root.clone())
+        .with_context(|| format!("opening artifact store at `{}`", project_root.display()))
+}
+
+/// Find the nearest ancestor of `start` that contains a `.gid/` directory.
+/// (Local helper for artifact commands; distinct from
+/// `gid_core::find_project_root` which has a different signature.)
+fn find_artifact_project_root(start: &Path) -> Option<PathBuf> {
+    let mut cur: &Path = start;
+    loop {
+        if cur.join(".gid").is_dir() {
+            return Some(cur.to_path_buf());
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
+}
+
+/// Strip the `<project>:` prefix from a ref, if present. Returns the part
+/// after the `:` (or the ref unchanged if no prefix).
+fn ref_path_part(r: &str) -> &str {
+    match r.split_once(':') {
+        Some((proj, rest)) if !proj.is_empty() => rest,
+        _ => r,
+    }
+}
+
+/// Resolve a ref string to a canonical [`gid_core::ArtifactId`] within `store`.
+///
+/// Strategy:
+///   1. If the path-part contains `/`, treat as a relative path inside the
+///      project. Accept either `.gid/...` or anything else (we don't enforce).
+///   2. Otherwise, treat as a *short id* and scan `store.list()` for an
+///      artifact whose Layout-extracted slots contain the short as `id`,
+///      `slug`, `seq`, or `name` (in that priority).
+fn resolve_ref(
+    store: &gid_core::ArtifactStore,
+    r: &str,
+) -> Result<gid_core::ArtifactId> {
+    use gid_core::ArtifactId;
+
+    let path_part = ref_path_part(r);
+    if path_part.is_empty() {
+        bail!("empty artifact ref: `{}`", r);
+    }
+    if path_part.contains('/') {
+        return ArtifactId::new(path_part)
+            .with_context(|| format!("parsing ref `{}` as relative path", r));
+    }
+
+    // Short-id resolution: scan and match by slot.
+    let layout = store.layout();
+    let artifacts = store
+        .list(None)
+        .with_context(|| format!("listing artifacts to resolve short ref `{}`", r))?;
+    let mut candidates: Vec<&gid_core::Artifact> = Vec::new();
+    for art in &artifacts {
+        let rel = art.id.as_str().strip_prefix(".gid/").unwrap_or(art.id.as_str());
+        let m = layout.match_path(rel);
+        let hits = ["id", "slug", "name", "seq"]
+            .iter()
+            .any(|k| m.slots.get(*k).map(|v: &String| v.as_str()) == Some(path_part));
+        if hits {
+            candidates.push(art);
+        }
+    }
+    match candidates.len() {
+        0 => bail!(
+            "no artifact in project `{}` matches short ref `{}` \
+             (looked for slots: id, slug, name, seq)",
+            store.project(),
+            path_part
+        ),
+        1 => Ok(candidates[0].id.clone()),
+        _ => bail!(
+            "ambiguous short ref `{}` in project `{}`: matched {} artifacts ({})",
+            path_part,
+            store.project(),
+            candidates.len(),
+            candidates
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verb 1: list
+// ---------------------------------------------------------------------------
+
+fn cmd_artifact_list(
+    kind: Option<String>,
+    project: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let store = open_store_for(project.as_deref(), None)?;
+    let artifacts = store
+        .list(kind.as_deref())
+        .with_context(|| format!("listing artifacts in `{}`", store.project()))?;
+
+    if json {
+        let arr: Vec<serde_json::Value> = artifacts
+            .iter()
+            .map(|a| {
+                let title = a
+                    .metadata
+                    .get("title")
+                    .and_then(|v| v.as_scalar().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "project": store.project(),
+                    "path": a.id.as_str(),
+                    "kind": a.kind,
+                    "title": title,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(arr));
+    } else {
+        if artifacts.is_empty() {
+            eprintln!(
+                "(no artifacts{}{} in project '{}')",
+                kind.as_deref().map(|k| format!(" of kind '{}'", k)).unwrap_or_default(),
+                "",
+                store.project()
+            );
+            return Ok(());
+        }
+        for a in &artifacts {
+            let title = a
+                .metadata
+                .get("title")
+                .and_then(|v| v.as_scalar().map(|s| s.to_string()))
+                .unwrap_or_default();
+            println!(
+                "{:<10}  {:<60}  {}",
+                a.kind,
+                a.id.as_str(),
+                title
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Verb 2: show
+// ---------------------------------------------------------------------------
+
+fn cmd_artifact_show(
+    artifact_ref: &str,
+    project: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let store = open_store_for(project.as_deref(), Some(artifact_ref))?;
+    let id = resolve_ref(&store, artifact_ref)?;
+    let art = store
+        .get(&id)
+        .with_context(|| format!("loading artifact `{}`", id.as_str()))?
+        .ok_or_else(|| anyhow!(
+            "artifact not found: project=`{}` path=`{}`",
+            store.project(),
+            id.as_str()
+        ))?;
+
+    if json {
+        println!("{}", artifact_to_json(&store, &art));
+    } else {
+        println!("# {} ({})", art.id.as_str(), art.kind);
+        println!("project: {}", store.project());
+        if !art.metadata.is_empty() {
+            println!("---");
+            for (k, v) in art.metadata.fields() {
+                match v {
+                    gid_core::FieldValue::Scalar(s) => println!("{}: {}", k, s),
+                    gid_core::FieldValue::List(items) => {
+                        println!("{}: [{}]", k, items.join(", "))
+                    }
+                }
+            }
+            println!("---");
+        }
+        print!("{}", art.body);
+    }
+    Ok(())
+}
+
+fn artifact_to_json(
+    store: &gid_core::ArtifactStore,
+    art: &gid_core::Artifact,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    for (k, v) in art.metadata.fields() {
+        let val = match v {
+            gid_core::FieldValue::Scalar(s) => serde_json::Value::String(s.clone()),
+            gid_core::FieldValue::List(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        };
+        metadata.insert(k.to_string(), val);
+    }
+    serde_json::json!({
+        "id": {
+            "project": store.project(),
+            "path": art.id.as_str(),
+        },
+        "kind": art.kind,
+        "metadata": metadata,
+        "body": art.body,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Verb 3: new
+// ---------------------------------------------------------------------------
+
+fn cmd_artifact_new(
+    kind: &str,
+    project: Option<String>,
+    parent: Option<String>,
+    title: Option<String>,
+    slot_args: Vec<String>,
+    json: bool,
+) -> Result<()> {
+    use gid_core::{FieldValue, MetaSourceHint, Metadata};
+
+    let store = open_store_for(project.as_deref(), None)?;
+
+    // Parse slot key=value args.
+    let mut slots = gid_core::SlotMap::new();
+    for raw in &slot_args {
+        let (k, v) = raw.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "expected positional slot arg in `key=value` form, got `{}`",
+                raw
+            )
+        })?;
+        slots.insert(k.trim().to_string(), v.trim().to_string());
+    }
+
+    // Resolve parent (if supplied).
+    let parent_id = if let Some(p) = parent.as_deref() {
+        Some(resolve_ref(&store, p)?)
+    } else {
+        None
+    };
+
+    let path = store
+        .next_path(kind, parent_id.as_ref(), &slots)
+        .with_context(|| format!("allocating new path for kind `{}`", kind))?;
+
+    // Build minimal frontmatter (title only, if given).
+    let mut metadata = Metadata::new(MetaSourceHint::Frontmatter);
+    if let Some(t) = title.as_deref() {
+        metadata.set_field("title", FieldValue::Scalar(t.to_string()));
+    }
+
+    let body = "\n";
+    let art = store
+        .create(&path, metadata, body)
+        .with_context(|| format!("creating artifact at `{}`", path.display()))?;
+
+    if json {
+        println!("{}", artifact_to_json(&store, &art));
+    } else {
+        eprintln!(
+            "✓ Created {} ({}) at {}",
+            art.id.as_str(),
+            art.kind,
+            store.project_root().join(art.id.as_path()).display()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Verb 4: update
+// ---------------------------------------------------------------------------
+
+fn cmd_artifact_update(
+    artifact_ref: &str,
+    project: Option<String>,
+    fields: Vec<String>,
+    json: bool,
+) -> Result<()> {
+    use gid_core::FieldValue;
+
+    let store = open_store_for(project.as_deref(), Some(artifact_ref))?;
+    let id = resolve_ref(&store, artifact_ref)?;
+    let mut art = store
+        .get(&id)
+        .with_context(|| format!("loading artifact `{}`", id.as_str()))?
+        .ok_or_else(|| anyhow!(
+            "artifact not found: project=`{}` path=`{}`",
+            store.project(),
+            id.as_str()
+        ))?;
+
+    if fields.is_empty() {
+        bail!("`gid artifact update` requires at least one --field key=value");
+    }
+    for raw in &fields {
+        let (k, v) = raw.split_once('=').ok_or_else(|| {
+            anyhow!("--field expects `key=value`, got `{}`", raw)
+        })?;
+        let key = k.trim().to_string();
+        let value = v.trim();
+        let fv = if value.contains(',') {
+            FieldValue::List(value.split(',').map(|s| s.trim().to_string()).collect())
+        } else {
+            FieldValue::Scalar(value.to_string())
+        };
+        art.metadata.set_field(&key, fv);
+    }
+
+    store
+        .update(&art)
+        .with_context(|| format!("writing updated artifact `{}`", art.id.as_str()))?;
+
+    if json {
+        println!("{}", artifact_to_json(&store, &art));
+    } else {
+        eprintln!(
+            "✓ Updated {} ({} fields)",
+            art.id.as_str(),
+            fields.len()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Verb 5: relate
+// ---------------------------------------------------------------------------
+
+fn cmd_artifact_relate(
+    from: &str,
+    relation_kind: &str,
+    to: &str,
+    project: Option<String>,
+    json: bool,
+) -> Result<()> {
+    use gid_core::{merge_list, FieldValue};
+
+    // Source store: from project arg, prefix on `from`, or cwd.
+    let from_store = open_store_for(project.as_deref(), Some(from))?;
+    let from_id = resolve_ref(&from_store, from)?;
+
+    // For `to`, we don't need to open its store — we just need the ref string
+    // to embed in the source frontmatter. Honor the project prefix verbatim
+    // (qualified ref like `engram:ISS-022`) or use the source's project as
+    // the implicit one (unqualified ref → relative path within from_store).
+    let to_token: String = if to.contains(':') {
+        to.to_string()
+    } else {
+        // Resolve within the source project to a canonical path so the
+        // recorded edge is unambiguous.
+        let resolved = resolve_ref(&from_store, to)?;
+        resolved.as_str().to_string()
+    };
+
+    // Load source artifact and append `to_token` to the relation field.
+    let mut art = from_store
+        .get(&from_id)
+        .with_context(|| format!("loading artifact `{}`", from_id.as_str()))?
+        .ok_or_else(|| anyhow!(
+            "source artifact not found: project=`{}` path=`{}`",
+            from_store.project(),
+            from_id.as_str()
+        ))?;
+
+    let existing: Vec<String> = art
+        .metadata
+        .get(relation_kind)
+        .map(|v| v.as_list())
+        .unwrap_or_default();
+    let merged = merge_list(&existing, &[to_token.clone()]);
+    let new_value = if merged.len() == 1 {
+        FieldValue::Scalar(merged.into_iter().next().unwrap())
+    } else {
+        FieldValue::List(merged)
+    };
+    art.metadata.set_field(relation_kind, new_value);
+
+    from_store
+        .update(&art)
+        .with_context(|| format!("writing updated artifact `{}`", art.id.as_str()))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "from": {
+                    "project": from_store.project(),
+                    "path": art.id.as_str(),
+                },
+                "kind": relation_kind,
+                "to": to_token,
+            })
+        );
+    } else {
+        eprintln!(
+            "✓ Related {}:{} -[{}]-> {}",
+            from_store.project(),
+            art.id.as_str(),
+            relation_kind,
+            to_token
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Verb 6: refs
+// ---------------------------------------------------------------------------
+
+fn cmd_artifact_refs(
+    artifact_ref: &str,
+    project: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let store = open_store_for(project.as_deref(), Some(artifact_ref))?;
+    let id = resolve_ref(&store, artifact_ref)?;
+    let rels = store
+        .relations_to(&id)
+        .with_context(|| format!("scanning incoming relations to `{}`", id.as_str()))?;
+
+    if json {
+        let arr: Vec<serde_json::Value> = rels
+            .iter()
+            .map(|r| {
+                let source = match &r.source {
+                    gid_core::RelationSource::Frontmatter { field } => {
+                        serde_json::json!({"type": "frontmatter", "field": field})
+                    }
+                    gid_core::RelationSource::MarkdownLink => {
+                        serde_json::json!({"type": "markdown_link"})
+                    }
+                    gid_core::RelationSource::BacktickRef => {
+                        serde_json::json!({"type": "backtick_ref"})
+                    }
+                    gid_core::RelationSource::DirectoryNesting => {
+                        serde_json::json!({"type": "directory_nesting"})
+                    }
+                };
+                serde_json::json!({
+                    "from": r.from.as_str(),
+                    "to": r.to.as_str(),
+                    "kind": r.kind,
+                    "source": source,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(arr));
+    } else {
+        if rels.is_empty() {
+            eprintln!("(no references to {})", id.as_str());
+            return Ok(());
+        }
+        for r in &rels {
+            let src = match &r.source {
+                gid_core::RelationSource::Frontmatter { field } => {
+                    format!("frontmatter:{}", field)
+                }
+                gid_core::RelationSource::MarkdownLink => "markdown_link".into(),
+                gid_core::RelationSource::BacktickRef => "backtick_ref".into(),
+                gid_core::RelationSource::DirectoryNesting => "directory_nesting".into(),
+            };
+            println!("{}  -[{}]->  {}  ({})", r.from.as_str(), r.kind, r.to.as_str(), src);
+        }
+    }
+    Ok(())
 }

@@ -1079,17 +1079,17 @@ mod tests {
         let sb = Sandbox::new("nextid_empty");
         let store = sb.store();
         let id = store.next_id("issue", None).unwrap();
-        assert_eq!(id, "ISS-0001");
+        assert_eq!(id, "ISS-001");
     }
 
     #[test]
     fn next_id_increments_past_existing_max() {
         let sb = Sandbox::new("nextid_inc");
-        sb.write(".gid/issues/ISS-0042/issue.md", &issue_body("x"));
-        sb.write(".gid/issues/ISS-0007/issue.md", &issue_body("y"));
+        sb.write(".gid/issues/ISS-042/issue.md", &issue_body("x"));
+        sb.write(".gid/issues/ISS-007/issue.md", &issue_body("y"));
         let store = sb.store();
         let id = store.next_id("issue", None).unwrap();
-        assert_eq!(id, "ISS-0043");
+        assert_eq!(id, "ISS-043");
     }
 
     #[test]
@@ -1117,16 +1117,16 @@ mod tests {
         let sb = Sandbox::new("nextpath_issue");
         let store = sb.store();
         let path = store.next_path("issue", None, &SlotMap::new()).unwrap();
-        assert_eq!(path, PathBuf::from(".gid/issues/ISS-0001/issue.md"));
+        assert_eq!(path, PathBuf::from(".gid/issues/ISS-001/issue.md"));
     }
 
     #[test]
     fn next_path_with_existing_artifacts_continues_sequence() {
         let sb = Sandbox::new("nextpath_seq");
-        sb.write(".gid/issues/ISS-0050/issue.md", &issue_body("x"));
+        sb.write(".gid/issues/ISS-050/issue.md", &issue_body("x"));
         let store = sb.store();
         let path = store.next_path("issue", None, &SlotMap::new()).unwrap();
-        assert_eq!(path, PathBuf::from(".gid/issues/ISS-0051/issue.md"));
+        assert_eq!(path, PathBuf::from(".gid/issues/ISS-051/issue.md"));
     }
 
     #[test]
@@ -1288,11 +1288,11 @@ mod tests {
             Some("b")
         );
 
-        // next_id is project-scoped — both projects independently land on 0051.
+        // next_id is project-scoped — both projects independently land on 051.
         let next_a = store_a.next_id("issue", None).unwrap();
         let next_b = store_b.next_id("issue", None).unwrap();
-        assert_eq!(next_a, "ISS-0051");
-        assert_eq!(next_b, "ISS-0051");
+        assert_eq!(next_a, "ISS-051");
+        assert_eq!(next_b, "ISS-051");
     }
 
     // ----- find_references_to_in_projects -------------------------------

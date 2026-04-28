@@ -35,6 +35,19 @@ pub use graph::*;
 pub use slugify::slugify;
 pub use query::{QueryEngine, QueryResult, DEFAULT_MIN_CONFIDENCE};
 pub use parser::{load_graph, save_graph, find_graph_file, find_graph_file_walk_up, find_project_root};
+
+// Artifact layer (ISS-053)
+pub use artifact::{
+    Artifact, ArtifactError, ArtifactId, ArtifactIdError,
+    ArtifactStore, FieldValue, Layout, LayoutError, LayoutPattern,
+    MatchResult, MetaSourceHint, Metadata, MetadataError,
+    Relation, RelationError, RelationSource, SeqScope, SlotMap,
+    StoreError,
+};
+pub use artifact::metadata::merge_list;
+pub use artifact::store::{
+    find_references_to, find_references_to_in_projects, resolve, resolve_in,
+};
 pub use code_graph::{
     CodeGraph, CodeNode, CodeEdge, NodeKind, EdgeRelation, Language,
     ImpactReport, CausalChain, ChainNode,

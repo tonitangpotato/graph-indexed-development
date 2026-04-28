@@ -143,7 +143,7 @@ fn default_patterns() -> Vec<LayoutPattern> {
     use MetaSourceHint::None as MNone;
     vec![
         LayoutPattern {
-            pattern: "issues/{id:ISS-{seq:04}}/issue.md".into(),
+            pattern: "issues/{id:ISS-{seq:03}}/issue.md".into(),
             kind: "issue".into(),
             metadata_format: FM,
             seq_scope: SeqScope::Project,
@@ -770,25 +770,25 @@ mod tests {
     fn resolve_issue_with_id_slot() {
         let layout = Layout::default();
         let path = layout
-            .resolve("issue", &slots_of(&[("id", "ISS-0042")]))
+            .resolve("issue", &slots_of(&[("id", "ISS-042")]))
             .unwrap();
-        assert_eq!(path, PathBuf::from("issues/ISS-0042/issue.md"));
+        assert_eq!(path, PathBuf::from("issues/ISS-042/issue.md"));
     }
 
     #[test]
     fn resolve_issue_with_seq_only() {
         let layout = Layout::default();
         let path = layout
-            .resolve("issue", &slots_of(&[("seq", "0042")]))
+            .resolve("issue", &slots_of(&[("seq", "042")]))
             .unwrap();
-        assert_eq!(path, PathBuf::from("issues/ISS-0042/issue.md"));
+        assert_eq!(path, PathBuf::from("issues/ISS-042/issue.md"));
     }
 
     #[test]
     fn resolve_issue_with_short_seq_pads() {
         let layout = Layout::default();
         let path = layout.resolve("issue", &slots_of(&[("seq", "5")])).unwrap();
-        assert_eq!(path, PathBuf::from("issues/ISS-0005/issue.md"));
+        assert_eq!(path, PathBuf::from("issues/ISS-005/issue.md"));
     }
 
     #[test]
@@ -827,10 +827,10 @@ mod tests {
     fn resolve_seq_overflow_errors() {
         let layout = Layout::default();
         let err = layout
-            .resolve("issue", &slots_of(&[("seq", "100000")]))
+            .resolve("issue", &slots_of(&[("seq", "10000")]))
             .unwrap_err();
         match err {
-            LayoutError::SeqExhausted { max, .. } => assert_eq!(max, 9999),
+            LayoutError::SeqExhausted { max, .. } => assert_eq!(max, 999),
             other => panic!("expected SeqExhausted, got {:?}", other),
         }
     }
