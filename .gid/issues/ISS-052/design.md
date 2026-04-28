@@ -292,6 +292,14 @@ pub trait RitualHooks: Send + Sync {
     /// simpler poll model; mid-action cancellation (e.g. interrupting an
     /// in-progress LLM turn) is out of scope for this design and tracked as
     /// a follow-up if it surfaces as a real UX problem.
+    ///
+    /// **Follow-up shape (FINDING-13):** if the up-to-N-minutes latency does
+    /// surface in practice, the planned addition is a second optional hook
+    /// `should_cancel_during(&action: &RitualAction) -> Option<CancelReason>`
+    /// that long-running actions (skills, harness) can poll mid-execution.
+    /// Keeping it optional preserves the simple top-of-action poll for
+    /// embedders that don't care; the richer signature is purely additive.
+    /// Not added in this PR.
     fn should_cancel(&self) -> Option<CancelReason> { None }
 }
 
@@ -668,12 +676,22 @@ async fn persist_state(&self, state: &RitualState) -> RitualEvent {
             Err(e) => {
                 last_error = e.to_string();
                 if attempt < MAX_ATTEMPTS {
-                    // Note: per FINDING-15 follow-up, per-attempt notify spam
-                    // should be suppressed and replaced with a single summary
-                    // notify on final outcome. Tracked as deferred follow-up.
-                    self.hooks.notify(&format!(
-                        "⚠️ state persist attempt {attempt}/{MAX_ATTEMPTS} failed: {e}; retrying"
-                    )).await;
+                    // FINDING-15: per-attempt notify here produces 2 ⚠️
+                    // Telegram messages within ~1.3s for transient FS errors.
+                    // Resolution: wrap behind a `verbose_retries: bool` flag
+                    // on `V2ExecutorConfig` (default `false`). When `false`,
+                    // skip the per-attempt notify and emit a single summary
+                    // notify from the final-outcome path (the
+                    // `StatePersistFailed` arm in §6.3 already does this on
+                    // exhaustion; the `StatePersisted` arm can stay quiet).
+                    // When `true`, the current per-attempt notify is kept
+                    // for debugging. Implementation is one if-guard around
+                    // the `notify` call below; tracked as deferred polish.
+                    if self.config.verbose_retries {
+                        self.hooks.notify(&format!(
+                            "⚠️ state persist attempt {attempt}/{MAX_ATTEMPTS} failed: {e}; retrying"
+                        )).await;
+                    }
                     tokio::time::sleep(BACKOFF[(attempt as usize) - 1]).await;
                 }
             }
@@ -771,6 +789,102 @@ The state machine emits `SaveState { kind: Boundary }` on phase transitions and 
 This is the key compromise:
 - **Disk full mid-implement-phase (Periodic save)** → don't lose 20 minutes of LLM work; flag, retry on next periodic save.
 - **Disk full at phase boundary (Boundary save)** → fail loudly; we cannot guarantee the next phase starts from a known state.
+
+##### 6.3.3.a Worked pseudo-code (FINDING-20)
+
+The table above is the spec. The fragment below is the corresponding Rust shape
+of the `StatePersistFailed` arm, expanded to make the increment / reset /
+terminate paths concrete. It is not the full transition function — only the
+arm relevant to §6.3 — and is meant to remove ambiguity for the implementer
+without locking in line-level structure.
+
+```rust
+match (state.phase.clone(), event) {
+    // ── Periodic save failure: degrade, count, terminate at 5 ──
+    (phase, RitualEvent::StatePersistFailed { kind: SaveStateKind::Periodic, error, .. }) => {
+        match state.persist_degraded.as_mut() {
+            // First failure in a fresh degradation window.
+            None => {
+                state.persist_degraded = Some(PersistDegradedInfo {
+                    since_phase: phase.clone(),
+                    last_error: error.clone(),
+                    consecutive_failures: 1,
+                });
+                actions.push(RitualAction::Notify {
+                    message: format!(
+                        "⚠️ ritual continuing in-memory only, persist failed: {error}"
+                    ),
+                });
+                // No phase change — ritual continues in `phase`.
+            }
+            // Continuing degradation — bump counter, keep going.
+            Some(info) if info.consecutive_failures < 4 => {
+                info.consecutive_failures += 1;
+                info.last_error = error.clone();
+                // No notify (FINDING-15: per-attempt spam suppressed by default;
+                // single recovery / abort notify is sufficient).
+            }
+            // Fifth consecutive failure → terminate.
+            Some(info) => {
+                debug_assert_eq!(info.consecutive_failures, 4,
+                    "guard above must keep us at 4 here");
+                state.phase = RitualPhase::Failed;
+                state.failed_phase = Some(phase);
+                actions.push(RitualAction::Notify {
+                    message: format!(
+                        "❌ ritual aborted — 5 consecutive persist failures: {error}"
+                    ),
+                });
+            }
+        }
+    }
+
+    // ── Periodic save success while degraded: clear flag, notify recovery ──
+    (_, RitualEvent::StatePersisted { kind: SaveStateKind::Periodic, .. }) => {
+        if let Some(info) = state.persist_degraded.take() {
+            actions.push(RitualAction::Notify {
+                message: format!(
+                    "✅ persistence recovered after {} failed attempts",
+                    info.consecutive_failures
+                ),
+            });
+        }
+        // Steady-state success (`persist_degraded == None`) is a no-op —
+        // intentionally not represented here.
+    }
+
+    // ── Boundary failure: abort regardless of degraded state. ──
+    (phase, RitualEvent::StatePersistFailed { kind: SaveStateKind::Boundary, error, .. }) => {
+        // Boundary failures NEVER set persist_degraded — the next phase
+        // requires a known-persisted prior, which we cannot offer.
+        state.phase = RitualPhase::Failed;  // or Escalated, per §6.3 row 1
+        state.failed_phase = Some(phase);
+        actions.push(RitualAction::Notify {
+            message: format!(
+                "❌ could not persist state at phase boundary: {error}"
+            ),
+        });
+        // Note: persist_degraded field is left as-is on the final state (for
+        // post-mortem); the `failed_phase` is what callers branch on.
+    }
+
+    // … other arms unchanged …
+}
+```
+
+Implementer notes:
+- The `consecutive_failures < 4` guard in the second arm is exact — the next
+  failure (which would push it to 5) is the terminate branch, not the
+  increment branch. This matches §6.3.3 row 3 (`< 4` → bump) and row 4
+  (`== 4` → terminate-at-5).
+- The `Boundary` failure arm does not look at `persist_degraded`. By design:
+  the side-channel only handles the Periodic-recoverable case; Boundary is
+  unconditionally fatal.
+- `actions` is the existing `Vec<RitualAction>` accumulator the surrounding
+  `transition` function returns; this fragment only shows pushes onto it.
+- Notify messages are `RitualAction::Notify` not direct hook calls — the
+  state-machine arm stays pure (§5 invariant), and the dispatcher executes
+  the notify via `hooks.notify` per §5.2.
 
 #### 6.3.4 Persistence of the flag itself
 
@@ -1034,7 +1148,14 @@ For an `implement` skill running in a ritual:
 
 ### 8.4 Side benefit: gate 2 testability
 
-Self-review subloop is now in V2Executor, which already has `ScriptedLlm` test infrastructure (`v2_executor.rs:1781+`). Adding a "subloop hits turn limit on every turn" test is ~30 LOC of test setup, vs. the current rustclaw-side path which has no LLM scripting harness at all.
+Self-review subloop is **ported into V2Executor** by this PR (rewritten + adapted
++ extended with the new turn-limit gate; not a relocation of an existing
+identical function). V2Executor already has `ScriptedLlm` test infrastructure
+(`v2_executor.rs:1781+`), so adding a "subloop hits turn limit on every turn"
+test is ~30 LOC of test setup, vs. the current rustclaw-side path which has no
+LLM scripting harness at all. (FINDING-18: scope is "port + fix," not "fix" —
+the §7.4 commit ordering reflects this; commit 3b explicitly ports the subloop
+before commit 3c lights the new gate.)
 
 ## §9. Testing Strategy
 
@@ -1190,6 +1311,33 @@ If post-release issues:
 - gid-core: yank the bad version, release a `.1` patch with revert. rustclaw can pin to previous.
 - rustclaw: revert the upgrade commit, rebuild. Old `ritual_runner.rs` is in git history.
 
+**Rollback window** (FINDING-19): the inexpensive rollback path closes at
+`cargo publish`. Before publish, reverting is a single commit on the path-dep
+build. After publish, rollback requires a `cargo yank` plus a `.1` patch
+release — possible but disruptive (any downstream that already pulled the bad
+version must re-resolve). Therefore the manual acceptance run (§9.5) and the
+zero-file regression test (§12 AC5) **must pass on the path-dep build before
+`cargo publish` is invoked.** The path-dep stage is the last cheap rollback
+checkpoint; treat it as a release gate, not a formality.
+
+### 10.6 Cross-repo issue closeout (FINDING-11)
+
+This PR closes one issue in this repo (gid-rs) and resolves three related
+issues whose surface lives partly here, partly in rustclaw. The closeout map:
+
+| Issue | Repo | Closes when this PR lands? | Why |
+|---|---|---|---|
+| **gid-rs ISS-052** | gid-rs | Yes — closed by this PR | This PR *is* ISS-052. |
+| **gid-rs ISS-038** (zero-file gate) | gid-rs | Yes | The Required-policy zero-file gate now lives in `V2Executor::run_skill` (§5.2 / §5.3) and applies to all rituals via the single dispatcher path. The previous rustclaw-side gate is deleted. |
+| **gid-rs ISS-039** (self-review subloop missing turn-limit gate) | gid-rs | Yes | §8.2 ports the subloop into V2Executor and adds the `LlmTurnLimitNoVerdict` failure path. Old rustclaw-side subloop is deleted. |
+| **gid-rs ISS-051** (save_state silent failure) | gid-rs | Yes — main fix; T08 follow-up tracked separately | §6 makes persistence a first-class action with retry + `StatePersisted` / `StatePersistFailed` events and a `persist_degraded` side-channel. The remaining `T08` work (wiring the `RitualAction::SaveState` dispatcher arm through `persist_state` so the events flow back into the state machine, rather than only through direct test calls) is captured in ISS-051's Progress section as a deferred follow-up post-0.4.0 publish. |
+| **rustclaw ISS-052** (artifact↔graph sync) | rustclaw | No — separate scope | Tracked in rustclaw's own ISS-052; depends on gid-rs ISS-053 (ArtifactStore). Independent of this PR. |
+
+CHANGELOG entries for the three gid-rs follow-on closeouts (ISS-038/039/051)
+are written in §10.1's CHANGELOG section, not as separate release notes — the
+issues collapse into "ISS-052 ritual-runtime consolidation" from the
+downstream consumer's perspective.
+
 ---
 
 ## §11. Risks & Open Questions
@@ -1243,7 +1391,16 @@ This design is "done" when:
 
 - **AC1.** `rustclaw/src/ritual_runner.rs` line count reduced by ≥1500 LOC (final state, measured at end of T13b).
 - **AC2.** `cargo test --all` passes in both repos against the new gid-core. **Must hold at every commit boundary** — T12, T13a, and T13b each leave the workspace green.
-- **AC3.** `grep -rn "match action" rustclaw/src/` returns **zero** matches against `RitualAction` variants. (Single-dispatcher invariant — measured at end of T13b.)
+- **AC3.** Single-dispatcher invariant — measured at end of T13b. Combined check (FINDING-16: the bare `grep "match action"` is too narrow / too broad — false negatives on `match &action` / `match dispatch.action`, false positives on string literals and comments):
+  - **AC3a (no rustclaw-side dispatch):**
+    `grep -rnE "match\s+(\&?\w+\.)?action\b" rustclaw/src/ | grep -v "//\|/\*"`
+    returns **zero** matches against `RitualAction` variants.
+  - **AC3b (file size budget):**
+    `wc -l rustclaw/src/ritual_runner.rs` ≤ 800 (post-deletion target).
+  - Both conditions must hold. AC3a alone admits a 2000-line file that
+    happens to lack the literal substring; AC3b alone admits a small file
+    that still contains a `match &dispatch.action` block. Together they
+    pin both surface and structure.
 - **AC4.** New gid-core test `skill_required_zero_files_fails` passes (gate runs).
 - **AC5.** New rustclaw integration test `zero_file_implement_fails_in_prod` passes (gate runs in production path — r-950ebf regression test).
 - **AC6.** New gid-core test `subloop_turn_limit_all_attempts_fails` passes (rustclaw ISS-051 gate).

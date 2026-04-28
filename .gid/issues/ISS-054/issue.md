@@ -1,12 +1,61 @@
 ---
 id: "ISS-054"
 title: "ISS-052 design — deferred refinements (9 follow-up findings)"
-status: open
+status: closed
 priority: P2
 created: 2026-04-27
+closed: 2026-04-28
 severity: low
 related: ["ISS-052"]
 ---
+
+## Resolution (2026-04-28)
+
+All 7 actionable deferred findings applied to `.gid/issues/ISS-052/design.md` in
+a single doc-polish pass:
+
+- **FINDING-11** — §10.6 added: cross-repo issue closeout table mapping
+  ISS-052 / ISS-038 / ISS-039 / ISS-051 closure status to this PR. Captures
+  why ISS-051 closes "main fix only" with T08 wiring deferred.
+- **FINDING-13** — §4 `should_cancel` doc extended: documents the planned
+  `should_cancel_during(&action)` follow-up shape and why it's not added in
+  this PR (additive, no urgency until the up-to-N-min latency surfaces).
+- **FINDING-15** — §6.2 retry notify: replaced free-standing `notify` with a
+  `verbose_retries: bool` config flag (default `false`). Spec-grade comment
+  explains the spam reduction and points at the single-summary path that
+  takes over when the flag is `false`.
+- **FINDING-16** — §12 AC3 split into AC3a (regex `match\s+(\&?\w+\.)?action\b`
+  excluding comment lines) + AC3b (`wc -l` ≤ 800). Both must hold; rationale
+  for the AND included inline.
+- **FINDING-18** — §8.4 wording: "subloop is now in V2Executor" → "ported
+  into V2Executor (rewritten + adapted + extended with the new turn-limit
+  gate; not a relocation of an existing identical function)". Also points at
+  §7.4 commit ordering 3b/3c reflecting the port-then-light-gate sequence.
+- **FINDING-19** — §10.5 rollback window: `cargo publish` is the gate;
+  manual acceptance + AC5 zero-file regression test must pass on the
+  path-dep build before publish. After publish, rollback = `yank` + `.1`.
+- **FINDING-20** — §6.3.3.a worked Rust pseudo-code for the
+  `StatePersistFailed` arm (Periodic increment / reset, Boundary abort).
+  Removes ambiguity between the table's "increment" and "terminate at 5"
+  rows; calls out that boundary failures never touch `persist_degraded`.
+
+Two additional minor items from the review summary that were already
+addressed elsewhere:
+
+- **Trait coherence between `RitualHooks` defaults and tests** — covered by
+  FINDING-12 (already applied in r1 → in-place edits before this issue was
+  filed; no further work).
+- **`RitualEvent` enum naming clash** — FINDING-3 disambiguates inline. A
+  rename of either enum is a separate, larger refactor and **explicitly
+  not in scope** for ISS-054 (not pursued).
+
+Net design.md change: ~165 lines added across 7 sections (§4, §6.2, §6.3,
+§8.4, §10.5, §10.6, §12 AC3). No code change. No behavioral change. Pure
+clarity / precision uplift on the in-PR-archive design document.
+
+---
+
+
 # ISS-054 — ISS-052 design refinements (deferred from r1 review)
 
 **Status:** open
