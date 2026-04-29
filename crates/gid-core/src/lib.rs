@@ -26,6 +26,8 @@ pub mod watch;
 pub mod project_registry;
 pub mod artifact;
 pub mod backfill_doc_path;
+pub mod config;
+pub mod validate;
 
 // Ritual module (requires "ritual" feature)
 #[cfg(feature = "ritual")]

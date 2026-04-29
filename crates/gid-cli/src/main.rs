@@ -80,8 +80,17 @@ enum Commands {
         layer: LayerFilter,
     },
 
-    /// Validate the graph (cycles, orphans, missing refs)
-    Validate,
+    /// Validate the graph (cycles, orphans, missing refs).
+    ///
+    /// `--check-drift` (ISS-059) additionally compares the graph against
+    /// the `.gid/` artifact tree and reports drift findings (artifacts
+    /// without nodes, nodes without artifacts, status mismatches). Exits
+    /// non-zero if any error-severity drift is found.
+    Validate {
+        /// Enable drift detection between graph and .gid/ artifacts (ISS-059).
+        #[arg(long)]
+        check_drift: bool,
+    },
 
     /// Back-fill `doc_path` on graph nodes per ISS-058 §3.4 conventions.
     ///
@@ -1045,9 +1054,9 @@ fn main() -> Result<()> {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_read_ctx(&ctx, layer, cli.json)
         }
-        Commands::Validate => {
+        Commands::Validate { check_drift } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
-            cmd_validate_ctx(&ctx, cli.json)
+            cmd_validate_ctx(&ctx, check_drift, cli.json)
         }
         Commands::BackfillDocPath { apply, verbose } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
@@ -1431,12 +1440,54 @@ fn cmd_read_ctx(ctx: &GraphContext, layer: LayerFilter, json: bool) -> Result<()
     Ok(())
 }
 
-fn cmd_validate_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
+fn cmd_validate_ctx(ctx: &GraphContext, check_drift: bool, json: bool) -> Result<()> {
     let graph = ctx.load()?;
     let validator = Validator::new(&graph);
     let result = validator.validate();
+
+    // Optional drift detection (ISS-059). Runs after graph-internal validation
+    // so the order matches user expectation (cycles/orphans first, then "the
+    // graph drifted from .gid/"). Drift findings have their own severity and
+    // contribute their own bit to the non-zero exit code.
+    let drift_report: Option<gid_core::validate::drift::DriftReport> = if check_drift {
+        let project_root = ctx
+            .gid_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| ctx.gid_dir.clone());
+        let project_config = gid_core::config::load_project_config(&project_root);
+        // Resolve the artifact store rooted at the same project so drift's
+        // disk walk and the graph's `doc_path` values are talking about the
+        // same `.gid/` tree.
+        let project_name = project_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        match gid_core::artifact::store::ArtifactStore::open_at(
+            project_name,
+            project_root.clone(),
+        ) {
+            Ok(store) => Some(gid_core::validate::drift::check_drift(
+                &graph,
+                &store,
+                &project_root,
+                &project_config.drift,
+            )),
+            Err(e) => {
+                // Hard-failing here would defeat drift's purpose (it must run
+                // on half-broken projects). Surface the issue and continue
+                // with graph-only validation.
+                eprintln!("warning: drift detection skipped — could not open artifact store: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if json {
-        println!("{}", serde_json::json!({
+        let mut payload = serde_json::json!({
             "valid": result.is_valid(),
             "issues": result.issue_count(),
             "orphan_nodes": result.orphan_nodes,
@@ -1445,11 +1496,35 @@ fn cmd_validate_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
             }).collect::<Vec<_>>(),
             "cycles": result.cycles,
             "duplicate_nodes": result.duplicate_nodes,
-        }));
+        });
+        if let Some(ref report) = drift_report {
+            payload["drift"] = serde_json::to_value(report)
+                .unwrap_or_else(|_| serde_json::json!({"error": "serialize drift report failed"}));
+        }
+        println!("{}", payload);
     } else {
         println!("{}", result);
+        if let Some(ref report) = drift_report {
+            let rendered = gid_core::validate::drift::render_text(report);
+            if !rendered.is_empty() {
+                println!("\n--- drift detection (ISS-059) ---\n{}", rendered);
+            } else if check_drift {
+                println!("\n--- drift detection (ISS-059) ---");
+                println!("✓ no drift");
+            }
+        }
     }
-    if !result.is_valid() {
+
+    let drift_has_errors = drift_report
+        .as_ref()
+        .map(|r| {
+            r.findings
+                .iter()
+                .any(|f| matches!(f.severity, gid_core::validate::drift::Severity::Error))
+        })
+        .unwrap_or(false);
+
+    if !result.is_valid() || drift_has_errors {
         std::process::exit(1);
     }
     Ok(())
