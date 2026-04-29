@@ -83,6 +83,27 @@ enum Commands {
     /// Validate the graph (cycles, orphans, missing refs)
     Validate,
 
+    /// Back-fill `doc_path` on graph nodes per ISS-058 §3.4 conventions.
+    ///
+    /// Walks every node where `doc_path IS NULL` and computes the canonical
+    /// artifact path from `node_type` + `id` (issue → `.gid/issues/<id>/issue.md`,
+    /// feature/design → `.gid/features/<slug>/design.md`, review →
+    /// `.gid/features/<feat>/reviews/<name>.md`). Code-layer nodes (task, code,
+    /// function, class, etc.) legitimately have no canonical doc and stay NULL.
+    ///
+    /// Default mode is dry-run — prints a per-node plan and totals without
+    /// touching the database. Pass `--apply` to actually write the inferred
+    /// paths back via the existing storage layer.
+    BackfillDocPath {
+        /// Apply the inferred updates. Without this flag the command is read-only.
+        #[arg(long)]
+        apply: bool,
+
+        /// Print every entry (default: only fillable + skipped-missing rows).
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Repair the graph: remove orphan edges, duplicate nodes/edges, self-edges.
     ///
     /// By default runs in interactive mode: shows a plan and asks for confirmation
@@ -1028,6 +1049,10 @@ fn main() -> Result<()> {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_validate_ctx(&ctx, cli.json)
         }
+        Commands::BackfillDocPath { apply, verbose } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_backfill_doc_path_ctx(&ctx, apply, verbose, cli.json)
+        }
         Commands::Repair {
             orphan_edges,
             orphan_nodes,
@@ -1426,6 +1451,165 @@ fn cmd_validate_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
     }
     if !result.is_valid() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Implements `gid backfill-doc-path` (ISS-058 §3.4).
+///
+/// Default = dry-run: prints per-node outcomes + totals, no writes. With
+/// `--apply`, persists the inferred `doc_path` values back via the storage
+/// layer (round-trips through whichever backend `ctx` resolved to — the
+/// SQLite path is the canonical one for ISS-058 since v2 only exists there).
+fn cmd_backfill_doc_path_ctx(
+    ctx: &GraphContext,
+    apply: bool,
+    verbose: bool,
+    json: bool,
+) -> Result<()> {
+    use gid_core::backfill_doc_path::{
+        applicable_updates, default_file_exists, plan_backfill, BackfillOutcome,
+    };
+
+    // Resolve project root (= parent of .gid/) so file-existence checks
+    // and any displayed paths line up with what the user sees in their repo.
+    let project_root = ctx
+        .gid_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| ctx.gid_dir.clone());
+
+    let mut graph = ctx.load()?;
+    let plan = plan_backfill(&graph.nodes, &project_root, default_file_exists);
+
+    if json {
+        let entries: Vec<_> = plan
+            .entries
+            .iter()
+            .map(|e| {
+                let (label, path, existing) = match &e.outcome {
+                    BackfillOutcome::Fillable { inferred_path } => {
+                        ("fillable", Some(inferred_path.as_str()), None)
+                    }
+                    BackfillOutcome::SkippedMissing { inferred_path } => {
+                        ("skipped-missing", Some(inferred_path.as_str()), None)
+                    }
+                    BackfillOutcome::SkippedNoRule => ("skipped-no-rule", None, None),
+                    BackfillOutcome::AlreadySet { existing } => {
+                        ("already-set", None, Some(existing.as_str()))
+                    }
+                };
+                serde_json::json!({
+                    "id": e.node_id,
+                    "node_type": e.node_type,
+                    "outcome": label,
+                    "inferred_path": path,
+                    "existing_doc_path": existing,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "dry_run": !apply,
+                "applied": false,    // updated below if apply succeeds
+                "totals": {
+                    "fillable":        plan.fillable,
+                    "skipped_missing": plan.skipped_missing,
+                    "skipped_no_rule": plan.skipped_no_rule,
+                    "already_set":     plan.already_set,
+                    "total":           plan.total(),
+                },
+                "entries": entries,
+            })
+        );
+    } else {
+        println!("ISS-058 doc_path back-fill — {} mode",
+                 if apply { "apply" } else { "dry-run" });
+        println!("Project root: {}", project_root.display());
+        println!();
+
+        for e in &plan.entries {
+            match &e.outcome {
+                BackfillOutcome::Fillable { inferred_path } => {
+                    println!(
+                        "  fillable        {:<40} → {}",
+                        e.node_id, inferred_path
+                    );
+                }
+                BackfillOutcome::SkippedMissing { inferred_path } => {
+                    println!(
+                        "  skipped-missing {:<40}   {} (file not found)",
+                        e.node_id, inferred_path
+                    );
+                }
+                BackfillOutcome::SkippedNoRule if verbose => {
+                    println!(
+                        "  skipped-no-rule {:<40}   ({})",
+                        e.node_id,
+                        e.node_type.as_deref().unwrap_or("<no type>")
+                    );
+                }
+                BackfillOutcome::AlreadySet { existing } if verbose => {
+                    println!("  already-set     {:<40}   {}", e.node_id, existing);
+                }
+                _ => {} // omitted in non-verbose mode
+            }
+        }
+
+        println!();
+        println!("Totals:");
+        println!("  fillable:        {}", plan.fillable);
+        println!("  skipped-missing: {}", plan.skipped_missing);
+        println!("  skipped-no-rule: {}", plan.skipped_no_rule);
+        println!("  already-set:     {}", plan.already_set);
+        println!("  total nodes:     {}", plan.total());
+    }
+
+    if !apply {
+        if !json {
+            println!();
+            println!("Dry-run only — re-run with `--apply` to persist {} update(s).",
+                     plan.fillable);
+        }
+        return Ok(());
+    }
+
+    // Apply mode: mutate the in-memory graph, then save through the existing
+    // backend (no direct SQL — go through the same save_graph_auto path that
+    // every other write uses, so we inherit migration + validation handling).
+    let updates = applicable_updates(&plan);
+    let n_updates = updates.len();
+    if n_updates == 0 {
+        if !json {
+            println!();
+            println!("Nothing to apply.");
+        }
+        return Ok(());
+    }
+
+    use std::collections::HashMap;
+    let map: HashMap<String, String> = updates.into_iter().collect();
+    for node in graph.nodes.iter_mut() {
+        if let Some(path) = map.get(&node.id) {
+            node.doc_path = Some(path.clone());
+        }
+    }
+
+    ctx.save(&graph)?;
+
+    if json {
+        // Second JSON line for apply summary — keeps the structured stream parseable.
+        println!(
+            "{}",
+            serde_json::json!({
+                "applied": true,
+                "updates_written": n_updates,
+            })
+        );
+    } else {
+        println!();
+        println!("Applied {} update(s).", n_updates);
     }
     Ok(())
 }
