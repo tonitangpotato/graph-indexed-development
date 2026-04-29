@@ -876,9 +876,13 @@ impl V2Executor {
         // Pass-through for non-success events. (Today this method is only
         // called with SkillCompleted; the match keeps the API total in
         // case future call sites widen its input.)
-        if !matches!(completed, RitualEvent::SkillCompleted { .. }) {
-            return completed;
-        }
+        // ISS-062: also extract `artifacts` here so the review subloop can
+        // surface them in its prompt — without paths the sub-agent (Read/
+        // Write/Edit only) has no way to discover what to review.
+        let artifacts = match &completed {
+            RitualEvent::SkillCompleted { artifacts, .. } => artifacts.clone(),
+            _ => return completed,
+        };
 
         if !is_self_review_eligible(name) {
             return completed;
@@ -892,7 +896,10 @@ impl V2Executor {
             None => return completed,
         };
 
-        match self.run_self_review_subloop(name, state, llm).await {
+        match self
+            .run_self_review_subloop(name, state, &artifacts, llm)
+            .await
+        {
             // Accept verdict — emit the structured event. State machine
             // forwards to the equivalent SkillCompleted arm (§8.2).
             SubloopOutcome::Accepted(turns_used) => RitualEvent::SelfReviewCompleted {
@@ -950,6 +957,7 @@ impl V2Executor {
         &self,
         skill_name: &str,
         _state: &RitualState,
+        artifacts: &[String],
         llm: Arc<dyn LlmClient>,
     ) -> SubloopOutcome {
         let scope = default_scope_for_phase(skill_name);
@@ -959,7 +967,8 @@ impl V2Executor {
         let mut last_error: Option<String> = None;
 
         for turn in 1..=SELF_REVIEW_MAX_TURNS {
-            let review_prompt = build_self_review_prompt(skill_name, turn, SELF_REVIEW_MAX_TURNS);
+            let review_prompt =
+                build_self_review_prompt(skill_name, turn, SELF_REVIEW_MAX_TURNS, artifacts);
 
             info!(
                 skill = skill_name,
@@ -1819,7 +1828,12 @@ fn is_self_review_eligible(name: &str) -> bool {
 /// does not regress relative to the production-tested rustclaw form;
 /// the only adapted piece is the verdict-tag instruction at the bottom,
 /// which now documents the three tags the parser recognizes.
-fn build_self_review_prompt(skill_name: &str, turn: u32, max_turns: u32) -> String {
+fn build_self_review_prompt(
+    skill_name: &str,
+    turn: u32,
+    max_turns: u32,
+    artifacts: &[String],
+) -> String {
     let checklist = match skill_name {
         "draft-design" | "update-design" => "\
              - Does the design actually solve the stated problem?\n\
@@ -1843,9 +1857,35 @@ fn build_self_review_prompt(skill_name: &str, turn: u32, max_turns: u32) -> Stri
              - Inconsistencies with the rest of the codebase",
     };
 
+    // ISS-062: surface the artifact list explicitly. The review sub-agent's
+    // ToolScope only allows Read/Write/Edit — there is no `list_dir` / shell,
+    // so without these paths it has no way to discover what to review and
+    // ends up REJECT'ing for a reason unrelated to the work's quality.
+    let artifacts_section = if artifacts.is_empty() {
+        "## Artifacts to review\n\n\
+         The previous step did not create or modify any files. Review the \
+         conversation context and any in-memory state instead.\n\n"
+            .to_string()
+    } else {
+        let mut s = String::from("## Artifacts to review\n\n");
+        s.push_str(
+            "The previous step created or modified the following files. \
+             Open each one with the Read tool before forming a verdict — \
+             do not guess, and do not REJECT for inability to find them:\n\n",
+        );
+        for path in artifacts {
+            s.push_str("- `");
+            s.push_str(path);
+            s.push_str("`\n");
+        }
+        s.push('\n');
+        s
+    };
+
     format!(
         "## SELF-REVIEW ROUND {turn}/{max_turns}\n\n\
-         Read back ALL files you created or modified in the previous step. \
+         {artifacts_section}\
+         Read back ALL files listed above. \
          Carefully check for:\n{checklist}\n\n\
          If you find issues, fix them using the available tools and respond \
          with exactly: `verdict: needs-changes`\n\
@@ -4270,7 +4310,7 @@ mod tests {
     fn build_self_review_prompt_contains_verdict_instructions() {
         // Pin the prompt contract: the LLM must be told about all three
         // tags so the parser actually has something to parse.
-        let p = build_self_review_prompt("implement", 2, 4);
+        let p = build_self_review_prompt("implement", 2, 4, &[]);
         assert!(p.contains("SELF-REVIEW ROUND 2/4"));
         assert!(p.contains("REVIEW_PASS"));
         assert!(p.contains("REVIEW_REJECT"));
@@ -4278,11 +4318,53 @@ mod tests {
         // implement checklist branch
         assert!(p.contains("Logic errors"));
 
-        let p = build_self_review_prompt("draft-design", 1, 4);
+        let p = build_self_review_prompt("draft-design", 1, 4, &[]);
         assert!(p.contains("Does the design actually solve"));
 
-        let p = build_self_review_prompt("draft-requirements", 1, 4);
+        let p = build_self_review_prompt("draft-requirements", 1, 4, &[]);
         assert!(p.contains("specific and testable"));
+    }
+
+    /// ISS-062: when artifacts are supplied, every path must appear verbatim
+    /// in the prompt under the "Artifacts to review" heading. Without this,
+    /// the review sub-agent (Read/Write/Edit only — no `list_dir`) has no
+    /// way to discover what to review and falls back to REVIEW_REJECT for
+    /// reasons unrelated to the work's quality.
+    #[test]
+    fn build_self_review_prompt_lists_artifacts_when_supplied() {
+        let artifacts = vec![
+            ".gid/features/iss-060/requirements.md".to_string(),
+            ".gid/features/iss-060/design.md".to_string(),
+        ];
+        let p = build_self_review_prompt("draft-design", 1, 4, &artifacts);
+
+        assert!(
+            p.contains("## Artifacts to review"),
+            "missing artifacts section header"
+        );
+        for path in &artifacts {
+            assert!(
+                p.contains(path),
+                "artifact path {path:?} not present in prompt"
+            );
+        }
+        // Still routes through the review verdict instructions.
+        assert!(p.contains("REVIEW_PASS"));
+        // No misleading "did not create" message when artifacts exist.
+        assert!(!p.contains("did not create or modify any files"));
+    }
+
+    /// ISS-062: with an empty artifact list the prompt explicitly says so
+    /// rather than rendering an empty bullet list, so the sub-agent doesn't
+    /// hunt for files that don't exist.
+    #[test]
+    fn build_self_review_prompt_handles_empty_artifacts() {
+        let p = build_self_review_prompt("implement", 1, 4, &[]);
+        assert!(p.contains("## Artifacts to review"));
+        assert!(
+            p.contains("did not create or modify any files"),
+            "empty-artifacts path must communicate the absence explicitly"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
