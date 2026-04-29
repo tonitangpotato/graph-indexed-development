@@ -186,6 +186,10 @@ impl SqliteStorage {
         // Apply schema
         conn.execute_batch(SCHEMA_SQL)?;
 
+        // Apply schema-version migrations (ISS-058 and onward).
+        // Idempotent: no-op for already-current DBs.
+        super::schema::apply_migrations(&conn).map_err(StorageError::from)?;
+
         tracing::debug!("opened SQLite storage at {} (foreign_keys=ON verified)", path.display());
 
         Ok(Self {
@@ -448,6 +452,7 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<Node> {
         body: row.get(23)?,
         created_at: row.get(24)?,
         updated_at: row.get(25)?,
+        doc_path: row.get(26)?, // ISS-058 schema_version 2 (appended column)
         // Loaded separately via load_node_extras
         tags: Vec::new(),
         metadata: HashMap::new(),
@@ -468,14 +473,16 @@ fn put_node_on<C: std::ops::Deref<Target = Connection>>(
             visibility, doc_comment, body_hash, node_kind,
             owner, source, repo, priority, assigned_to,
             parent_id, depth, complexity, is_public,
-            body, created_at, updated_at
+            body, created_at, updated_at,
+            doc_path
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14,
             ?15, ?16, ?17, ?18, ?19,
             ?20, ?21, ?22, ?23,
-            ?24, ?25, ?26
+            ?24, ?25, ?26,
+            ?27
         )",
         params![
             node.id,
@@ -504,6 +511,7 @@ fn put_node_on<C: std::ops::Deref<Target = Connection>>(
             node.body,
             node.created_at,
             node.updated_at,
+            node.doc_path, // ISS-058
         ],
     )?;
 

@@ -813,4 +813,98 @@ edges:
             );
         }
     }
+
+    // ═════════════════════════════════════════════════════════
+    // Test (ISS-058): doc_path persists through put_node → get_node
+    //
+    // Verifies the schema_version 2 column is wired correctly end-to-end:
+    //   - SCHEMA_SQL creates the column at table-tail position
+    //   - put_node_on writes node.doc_path into ?27
+    //   - row_to_node reads it from positional index 26
+    //   - None and Some(...) both roundtrip (no NULL/empty confusion)
+    // ═════════════════════════════════════════════════════════
+    #[test]
+    fn test_doc_path_roundtrip_some_and_none() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("doc_path.db");
+        let storage = SqliteStorage::open(&db).unwrap();
+
+        // Node with doc_path Some(...)
+        let mut n_with = Node::new("iss-058", "doc_path field");
+        n_with.doc_path = Some(".gid/issues/ISS-058/issue.md".to_string());
+        storage.put_node(&n_with).unwrap();
+
+        // Node with doc_path None (default)
+        let n_without = Node::new("code-foo", "extracted code node");
+        storage.put_node(&n_without).unwrap();
+
+        // Read back & assert exact roundtrip
+        let got_with = storage.get_node("iss-058").unwrap().unwrap();
+        assert_eq!(
+            got_with.doc_path,
+            Some(".gid/issues/ISS-058/issue.md".to_string()),
+            "doc_path Some(...) must roundtrip exactly"
+        );
+
+        let got_without = storage.get_node("code-foo").unwrap().unwrap();
+        assert_eq!(
+            got_without.doc_path, None,
+            "doc_path None must stay None (not Some(\"\"))"
+        );
+
+        // UPDATE path: change doc_path on existing node
+        let mut updated = got_with.clone();
+        updated.doc_path = Some(".gid/issues/ISS-058/v2.md".to_string());
+        storage.put_node(&updated).unwrap();
+        let re_fetched = storage.get_node("iss-058").unwrap().unwrap();
+        assert_eq!(
+            re_fetched.doc_path,
+            Some(".gid/issues/ISS-058/v2.md".to_string())
+        );
+
+        // Clearing: set back to None
+        let mut cleared = re_fetched.clone();
+        cleared.doc_path = None;
+        storage.put_node(&cleared).unwrap();
+        let final_node = storage.get_node("iss-058").unwrap().unwrap();
+        assert_eq!(final_node.doc_path, None);
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // Test (ISS-058): apply_migrations on fresh open() leaves
+    // user_version at CURRENT_SCHEMA_VERSION, and on a re-open of
+    // the same file it's a no-op (idempotency at the storage level).
+    // ═════════════════════════════════════════════════════════
+    #[test]
+    fn test_open_runs_migrations_to_current_version() {
+        use crate::storage::schema::CURRENT_SCHEMA_VERSION;
+        use rusqlite::Connection;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("open_migrate.db");
+
+        // First open: SCHEMA_SQL runs (column already present), then
+        // apply_migrations stamps user_version.
+        {
+            let _storage = SqliteStorage::open(&db).unwrap();
+        }
+
+        // Re-read user_version directly via raw connection.
+        let conn = Connection::open(&db).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+
+        // Second open: must not change anything (idempotent).
+        drop(conn);
+        {
+            let _storage = SqliteStorage::open(&db).unwrap();
+        }
+        let conn = Connection::open(&db).unwrap();
+        let v2: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v2, CURRENT_SCHEMA_VERSION);
+    }
 }

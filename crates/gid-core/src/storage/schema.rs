@@ -34,7 +34,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_public     INTEGER,                     -- 0/1 boolean
     body          TEXT,
     created_at    TEXT,
-    updated_at    TEXT
+    updated_at    TEXT,
+    -- ISS-058 (schema_version 2): doc_path is appended LAST so that
+    -- ALTER TABLE-migrated DBs and freshly-created DBs share the same
+    -- column ordering. Positional row reads in row_to_node assume this.
+    doc_path      TEXT
 ) STRICT;
 
 -- ═══════════════════════════════════════════════════════════
@@ -170,3 +174,194 @@ CREATE INDEX IF NOT EXISTS idx_nodes_file_lang ON nodes(file_path, lang);
 -- ═══════════════════════════════════════════════════════════
 INSERT OR IGNORE INTO config (key, value) VALUES ('schema_version', '1');
 "#;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Schema version tracking & migrations  (ISS-058)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Design reference: .gid/features/iss-058-doc-path/design.md §3.1
+//
+// `apply_migrations` is called by `SqliteStorage::open` after `SCHEMA_SQL` has
+// run. It uses SQLite's `PRAGMA user_version` as a numeric schema-version
+// counter (separate from the `config` table's `schema_version` row, which
+// remains for backward-compat introspection).
+//
+// Versions:
+//   - 0  : pre-migration database (legacy DBs predating this runner). The
+//          migration runner treats `user_version=0` as "needs all migrations".
+//          Newly created DBs that ran SCHEMA_SQL already have the doc_path
+//          column, so v1→v2 ALTER becomes a no-op via `IF NOT EXISTS`-style
+//          duplicate-column handling (see below).
+//   - 1  : initial published schema (no doc_path column).
+//   - 2  : ISS-058 — adds `nodes.doc_path TEXT` column.
+//
+// Idempotency:
+//   - The runner re-reads `user_version` on every call.
+//   - If it equals `CURRENT_SCHEMA_VERSION`, it returns immediately.
+//   - The ALTER step uses a duplicate-column probe so that fresh DBs (where
+//     SCHEMA_SQL already created the column) do not error.
+
+/// Latest schema version this build of gid-core targets.
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+
+/// Apply any pending migrations on `conn`. Idempotent: safe to call on
+/// already-migrated DBs and on freshly-created DBs.
+///
+/// Errors propagated as `rusqlite::Error` (the storage layer wraps them).
+#[cfg(feature = "sqlite")]
+pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+    if current >= CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // ── v0/v1 → v2 : add nodes.doc_path ────────────────────────────────────
+    if current < 2 {
+        if !column_exists(conn, "nodes", "doc_path")? {
+            conn.execute_batch("ALTER TABLE nodes ADD COLUMN doc_path TEXT;")?;
+        }
+        // (No data backfill here — backfill is a separate `gid backfill-doc-path`
+        // CLI subcommand, deferred to ISS-058 B1 follow-up.)
+    }
+
+    // Future: if current < 3 { ... }
+
+    // Stamp final version (single write, regardless of how many steps ran).
+    conn.execute_batch(&format!(
+        "PRAGMA user_version = {};",
+        CURRENT_SCHEMA_VERSION
+    ))?;
+    Ok(())
+}
+
+/// Returns true if `column` exists on `table`. Uses sqlite_master / table_info.
+#[cfg(feature = "sqlite")]
+fn column_exists(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({});", table))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?; // table_info col 1 = name
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn fresh_v1_db() -> Connection {
+        // Simulates an old v1 DB: just nodes table without doc_path,
+        // user_version unset (=0).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 doc_comment TEXT,
+                 body_hash TEXT
+             ) STRICT;",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_adds_doc_path_column_to_v1_db() {
+        let conn = fresh_v1_db();
+        assert!(!column_exists(&conn, "nodes", "doc_path").unwrap());
+        apply_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "nodes", "doc_path").unwrap());
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = fresh_v1_db();
+        apply_migrations(&conn).unwrap();
+        // Calling twice must not error and must not duplicate the column.
+        apply_migrations(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        // table_info must still show exactly one doc_path column.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name = 'doc_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migration_skips_when_column_already_exists() {
+        // Simulates a fresh DB created by SCHEMA_SQL (column already present),
+        // but with user_version=0.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 doc_path TEXT
+             ) STRICT;",
+        )
+        .unwrap();
+        apply_migrations(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn no_op_when_already_at_current() {
+        let conn = fresh_v1_db();
+        apply_migrations(&conn).unwrap();
+        // Now user_version=CURRENT. A second call should early-return.
+        let before: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        apply_migrations(&conn).unwrap();
+        let after: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, after);
+    }
+}
+
+#[cfg(test)]
+mod yaml_doc_path_tests {
+    //! Verifies `doc_path` roundtrips cleanly through serde_yaml, and that
+    //! `skip_serializing_if = "Option::is_none"` elides the field when None
+    //! (keeps yaml diffs minimal for code/extracted nodes).
+    use crate::graph::Node;
+
+    #[test]
+    fn doc_path_roundtrips_through_yaml() {
+        let mut n = Node::new("iss-058", "doc_path field");
+        n.doc_path = Some(".gid/issues/ISS-058/issue.md".to_string());
+        let yaml = serde_yaml::to_string(&n).unwrap();
+        assert!(
+            yaml.contains("doc_path: .gid/issues/ISS-058/issue.md"),
+            "yaml must contain doc_path; got:\n{}",
+            yaml
+        );
+        let back: Node = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.doc_path, n.doc_path);
+    }
+
+    #[test]
+    fn doc_path_none_is_elided_from_yaml() {
+        let n = Node::new("code-foo", "extracted code");
+        assert_eq!(n.doc_path, None);
+        let yaml = serde_yaml::to_string(&n).unwrap();
+        assert!(
+            !yaml.contains("doc_path"),
+            "doc_path: None must be elided (skip_serializing_if); got:\n{}",
+            yaml
+        );
+        let back: Node = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.doc_path, None);
+    }
+}

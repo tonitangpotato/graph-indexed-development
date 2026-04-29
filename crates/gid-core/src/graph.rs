@@ -115,6 +115,12 @@ pub struct Node {
     /// Documentation comment extracted from source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_comment: Option<String>,
+    /// Path to the documentation artifact backing this node, relative to the project
+    /// root (e.g. `.gid/issues/ISS-058/issue.md`). Source of truth for issue/feature/
+    /// design nodes; `None` for code/extracted nodes which have no doc artifact.
+    /// Added in schema_version 2 (gid-rs#ISS-058).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_path: Option<String>,
     /// Hash of the body content (for change detection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_hash: Option<String>,
@@ -185,6 +191,7 @@ impl Node {
             signature: None,
             visibility: None,
             doc_comment: None,
+            doc_path: None,
             body_hash: None,
             node_kind: None,
             owner: None,
