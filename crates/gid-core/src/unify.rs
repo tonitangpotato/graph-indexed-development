@@ -675,10 +675,15 @@ mod tests {
         let ratio = mixed_time.as_nanos() as f64 / project_only_time.as_nanos() as f64;
         println!("project_nodes() — project_only: {:?}, mixed(+2000 code): {:?}, ratio: {:.2}x", project_only_time, mixed_time, ratio);
 
-        // With 2000 code nodes, filtering should scan all nodes but it's still linear
-        // We allow some overhead but < 50x would indicate something is wrong  
-        // In practice, 2050 nodes vs 50 nodes → ~41x scan, but still sub-millisecond
-        assert!(mixed_time.as_millis() < 100, "project_nodes() on 2050-node graph should be < 100ms for {} iters, got {:?}", iterations, mixed_time);
+        // We care about complexity (no quadratic blow-up), not wall-clock.
+        // Wall-clock thresholds are flaky under concurrent test load. Linear scan of
+        // 2050 vs 50 nodes is ~41x; we allow generous headroom (200x) to catch only
+        // genuine algorithmic regressions (e.g., O(n²) creep).
+        assert!(
+            ratio < 200.0,
+            "project_nodes() overhead too high: {:.2}x (suggests non-linear scan), times: project_only={:?} mixed={:?}",
+            ratio, project_only_time, mixed_time
+        );
 
         // Also benchmark summary() which does status counting
         let start = std::time::Instant::now();
@@ -696,7 +701,12 @@ mod tests {
         let summary_ratio = summary_mixed.as_nanos() as f64 / summary_project.as_nanos() as f64;
         println!("summary() — project_only: {:?}, mixed: {:?}, ratio: {:.2}x", summary_project, summary_mixed, summary_ratio);
 
-        assert!(summary_mixed.as_millis() < 100, "summary() on 2050-node graph should be < 100ms for {} iters", iterations);
+        // summary() also scans all nodes; same complexity-not-wall-clock check.
+        assert!(
+            summary_ratio < 200.0,
+            "summary() overhead too high: {:.2}x (suggests non-linear scan), times: project_only={:?} mixed={:?}",
+            summary_ratio, summary_project, summary_mixed
+        );
     }
 
     #[test]

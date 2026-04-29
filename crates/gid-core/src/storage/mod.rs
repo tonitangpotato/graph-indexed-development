@@ -235,7 +235,15 @@ pub fn load_graph_auto(
         }
         #[cfg(not(feature = "sqlite"))]
         StorageBackend::Sqlite => {
-            Err("SQLite backend not available (compile with --features sqlite)".into())
+            // Without the sqlite feature compiled in we can't read a real db,
+            // but an empty dir (no graph.db) is unambiguously an empty graph —
+            // returning that is correct regardless of which backend is "preferred".
+            let db_path = gid_dir.join("graph.db");
+            if db_path.exists() {
+                Err("SQLite backend not available (compile with --features sqlite)".into())
+            } else {
+                Ok(crate::Graph::default())
+            }
         }
     }
 }
