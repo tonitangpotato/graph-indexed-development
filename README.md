@@ -319,6 +319,37 @@ edges:
 
 ---
 
+## FAQ
+
+### "Won't long context windows (12M tokens, sparse attention) make GID obsolete?"
+
+**No — they make GID more valuable, not less.**
+
+The intuition that "if the model can fit the whole codebase, you don't need to select files for it" misunderstands what GID actually does. Long context solves *capacity*. GID provides *deterministic architectural truth*. They are different layers, and they compose.
+
+**Sparse attention selects tokens inside the model. GID selects files, functions, and dependencies at the application layer.**
+
+Concretely:
+
+- **Determinism vs stochastic reasoning.** `gid query impact UserService` returns the *exact* set of affected callers via graph traversal. A 12M-context LLM asked the same question gives a plausible answer that varies between runs and silently misses transitive dependencies. Sparse attention has documented failure modes on multi-hop reasoning — and "what does this change break?" is exactly that kind of multi-hop trace.
+- **Auditability.** Edges in the GID graph are typed (`calls`, `imports`, `satisfies`, `tests_for`). You can explain *why* a file entered the agent's context. You cannot explain why an LLM's attention landed where it did.
+- **Build-time vs run-time.** GID indexes once and answers queries in milliseconds. Long-context models re-reason from scratch on every prompt, paying the full prefill cost each time.
+- **Multi-agent coordination.** When you split a task across 8 parallel sub-agents, each one needs a *focused* context, not the whole repo. `gid task-context <task-id>` gives each agent precisely what it needs.
+
+The right pipeline is: **GID narrows the search space at the application layer → long-context model does focused reasoning inside that space.** Two selection layers in series outperform either alone — graph traversal catches the structural dependencies sparse attention misses, and the model handles the semantic reasoning the graph can't.
+
+This is the same pattern that played out with databases and compilers: stronger LLMs didn't kill them, they *increased* the demand for deterministic structural tools that LLMs can call. Architectural ground truth becomes more valuable, not less, when the model layer becomes more powerful and more stochastic.
+
+### "Isn't this just RAG with extra steps?"
+
+RAG retrieves passages by semantic similarity. GID retrieves nodes by *structural relationship* — the things RAG can't index because they only exist as graph edges (call sites, type references, satisfies-this-requirement, blocks-this-task). Both can coexist; they answer different questions.
+
+### "Do I have to use the full ritual / harness pipeline?"
+
+No. The graph engine, code extraction, and impact queries work standalone. The Ritual and Harness layers are opt-in for teams that want to enforce design-before-code or run multi-agent task orchestration.
+
+---
+
 ## Monorepo Structure
 
 ```
